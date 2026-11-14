@@ -3,6 +3,7 @@ Domain models for the Constella AI Thesis Engine.
 Enforces typed schemas, bounds validation, and eligibility flags.
 """
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, List, Optional
 from pydantic import BaseModel, Field, field_validator
@@ -142,4 +143,93 @@ class SimulationReport(BaseModel):
     worst_case_exit_hours: int
     historical_nav_series: List[float] = Field(default_factory=list)
     disclaimer: str
+
+
+# ==============================================================================
+# Slice 3: Explain & Sign Models (Steps 5 & 6)
+# ==============================================================================
+
+class DiffItem(BaseModel):
+    """
+    Structured divergence item between natural language thesis and proposed basket.
+    """
+    category: str  # e.g., "currency", "exclusion", "liquidity", "ambiguity", "diversification"
+    requested: str
+    proposed: str
+    explanation: str
+
+
+class ExplanationReport(BaseModel):
+    """
+    Transparent explanation report produced by Step 5 (Explain).
+    """
+    asset_rationales: Dict[str, str]  # asset_id -> plain-language rationale
+    thesis_diff: List[DiffItem]
+    issuer_concentration_warnings: List[str] = Field(default_factory=list)
+    ambiguity_clarifications: List[str] = Field(default_factory=list)
+
+
+class CanonicalSleeve(BaseModel):
+    """
+    Canonical on-chain sleeve entry within a Constella policy.
+    """
+    asset_id: str
+    contract_address: str
+    target_weight_bps: int
+    band_bps: int = 500
+    sleeve_type: str = "cash"
+
+
+class CanonicalConstraints(BaseModel):
+    """
+    Immutable risk and liquidity constraints enforced on-chain.
+    """
+    max_issuer_weight_bps: int = 3000
+    max_single_asset_weight_bps: int = 2500
+    min_liquidity_sleeve_bps: int = 1000
+    max_slippage_bps: int = 50
+    rebalance_band_bps: int = 500
+
+
+class CanonicalEligibility(BaseModel):
+    """
+    Jurisdictional and compliance boundary parameters.
+    """
+    jurisdiction: str = "non-US"
+    investor_class: str = "retail"
+    share_class: str = "open"
+
+
+class CanonicalAdmin(BaseModel):
+    """
+    Governance and multisig parameters for vault administration.
+    """
+    admin_address: str
+    multisig_threshold: int = 1
+    multisig_signers: List[str] = Field(default_factory=list)
+
+
+class CanonicalPolicy(BaseModel):
+    """
+    Canonical on-chain policy specification matching the Soroban contract contract.
+    """
+    schema_version: str = "1.0"
+    created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"))
+    basket_name: str
+    numeraire: str = "USDC"
+    sleeves: List[CanonicalSleeve]
+    constraints: CanonicalConstraints
+    eligibility: CanonicalEligibility
+    admin: CanonicalAdmin
+
+
+class SignedPolicyEnvelope(BaseModel):
+    """
+    Cryptographic envelope bundling the canonical policy, canonical JSON, and SHA-256 hash.
+    """
+    policy: CanonicalPolicy
+    canonical_json: str
+    policy_hash_hex: str
+    policy_hash_bytes: bytes
+
 

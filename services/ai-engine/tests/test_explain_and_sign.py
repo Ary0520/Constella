@@ -257,3 +257,100 @@ def test_t18_full_pipeline_end_to_end():
     assert envelope.policy.basket_name == "cDAO_RUNWAY"
     assert len(envelope.policy_hash_bytes) == 32
     assert len(envelope.policy.sleeves) > 0
+
+
+def test_t19_ambiguity_clarifications_and_unsupported_assets():
+    """
+    T19: Ambiguity Clarifications & Unsupported Assets
+    Verifies that ambiguities and unsupported assets in PolicyDraft produce
+    explicit clarifications and diff items in ExplanationReport.
+    """
+    from src.parser import parse_thesis
+    from src.retriever import retrieve_candidates, AssetRegistry
+    from src.optimizer import optimize_portfolio
+    from src.explainer import generate_explanation
+
+    thesis = "Allocate 50% to TSLA stock, 30% to BTC, and 20% to safe dollar T-bills."
+    policy = parse_thesis(thesis, jurisdiction="non-US", investor_class="retail")
+    registry = AssetRegistry()
+    candidates = retrieve_candidates(policy, registry)
+    opt_result = optimize_portfolio(policy, candidates)
+
+    report = generate_explanation(thesis, policy, opt_result, candidates)
+
+    # Policy should have flagged ambiguities for unsupported assets TSLA and BTC
+    assert len(policy.ambiguities) > 0
+    assert len(report.ambiguity_clarifications) > 0
+    assert any("TSLA" in c or "stock" in c for c in report.ambiguity_clarifications)
+    assert any(item.category == "ambiguity" for item in report.thesis_diff)
+
+
+def test_t20_canonical_policy_sleeve_sorting_determinism():
+    """
+    T20: Deterministic Sleeve Sorting
+    Verifies that assemble_canonical_policy always produces sleeves sorted by asset_id
+    regardless of input dictionary iteration order.
+    """
+    from src.models import PolicyDraft, AssetCandidate, OptimizationResult, SleeveType
+    from src.signer import assemble_canonical_policy, to_canonical_json
+
+    policy_draft = PolicyDraft(
+        objectives=["runway"],
+        currency_exposure={"USD": 1.0},
+        min_liquidity_sleeve=0.10,
+        max_issuer_weight=0.30,
+        max_single_asset_weight=0.25,
+    )
+
+    candidates = [
+        AssetCandidate(
+            asset_id="USDC",
+            display_name="USD Coin",
+            issuer="Circle",
+            sleeve_type=SleeveType.CASH_STABLE,
+            currency="USD",
+            contract_address="CUSDC",
+        ),
+        AssetCandidate(
+            asset_id="FRANKLIN_BENJI",
+            display_name="BENJI",
+            issuer="Franklin Templeton",
+            sleeve_type=SleeveType.USD_GOV_FUNDS,
+            currency="USD",
+            contract_address="CBENJI",
+        ),
+        AssetCandidate(
+            asset_id="SPIKO_USD",
+            display_name="Spiko USD",
+            issuer="Spiko",
+            sleeve_type=SleeveType.USD_GOV_FUNDS,
+            currency="USD",
+            contract_address="CSPIKO",
+        ),
+    ]
+
+    # Deliberately reverse the order of keys in weights_bps
+    opt_result_1 = OptimizationResult(
+        weights={"USDC": 0.20, "FRANKLIN_BENJI": 0.40, "SPIKO_USD": 0.40},
+        weights_bps={"USDC": 2000, "FRANKLIN_BENJI": 4000, "SPIKO_USD": 4000},
+        sleeve_weights={"cash": 0.20, "usd_gov_fund": 0.80},
+        currency_weights={"USD": 1.0},
+        issuer_weights={"Circle": 0.20, "Franklin Templeton": 0.40, "Spiko": 0.40},
+        algorithm_used="HRP",
+    )
+
+    opt_result_2 = OptimizationResult(
+        weights={"SPIKO_USD": 0.40, "USDC": 0.20, "FRANKLIN_BENJI": 0.40},
+        weights_bps={"SPIKO_USD": 4000, "USDC": 2000, "FRANKLIN_BENJI": 4000},
+        sleeve_weights={"cash": 0.20, "usd_gov_fund": 0.80},
+        currency_weights={"USD": 1.0},
+        issuer_weights={"Spiko": 0.40, "Circle": 0.20, "Franklin Templeton": 0.40},
+        algorithm_used="HRP",
+    )
+
+    p1 = assemble_canonical_policy(policy_draft, opt_result_1, candidates, created_at="2026-11-14T00:00:00Z")
+    p2 = assemble_canonical_policy(policy_draft, opt_result_2, candidates, created_at="2026-11-14T00:00:00Z")
+
+    assert to_canonical_json(p1) == to_canonical_json(p2)
+    assert [s.asset_id for s in p1.sleeves] == ["FRANKLIN_BENJI", "SPIKO_USD", "USDC"]
+
