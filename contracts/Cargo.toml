@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     # Crate members will be added as each contract crate is scaffolded:
     # "shared",
-    # "registry",
+    "registry",
     # "policy",
     # "vault-strategy",
     # "nav-oracle",
