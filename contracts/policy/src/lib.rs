@@ -201,6 +201,34 @@ impl PolicyContractTrait for PolicyContract {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
 
+        if max_slippage_bps > 10000 {
+            panic_with_error!(&env, PolicyError::SlippageLimitExceeded);
+        }
+        if min_liquidity_sleeve_bps > 10000 {
+            panic_with_error!(&env, PolicyError::LiquidityFloorBreached);
+        }
+        if max_single_asset_bps > 10000 {
+            panic_with_error!(&env, PolicyError::SingleAssetCapExceeded);
+        }
+        if max_issuer_bps > 10000 {
+            panic_with_error!(&env, PolicyError::IssuerCapExceeded);
+        }
+
+        // Validate sleeve band sanity if sleeves provided
+        for i in 0..sleeves.len() {
+            let sleeve_i = sleeves.get(i).unwrap();
+            if sleeve_i.min_band_bps > sleeve_i.max_band_bps {
+                panic_with_error!(&env, PolicyError::WeightBandExceeded);
+            }
+            // Check for duplicate sleeves
+            for j in (i + 1)..sleeves.len() {
+                let sleeve_j = sleeves.get(j).unwrap();
+                if sleeve_i.asset_id == sleeve_j.asset_id {
+                    panic_with_error!(&env, PolicyError::WeightBandExceeded);
+                }
+            }
+        }
+
         let existing_version = env
             .storage()
             .instance()
@@ -243,6 +271,20 @@ impl PolicyContractTrait for PolicyContract {
     ) {
         let admin = Self::get_admin(env.clone());
         admin.require_auth();
+
+        // Validate new sleeve sanity
+        for i in 0..new_sleeves.len() {
+            let sleeve_i = new_sleeves.get(i).unwrap();
+            if sleeve_i.min_band_bps > sleeve_i.max_band_bps {
+                panic_with_error!(&env, PolicyError::WeightBandExceeded);
+            }
+            for j in (i + 1)..new_sleeves.len() {
+                let sleeve_j = new_sleeves.get(j).unwrap();
+                if sleeve_i.asset_id == sleeve_j.asset_id {
+                    panic_with_error!(&env, PolicyError::WeightBandExceeded);
+                }
+            }
+        }
 
         let mut config: PolicyConfig = match env
             .storage()
@@ -329,6 +371,20 @@ impl PolicyContractTrait for PolicyContract {
             return res;
         }
 
+        // Verify proposal is destined for the queried vault
+        if proposal.vault != vault {
+            let res = ValidationResult {
+                is_valid: false,
+                code: PolicyError::Unauthorized as u32,
+                message: Symbol::new(&env, "VAULT_MISMATCH"),
+            };
+            env.events().publish(
+                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                (res.is_valid, res.code),
+            );
+            return res;
+        }
+
         // 1. Verify proposal deadline >= env.ledger().timestamp()
         if proposal.deadline < env.ledger().timestamp() {
             let res = ValidationResult {
@@ -360,6 +416,26 @@ impl PolicyContractTrait for PolicyContract {
                 (res.is_valid, res.code),
             );
             return res;
+        }
+
+        // 2b. Reject duplicate assets in weights_after to prevent single-asset and band bypass
+        for i in 0..proposal.weights_after.len() {
+            let (asset_i, _) = proposal.weights_after.get(i).unwrap();
+            for j in (i + 1)..proposal.weights_after.len() {
+                let (asset_j, _) = proposal.weights_after.get(j).unwrap();
+                if asset_i == asset_j {
+                    let res = ValidationResult {
+                        is_valid: false,
+                        code: PolicyError::WeightBandExceeded as u32,
+                        message: Symbol::new(&env, "DUPLICATE_ASSET"),
+                    };
+                    env.events().publish(
+                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                        (res.is_valid, res.code),
+                    );
+                    return res;
+                }
+            }
         }
 
         // 3. Verify each proposed weight is within [min_band_bps, max_band_bps] for declared sleeves
@@ -490,7 +566,7 @@ impl PolicyContractTrait for PolicyContract {
         // 7. Verify each trade operation slippage: if amount_in > 0, calculate if min_amount_out respects max_slippage_bps
         for i in 0..proposal.operations.len() {
             let op = proposal.operations.get(i).unwrap();
-            if op.amount_in <= 0 {
+            if op.amount_in <= 0 || op.min_amount_out <= 0 {
                 let res = ValidationResult {
                     is_valid: false,
                     code: PolicyError::SlippageLimitExceeded as u32,
@@ -502,11 +578,35 @@ impl PolicyContractTrait for PolicyContract {
                 );
                 return res;
             }
-            let min_required_out = op
-                .amount_in
-                .checked_mul((10000 - config.max_slippage_bps) as i128)
-                .unwrap_or(0)
-                / 10000;
+            if op.asset_in == op.asset_out {
+                let res = ValidationResult {
+                    is_valid: false,
+                    code: PolicyError::SlippageLimitExceeded as u32,
+                    message: Symbol::new(&env, "IDENTICAL_ASSETS"),
+                };
+                env.events().publish(
+                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                    (res.is_valid, res.code),
+                );
+                return res;
+            }
+
+            let slippage_factor = 10000u32.saturating_sub(config.max_slippage_bps) as i128;
+            let min_required_out = match op.amount_in.checked_mul(slippage_factor) {
+                Some(product) => product / 10000,
+                None => {
+                    let res = ValidationResult {
+                        is_valid: false,
+                        code: PolicyError::SlippageLimitExceeded as u32,
+                        message: Symbol::new(&env, "SLIPPAGE_OVERFLOW"),
+                    };
+                    env.events().publish(
+                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                        (res.is_valid, res.code),
+                    );
+                    return res;
+                }
+            };
             if op.min_amount_out < min_required_out {
                 let res = ValidationResult {
                     is_valid: false,
@@ -521,8 +621,32 @@ impl PolicyContractTrait for PolicyContract {
             }
         }
 
-        // 8. Cross-contract call to constella-registry (is_registered for asset_in and asset_out)
+        // 8. Cross-contract call to constella-registry
         let registry_client = AssetRegistryClient::new(&env, &config.registry_address);
+
+        // 8a. Verify all assets with positive weight in weights_after are registered and active
+        for j in 0..proposal.weights_after.len() {
+            let (asset_id, weight) = proposal.weights_after.get(j).unwrap();
+            if weight > 0 {
+                match registry_client.get_asset(&asset_id) {
+                    Some(entry) if entry.is_active => {}
+                    _ => {
+                        let res = ValidationResult {
+                            is_valid: false,
+                            code: PolicyError::AssetNotRegistered as u32,
+                            message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
+                        };
+                        env.events().publish(
+                            (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                            (res.is_valid, res.code),
+                        );
+                        return res;
+                    }
+                }
+            }
+        }
+
+        // 8b. Verify all traded assets in operations are registered and active
         for i in 0..proposal.operations.len() {
             let op = proposal.operations.get(i).unwrap();
             if !registry_client.is_registered(&op.asset_in)

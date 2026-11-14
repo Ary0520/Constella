@@ -995,3 +995,447 @@ fn test_unregistered_vault_rebalance_rejected() {
     assert_eq!(res.code, PolicyError::PolicyNotFound as u32);
     assert_eq!(res.message, Symbol::new(&ctx.env, "POLICY_NOT_FOUND"));
 }
+
+#[test]
+fn test_duplicate_asset_in_weights_after_rejected() {
+    let ctx = setup_test_context();
+    let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+
+    let p_hash = sample_hash(&ctx.env, 0x60);
+    let sleeves = sample_sleeves(&ctx.env);
+
+    policy.register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500, // max_single_asset_bps = 2500
+        &5000, // max_issuer_bps = 5000
+        &50,
+        &500,
+        &sleeves,
+    );
+
+    // Exploit attempt: Split CIRCLE_USDC across 2 entries (2000 + 2000 = 4000)
+    // to bypass single asset cap (2500) and sleeve max band (2500).
+    let duplicate_weights: Vec<(Symbol, u32)> = vec![
+        &ctx.env,
+        (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000),
+        (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000),
+        (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 2000),
+        (Symbol::new(&ctx.env, "SPIKO_EUSTBL"), 2000),
+        (Symbol::new(&ctx.env, "BLEND_BLND"), 2000),
+    ];
+
+    let proposal = RebalanceProposal {
+        vault: ctx.vault.clone(),
+        operations: vec![&ctx.env],
+        weights_after: duplicate_weights,
+        deadline: ctx.env.ledger().timestamp() + 3600,
+        proposer: ctx.proposer.clone(),
+    };
+
+    let res = policy.validate_rebalance(&ctx.vault, &proposal);
+    assert_eq!(res.is_valid, false);
+    assert_eq!(res.code, PolicyError::WeightBandExceeded as u32);
+    assert_eq!(res.message, Symbol::new(&ctx.env, "DUPLICATE_ASSET"));
+}
+
+#[test]
+fn test_slippage_overflow_rejected() {
+    let ctx = setup_test_context();
+    let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+
+    let p_hash = sample_hash(&ctx.env, 0x61);
+    let sleeves = sample_sleeves(&ctx.env);
+
+    policy.register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500,
+        &3000,
+        &50,
+        &500,
+        &sleeves,
+    );
+
+    let valid_weights: Vec<(Symbol, u32)> = vec![
+        &ctx.env,
+        (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000),
+        (Symbol::new(&ctx.env, "CIRCLE_EURC"), 1000),
+        (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 2500),
+        (Symbol::new(&ctx.env, "SPIKO_EUSTBL"), 2500),
+        (Symbol::new(&ctx.env, "BLEND_BLND"), 2000),
+    ];
+
+    // Exploit attempt: amount_in = i128::MAX with min_amount_out = 1
+    // Previously caused integer overflow in amount_in.checked_mul(9950) -> unwrap_or(0) -> min_required_out = 0 -> passed!
+    let ops_overflow = vec![
+        &ctx.env,
+        TradeOperation {
+            asset_in: ctx.usdc_addr.clone(),
+            asset_out: ctx.eurc_addr.clone(),
+            amount_in: i128::MAX,
+            min_amount_out: 1,
+            route: TradeRoute::Soroswap,
+        },
+    ];
+
+    let proposal = RebalanceProposal {
+        vault: ctx.vault.clone(),
+        operations: ops_overflow,
+        weights_after: valid_weights,
+        deadline: ctx.env.ledger().timestamp() + 3600,
+        proposer: ctx.proposer.clone(),
+    };
+
+    let res = policy.validate_rebalance(&ctx.vault, &proposal);
+    assert_eq!(res.is_valid, false);
+    assert_eq!(res.code, PolicyError::SlippageLimitExceeded as u32);
+    assert_eq!(res.message, Symbol::new(&ctx.env, "SLIPPAGE_OVERFLOW"));
+}
+
+#[test]
+fn test_vault_mismatch_rejected() {
+    let ctx = setup_test_context();
+    let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+
+    let p_hash = sample_hash(&ctx.env, 0x62);
+    let sleeves = sample_sleeves(&ctx.env);
+
+    policy.register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500,
+        &3000,
+        &50,
+        &500,
+        &sleeves,
+    );
+
+    let valid_weights: Vec<(Symbol, u32)> = vec![
+        &ctx.env,
+        (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000),
+        (Symbol::new(&ctx.env, "CIRCLE_EURC"), 1000),
+        (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 2500),
+        (Symbol::new(&ctx.env, "SPIKO_EUSTBL"), 2500),
+        (Symbol::new(&ctx.env, "BLEND_BLND"), 2000),
+    ];
+
+    let other_vault = Address::generate(&ctx.env);
+    let proposal = RebalanceProposal {
+        vault: other_vault, // Vault mismatch!
+        operations: vec![&ctx.env],
+        weights_after: valid_weights,
+        deadline: ctx.env.ledger().timestamp() + 3600,
+        proposer: ctx.proposer.clone(),
+    };
+
+    let res = policy.validate_rebalance(&ctx.vault, &proposal);
+    assert_eq!(res.is_valid, false);
+    assert_eq!(res.code, PolicyError::Unauthorized as u32);
+    assert_eq!(res.message, Symbol::new(&ctx.env, "VAULT_MISMATCH"));
+}
+
+#[test]
+fn test_weights_after_with_deactivated_asset_rejected() {
+    let ctx = setup_test_context();
+    let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+
+    let p_hash = sample_hash(&ctx.env, 0x63);
+
+    // Sleeves include RISKY_TOKEN (which was deactivated in setup_test_context)
+    let sleeves = vec![
+        &ctx.env,
+        SleeveTarget {
+            asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"),
+            target_weight_bps: 2000,
+            min_band_bps: 1000,
+            max_band_bps: 2500,
+            sleeve_type: Symbol::new(&ctx.env, "cash"),
+        },
+        SleeveTarget {
+            asset_id: Symbol::new(&ctx.env, "RISKY_TOKEN"),
+            target_weight_bps: 1000,
+            min_band_bps: 500,
+            max_band_bps: 1500,
+            sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund"),
+        },
+        SleeveTarget {
+            asset_id: Symbol::new(&ctx.env, "FRANKLIN_BENJI"),
+            target_weight_bps: 2500,
+            min_band_bps: 1500,
+            max_band_bps: 2500,
+            sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund"),
+        },
+        SleeveTarget {
+            asset_id: Symbol::new(&ctx.env, "SPIKO_EUSTBL"),
+            target_weight_bps: 2500,
+            min_band_bps: 1500,
+            max_band_bps: 2500,
+            sleeve_type: Symbol::new(&ctx.env, "eur_sovereign"),
+        },
+        SleeveTarget {
+            asset_id: Symbol::new(&ctx.env, "BLEND_BLND"),
+            target_weight_bps: 2000,
+            min_band_bps: 500,
+            max_band_bps: 2500,
+            sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund"),
+        },
+    ];
+
+    policy.register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500,
+        &3000,
+        &50,
+        &500,
+        &sleeves,
+    );
+
+    // Proposal allocates 1000 bps to RISKY_TOKEN with NO operations
+    // Previously passed because check 8 only inspected operations!
+    let proposal = RebalanceProposal {
+        vault: ctx.vault.clone(),
+        operations: vec![&ctx.env],
+        weights_after: vec![
+            &ctx.env,
+            (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000),
+            (Symbol::new(&ctx.env, "RISKY_TOKEN"), 1000),
+            (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 2500),
+            (Symbol::new(&ctx.env, "SPIKO_EUSTBL"), 2500),
+            (Symbol::new(&ctx.env, "BLEND_BLND"), 2000),
+        ],
+        deadline: ctx.env.ledger().timestamp() + 3600,
+        proposer: ctx.proposer.clone(),
+    };
+
+    let res = policy.validate_rebalance(&ctx.vault, &proposal);
+    assert_eq!(res.is_valid, false);
+    assert_eq!(res.code, PolicyError::AssetNotRegistered as u32);
+    assert_eq!(res.message, Symbol::new(&ctx.env, "ASSET_NOT_REGISTERED"));
+}
+
+#[test]
+fn test_identical_trade_assets_rejected() {
+    let ctx = setup_test_context();
+    let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+
+    let p_hash = sample_hash(&ctx.env, 0x64);
+    let sleeves = sample_sleeves(&ctx.env);
+
+    policy.register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500,
+        &3000,
+        &50,
+        &500,
+        &sleeves,
+    );
+
+    let valid_weights: Vec<(Symbol, u32)> = vec![
+        &ctx.env,
+        (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000),
+        (Symbol::new(&ctx.env, "CIRCLE_EURC"), 1000),
+        (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 2500),
+        (Symbol::new(&ctx.env, "SPIKO_EUSTBL"), 2500),
+        (Symbol::new(&ctx.env, "BLEND_BLND"), 2000),
+    ];
+
+    let ops_identical = vec![
+        &ctx.env,
+        TradeOperation {
+            asset_in: ctx.usdc_addr.clone(),
+            asset_out: ctx.usdc_addr.clone(), // Identical asset!
+            amount_in: 10_000,
+            min_amount_out: 9_960,
+            route: TradeRoute::Soroswap,
+        },
+    ];
+
+    let proposal = RebalanceProposal {
+        vault: ctx.vault.clone(),
+        operations: ops_identical,
+        weights_after: valid_weights,
+        deadline: ctx.env.ledger().timestamp() + 3600,
+        proposer: ctx.proposer.clone(),
+    };
+
+    let res = policy.validate_rebalance(&ctx.vault, &proposal);
+    assert_eq!(res.is_valid, false);
+    assert_eq!(res.code, PolicyError::SlippageLimitExceeded as u32);
+    assert_eq!(res.message, Symbol::new(&ctx.env, "IDENTICAL_ASSETS"));
+}
+
+#[test]
+fn test_negative_or_zero_min_amount_out_rejected() {
+    let ctx = setup_test_context();
+    let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+
+    let p_hash = sample_hash(&ctx.env, 0x65);
+    let sleeves = sample_sleeves(&ctx.env);
+
+    policy.register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500,
+        &3000,
+        &50,
+        &500,
+        &sleeves,
+    );
+
+    let valid_weights: Vec<(Symbol, u32)> = vec![
+        &ctx.env,
+        (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000),
+        (Symbol::new(&ctx.env, "CIRCLE_EURC"), 1000),
+        (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 2500),
+        (Symbol::new(&ctx.env, "SPIKO_EUSTBL"), 2500),
+        (Symbol::new(&ctx.env, "BLEND_BLND"), 2000),
+    ];
+
+    let ops_zero_out = vec![
+        &ctx.env,
+        TradeOperation {
+            asset_in: ctx.usdc_addr.clone(),
+            asset_out: ctx.eurc_addr.clone(),
+            amount_in: 10_000,
+            min_amount_out: 0, // min_amount_out == 0
+            route: TradeRoute::Soroswap,
+        },
+    ];
+
+    let proposal = RebalanceProposal {
+        vault: ctx.vault.clone(),
+        operations: ops_zero_out,
+        weights_after: valid_weights,
+        deadline: ctx.env.ledger().timestamp() + 3600,
+        proposer: ctx.proposer.clone(),
+    };
+
+    let res = policy.validate_rebalance(&ctx.vault, &proposal);
+    assert_eq!(res.is_valid, false);
+    assert_eq!(res.code, PolicyError::SlippageLimitExceeded as u32);
+}
+
+#[test]
+fn test_policy_registration_invalid_parameters_rejected() {
+    let ctx = setup_test_context();
+    let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+    let p_hash = sample_hash(&ctx.env, 0x66);
+
+    // 1. max_slippage_bps > 10000
+    let res_slippage = policy.try_register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500,
+        &3000,
+        &10001, // > 10000
+        &500,
+        &sample_sleeves(&ctx.env),
+    );
+    assert_eq!(
+        res_slippage,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            PolicyError::SlippageLimitExceeded as u32
+        )))
+    );
+
+    // 2. min_liquidity_sleeve_bps > 10000
+    let res_liq = policy.try_register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &10001, // > 10000
+        &2500,
+        &3000,
+        &50,
+        &500,
+        &sample_sleeves(&ctx.env),
+    );
+    assert_eq!(
+        res_liq,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            PolicyError::LiquidityFloorBreached as u32
+        )))
+    );
+
+    // 3. Inverted sleeve bands: min_band_bps > max_band_bps
+    let inverted_sleeves = vec![
+        &ctx.env,
+        SleeveTarget {
+            asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"),
+            target_weight_bps: 10000,
+            min_band_bps: 3000,
+            max_band_bps: 2000, // min > max!
+            sleeve_type: Symbol::new(&ctx.env, "cash"),
+        },
+    ];
+    let res_band = policy.try_register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500,
+        &3000,
+        &50,
+        &500,
+        &inverted_sleeves,
+    );
+    assert_eq!(
+        res_band,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            PolicyError::WeightBandExceeded as u32
+        )))
+    );
+
+    // 4. Duplicate sleeves in registration
+    let duplicate_sleeves = vec![
+        &ctx.env,
+        SleeveTarget {
+            asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"),
+            target_weight_bps: 5000,
+            min_band_bps: 1000,
+            max_band_bps: 6000,
+            sleeve_type: Symbol::new(&ctx.env, "cash"),
+        },
+        SleeveTarget {
+            asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"), // Duplicate asset_id!
+            target_weight_bps: 5000,
+            min_band_bps: 1000,
+            max_band_bps: 6000,
+            sleeve_type: Symbol::new(&ctx.env, "cash"),
+        },
+    ];
+    let res_dup = policy.try_register_policy(
+        &ctx.vault,
+        &p_hash,
+        &ctx.registry_address,
+        &1000,
+        &2500,
+        &3000,
+        &50,
+        &500,
+        &duplicate_sleeves,
+    );
+    assert_eq!(
+        res_dup,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            PolicyError::WeightBandExceeded as u32
+        )))
+    );
+}
