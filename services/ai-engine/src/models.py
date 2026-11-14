@@ -1,0 +1,99 @@
+"""
+Domain models for the Constella AI Thesis Engine.
+Enforces typed schemas, bounds validation, and eligibility flags.
+"""
+
+from enum import Enum
+from typing import Dict, List, Optional
+from pydantic import BaseModel, Field, field_validator
+
+
+class SleeveType(str, Enum):
+    """
+    Asset sleeve classifications matching Constella architectural specs.
+    """
+    CASH_STABLE = "cash"
+    USD_GOV_FUNDS = "usd_gov_fund"
+    EUR_SOVEREIGN = "eur_sovereign"
+    YIELD_DOLLAR = "yield_dollar"
+    LENDING = "lending"
+    EQUITY = "equity"
+    XLM = "xlm"
+
+
+class PolicyDraft(BaseModel):
+    """
+    Parsed policy specification extracted from plain-English thesis.
+    """
+    objectives: List[str] = Field(default_factory=list)
+    currency_exposure: Dict[str, float] = Field(default_factory=dict)
+    liquidity_horizon_hours: int = 24
+    max_issuer_weight: float = 0.30
+    max_single_asset_weight: float = 0.25
+    risk_tolerance: str = "conservative"  # "conservative" | "moderate" | "growth"
+    exclusions: List[str] = Field(default_factory=list)
+    min_liquidity_sleeve: float = 0.10
+    target_yield_orientation: str = "secondary"  # "maximize" | "secondary" | "none"
+    investor_class: str = "retail"  # "retail" | "professional" | "institutional"
+    jurisdiction: str = "non-US"  # e.g., "US", "EU", "IN", "non-US"
+    confidence: Dict[str, float] = Field(default_factory=dict)
+    ambiguities: List[str] = Field(default_factory=list)
+
+    @field_validator("max_issuer_weight", "max_single_asset_weight", "min_liquidity_sleeve")
+    @classmethod
+    def validate_weights(cls, v: float) -> float:
+        if not (0.0 <= v <= 1.0):
+            raise ValueError(f"Weight value must be between 0.0 and 1.0, got {v}")
+        return v
+
+    @field_validator("risk_tolerance")
+    @classmethod
+    def validate_risk_tolerance(cls, v: str) -> str:
+        allowed = {"conservative", "moderate", "growth"}
+        if v.lower() not in allowed:
+            raise ValueError(f"risk_tolerance must be one of {allowed}, got {v}")
+        return v.lower()
+
+    @field_validator("investor_class")
+    @classmethod
+    def validate_investor_class(cls, v: str) -> str:
+        allowed = {"retail", "professional", "institutional"}
+        if v.lower() not in allowed:
+            raise ValueError(f"investor_class must be one of {allowed}, got {v}")
+        return v.lower()
+
+    @field_validator("currency_exposure")
+    @classmethod
+    def validate_currency_exposure(cls, v: Dict[str, float]) -> Dict[str, float]:
+        for curr, weight in v.items():
+            if not (0.0 <= weight <= 1.0):
+                raise ValueError(f"Currency weight for {curr} must be between 0.0 and 1.0, got {weight}")
+        return v
+
+
+class AssetCandidate(BaseModel):
+    """
+    Approved registry asset representation for portfolio candidate selection.
+    """
+    asset_id: str
+    display_name: str
+    issuer: str
+    sleeve_type: SleeveType
+    currency: str
+    liquidity_tier: int = 1  # 0: instant, 1: 24h, 2: 1 week
+    permissionless: bool = False
+    requires_professional: bool = False
+    requires_institutional: bool = False
+    blocked_jurisdictions: List[str] = Field(default_factory=list)
+    contract_address: str = ""
+    current_yield_pct: float = 0.0
+    tags: List[str] = Field(default_factory=list)
+    description: str = ""
+
+    @property
+    def investor_classes_required(self) -> List[str]:
+        if self.requires_institutional:
+            return ["institutional"]
+        if self.requires_professional:
+            return ["professional", "institutional"]
+        return ["retail", "professional", "institutional"]
