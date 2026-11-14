@@ -95,8 +95,8 @@ pub struct AssetEntry {
 
 ## 4. Acceptance Criteria to Gate Slice 4
 
-- [ ] Cargo workspace configured with `registry` member.
-- [ ] Contract authored with Soroban SDK and compiles cleanly.
-- [ ] `cargo test` in `contracts/registry` passes 100% of T21–T25 test cases.
-- [ ] Atomic commits and pushes to GitHub.
-- [ ] AI pauses and presents test assertion proofs before touching Slice 5.
+- [x] Cargo workspace configured with `registry` member.
+- [x] Contract authored with Soroban SDK and compiles cleanly.
+- [x] `cargo test` in `contracts/registry` passes 100% of T21–T25 test cases.
+- [x] Atomic commits and pushes to GitHub.
+- [x] AI pauses and presents test assertion proofs before touching Slice 5.
