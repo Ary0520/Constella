@@ -287,6 +287,7 @@ fn test_t38_per_sleeve_isolation() {
             if t0 == Ok(resume_sym.clone()) && t1 == Ok(sleeve_gov.clone()) {
                 let resume_data = NavResumeData::try_from_val(&env, &data).unwrap();
                 assert_eq!(resume_data.sleeve, sleeve_gov);
+                assert_eq!(resume_data.sources_valid, 2);
                 found_resume = true;
                 break;
             }
@@ -336,11 +337,25 @@ fn test_t39_sep40_interface_conformance() {
     let lp = client.lastprice(&benji_asset).expect("lastprice should return Some");
     assert_eq!(lp.price, 1_000_000);
 
+    // prices() SEP-40 batch query returns vector of option prices
+    let batch_prices = client.prices(&assets, &1).expect("prices batch should return Some");
+    assert_eq!(batch_prices.len(), 1);
+    assert_eq!(batch_prices.get(0).unwrap().unwrap().price, 1_000_000);
+
+    // prices() with 0 records returns empty vector
+    let batch_empty = client.prices(&assets, &0).expect("prices 0 records returns empty");
+    assert_eq!(batch_empty.len(), 0);
+
     // When time advances past staleness limit:
     env.ledger().set_timestamp(50_000);
 
     // Fresh price returns None due to staleness
     assert!(client.price(&benji_asset).is_none());
+
+    // Batch prices also returns None for stale asset
+    let batch_prices_stale = client.prices(&assets, &1).expect("prices batch returns Some");
+    assert_eq!(batch_prices_stale.len(), 1);
+    assert!(batch_prices_stale.get(0).unwrap().is_none());
 
     // lastprice still returns the last recorded price (SEP-40 requirement)
     let lp_stale = client.lastprice(&benji_asset).expect("lastprice returns historical");
@@ -410,12 +425,26 @@ fn test_uninitialized_and_authorization_checks() {
             OracleError::NotInitialized as u32
         )))
     );
+    assert_eq!(
+        client.try_trigger_circuit_breaker(&Symbol::new(&env, "SLEEVE"), &Symbol::new(&env, "TEST")),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            OracleError::NotInitialized as u32
+        )))
+    );
 
     // Initialize
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let base = Address::generate(&env);
     client.initialize(&admin, &base, &7, &300);
+
+    // Trigger circuit breaker on non-existent sleeve fails
+    assert_eq!(
+        client.try_trigger_circuit_breaker(&Symbol::new(&env, "NON_EXISTENT"), &Symbol::new(&env, "TEST")),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            OracleError::SleeveNotFound as u32
+        )))
+    );
 
     // Duplicate initialization fails
     assert_eq!(
@@ -459,4 +488,154 @@ fn test_uninitialized_and_authorization_checks() {
 
     let unauth_clear = client.try_clear_circuit_breaker(&Symbol::new(&env, "SLEEVE"));
     assert!(unauth_clear.is_err());
+}
+
+#[test]
+fn test_thin_feed_cannot_poison_lastprice() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &300, &2);
+
+    let benji_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // Two deep valid feeds ($1.00 and $1.01)
+    let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    let s2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 200_000, 1000);
+    client.register_source(&s1);
+    client.register_source(&s2);
+
+    // Query price() -> establishes valid conservative NAV of $1.00 and records LastPrice
+    let p = client.price(&benji_asset).expect("valid price");
+    assert_eq!(p.price, 1_000_000);
+    assert_eq!(client.lastprice(&benji_asset).unwrap().price, 1_000_000);
+
+    // YieldBlox exploit attempt: A thin market feed ($107.00, but only $50k depth < $100k min)
+    let s3_thin = create_source(&env, "MANIPULATED_SDEX", &benji_asset, "USD_GOV_FUNDS", 107_000_000, 50_000, 1000);
+    client.register_source(&s3_thin);
+
+    // Also update a thin source via update_price
+    client.update_price(&Symbol::new(&env, "MANIPULATED_SDEX"), &108_000_000, &40_000, &1000);
+
+    // CRITICAL SECURITY ASSERTION: lastprice MUST NOT be poisoned by thin feeds!
+    let lp = client.lastprice(&benji_asset).expect("lastprice returns valid cached price");
+    assert_eq!(lp.price, 1_000_000, "Thin feed must not poison lastprice");
+    assert_eq!(lp.source, Symbol::new(&env, "BENJI_NAV"));
+}
+
+#[test]
+fn test_extreme_price_difference_no_overflow() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &300, &2);
+
+    let benji_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // Feed 1: normal price ($1.00)
+    let s1 = create_source(&env, "FEED_1", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    // Feed 2: astronomical price approaching i128::MAX / 2 (diff * 10_000 would overflow i128)
+    let extreme_price = i128::MAX / 2;
+    let s2 = create_source(&env, "FEED_EXTREME", &benji_asset, "USD_GOV_FUNDS", extreme_price, 200_000, 1000);
+
+    client.register_source(&s1);
+    client.register_source(&s2);
+
+    // Calling get_collateral_nav must trip deviation circuit breaker WITHOUT PANICKING from integer overflow
+    assert!(client.get_collateral_nav(&sleeve).is_none());
+
+    // Verify NAV_PAUSE event emission IMMEDIATELY after trigger
+    let events = env.events().all();
+    let nav_pause_sym = Symbol::new(&env, "NAV_PAUSE");
+    let mut found_pause = false;
+    for event in events.iter() {
+        let (_cid, topics, data) = event;
+        if topics.len() >= 2 {
+            let t0 = Symbol::try_from_val(&env, &topics.get(0).unwrap());
+            let t1 = Symbol::try_from_val(&env, &topics.get(1).unwrap());
+            if t0 == Ok(nav_pause_sym.clone()) && t1 == Ok(sleeve.clone()) {
+                let pause_data = NavPauseData::try_from_val(&env, &data).unwrap();
+                assert_eq!(pause_data.reason, Symbol::new(&env, "DEVIATION"));
+                assert_eq!(pause_data.deviation_bps, u32::MAX);
+                found_pause = true;
+                break;
+            }
+        }
+    }
+    assert!(found_pause, "NAV_PAUSE event must be emitted on extreme price deviation");
+
+    // Verify sleeve is paused
+    assert!(client.is_sleeve_paused(&sleeve));
+}
+
+#[test]
+fn test_median_price_no_overflow() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "LARGE_NUMS");
+    // Threshold 10,000 bps (100%) to allow small relative spread
+    client.configure_sleeve(&sleeve, &10_000, &2);
+
+    let test_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // Two huge prices whose sum would overflow i128:
+    // (i128::MAX - 20) + (i128::MAX - 10) > i128::MAX
+    let p1 = i128::MAX - 20;
+    let p2 = i128::MAX - 10;
+    let s1 = create_source(&env, "FEED_A", &test_asset, "LARGE_NUMS", p1, 200_000, 1000);
+    let s2 = create_source(&env, "FEED_B", &test_asset, "LARGE_NUMS", p2, 200_000, 1000);
+    client.register_source(&s1);
+    client.register_source(&s2);
+
+    // get_deposit_nav must compute midpoint without overflow panic
+    let deposit_nav = client.get_deposit_nav(&sleeve).expect("deposit nav computes safely");
+    assert_eq!(deposit_nav.price, i128::MAX - 15);
+}
+
+#[test]
+fn test_property_collateral_nav_le_deposit_nav() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "PROP_TEST");
+    client.configure_sleeve(&sleeve, &500, &2); // 5% tolerance
+
+    let asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // Test with 2 sources
+    let s1 = create_source(&env, "P1", &asset, "PROP_TEST", 1_000_000, 200_000, 1000);
+    let s2 = create_source(&env, "P2", &asset, "PROP_TEST", 1_020_000, 200_000, 1000);
+    client.register_source(&s1);
+    client.register_source(&s2);
+    let c = client.get_collateral_nav(&sleeve).unwrap();
+    let d = client.get_deposit_nav(&sleeve).unwrap();
+    assert!(c.price <= d.price);
+
+    // Add 3rd source (odd count = 3)
+    let s3 = create_source(&env, "P3", &asset, "PROP_TEST", 1_010_000, 200_000, 1000);
+    client.register_source(&s3);
+    let c = client.get_collateral_nav(&sleeve).unwrap();
+    let d = client.get_deposit_nav(&sleeve).unwrap();
+    assert!(c.price <= d.price);
+
+    // Add 4th source (even count = 4)
+    let s4 = create_source(&env, "P4", &asset, "PROP_TEST", 995_000, 200_000, 1000);
+    client.register_source(&s4);
+    let c = client.get_collateral_nav(&sleeve).unwrap();
+    let d = client.get_deposit_nav(&sleeve).unwrap();
+    assert!(c.price <= d.price);
+
+    // Add 5th source (odd count = 5)
+    let s5 = create_source(&env, "P5", &asset, "PROP_TEST", 1_005_000, 200_000, 1000);
+    client.register_source(&s5);
+    let c = client.get_collateral_nav(&sleeve).unwrap();
+    let d = client.get_deposit_nav(&sleeve).unwrap();
+    assert!(c.price <= d.price);
 }

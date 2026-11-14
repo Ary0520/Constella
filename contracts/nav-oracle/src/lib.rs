@@ -70,6 +70,7 @@ pub struct NavPauseData {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NavResumeData {
     pub sleeve: Symbol,
+    pub sources_valid: u32,
     pub timestamp: u64,
 }
 
@@ -134,6 +135,9 @@ pub trait NavOracleTrait {
     /// SEP-40: Standard last price query
     fn lastprice(env: Env, asset: Address) -> Option<PriceData>;
 
+    /// SEP-40: Standard batch price query
+    fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>;
+
     /// SEP-40 metadata queries
     fn base(env: Env) -> Address;
     fn decimals(env: Env) -> u32;
@@ -178,9 +182,9 @@ fn evaluate_sources(
     source_ids: &Vec<Symbol>,
     sleeve_id: &Symbol,
     config: &mut SleeveOracleConfig,
-) -> Result<Vec<OracleSource>, ()> {
+) -> Result<Vec<OracleSource>, OracleError> {
     if config.is_paused {
-        return Err(());
+        return Err(OracleError::SleevePaused);
     }
 
     let mut valid_sources = Vec::new(env);
@@ -192,6 +196,10 @@ fn evaluate_sources(
             .instance()
             .get::<_, OracleSource>(&DataKey::Source(source_id))
         {
+            // Verify sleeve matches
+            if source.sleeve != *sleeve_id {
+                continue;
+            }
             // Filter 1: Active check
             if !source.is_active {
                 continue;
@@ -214,7 +222,7 @@ fn evaluate_sources(
 
     // Rule 5: Hard stop if fewer than min_valid_sources
     if valid_sources.len() < config.min_valid_sources {
-        return Err(());
+        return Err(OracleError::InsufficientSources);
     }
 
     // Rule 4: Deviation circuit breaker check
@@ -230,7 +238,10 @@ fn evaluate_sources(
     }
 
     let diff = max_price - min_price;
-    let dev_bps = (diff * 10_000) / min_price;
+    let dev_bps = match diff.checked_mul(10_000) {
+        Some(product) => product / min_price,
+        None => i128::MAX,
+    };
 
     if dev_bps > config.deviation_threshold_bps as i128 {
         config.is_paused = true;
@@ -239,6 +250,12 @@ fn evaluate_sources(
             .instance()
             .set(&DataKey::SleeveConfig(sleeve_id.clone()), config);
 
+        let dev_bps_clamped = if dev_bps > u32::MAX as i128 {
+            u32::MAX
+        } else {
+            dev_bps as u32
+        };
+
         env.events().publish(
             (Symbol::new(env, "NAV_PAUSE"), sleeve_id.clone()),
             NavPauseData {
@@ -246,11 +263,11 @@ fn evaluate_sources(
                 sleeve: sleeve_id.clone(),
                 sources_valid: valid_sources.len(),
                 sources_total: source_ids.len(),
-                deviation_bps: dev_bps as u32,
+                deviation_bps: dev_bps_clamped,
                 timestamp: now,
             },
         );
-        return Err(());
+        return Err(OracleError::DeviationExceeded);
     }
 
     Ok(valid_sources)
@@ -391,18 +408,6 @@ impl NavOracleTrait for NavOracle {
             all_assets.push_back(source.asset.clone());
             env.storage().instance().set(&DataKey::AllAssets, &all_assets);
         }
-
-        // If source has a valid initial price, record LastPrice
-        if source.price > 0 {
-            env.storage().instance().set(
-                &DataKey::LastPrice(source.asset.clone()),
-                &PriceData {
-                    price: source.price,
-                    timestamp: source.timestamp,
-                    source: source.source_id.clone(),
-                },
-            );
-        }
     }
 
     fn update_price(
@@ -440,15 +445,6 @@ impl NavOracleTrait for NavOracle {
         env.storage()
             .instance()
             .set(&DataKey::Source(source_id.clone()), &source);
-
-        env.storage().instance().set(
-            &DataKey::LastPrice(source.asset.clone()),
-            &PriceData {
-                price,
-                timestamp,
-                source: source_id.clone(),
-            },
-        );
 
         env.events().publish(
             (Symbol::new(&env, "PRICE_UPDATED"), source_id.clone()),
@@ -538,10 +534,10 @@ impl NavOracleTrait for NavOracle {
             let mid = len / 2;
             let s1 = sorted.get(mid - 1).unwrap();
             let s2 = sorted.get(mid).unwrap();
-            let median_price = (s1.price + s2.price) / 2;
+            let median_price = s1.price + (s2.price - s1.price) / 2;
             PriceData {
                 price: median_price,
-                timestamp: s2.timestamp,
+                timestamp: s1.timestamp.min(s2.timestamp),
                 source: s2.source_id.clone(),
             }
         };
@@ -638,6 +634,18 @@ impl NavOracleTrait for NavOracle {
         })
     }
 
+    fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>> {
+        if records == 0 {
+            return Some(Vec::new(&env));
+        }
+        let mut results = Vec::new(&env);
+        for asset in assets.iter() {
+            let p = Self::price(env.clone(), asset);
+            results.push_back(p);
+        }
+        Some(results)
+    }
+
     fn base(env: Env) -> Address {
         match env.storage().instance().get(&DataKey::BaseAsset) {
             Some(a) => a,
@@ -679,6 +687,16 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn trigger_circuit_breaker(env: Env, sleeve_id: Symbol, reason: Symbol) {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            panic_with_error!(&env, OracleError::NotInitialized);
+        }
+
+        let has_sources = env.storage().instance().has(&DataKey::SleeveSources(sleeve_id.clone()));
+        let has_config = env.storage().instance().has(&DataKey::SleeveConfig(sleeve_id.clone()));
+        if !has_sources && !has_config {
+            panic_with_error!(&env, OracleError::SleeveNotFound);
+        }
+
         let mut config: SleeveOracleConfig = env
             .storage()
             .instance()
@@ -697,22 +715,40 @@ impl NavOracleTrait for NavOracle {
             .instance()
             .set(&DataKey::SleeveConfig(sleeve_id.clone()), &config);
 
-        let total_sources = env
+        let source_ids: Vec<Symbol> = env
             .storage()
             .instance()
             .get::<_, Vec<Symbol>>(&DataKey::SleeveSources(sleeve_id.clone()))
-            .map(|v| v.len())
-            .unwrap_or(0);
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut sources_valid: u32 = 0;
+        for s_id in source_ids.iter() {
+            if let Some(source) = env
+                .storage()
+                .instance()
+                .get::<_, OracleSource>(&DataKey::Source(s_id))
+            {
+                if source.is_active
+                    && source.sleeve == sleeve_id
+                    && source.current_liquidity_depth_usd >= source.min_liquidity_depth_usd
+                    && now.saturating_sub(source.timestamp) <= source.staleness_limit_seconds
+                    && source.price > 0
+                {
+                    sources_valid += 1;
+                }
+            }
+        }
 
         env.events().publish(
             (Symbol::new(&env, "NAV_PAUSE"), sleeve_id.clone()),
             NavPauseData {
                 reason,
                 sleeve: sleeve_id,
-                sources_valid: 0,
-                sources_total: total_sources,
+                sources_valid,
+                sources_total: source_ids.len(),
                 deviation_bps: 0,
-                timestamp: env.ledger().timestamp(),
+                timestamp: now,
             },
         );
     }
@@ -739,11 +775,37 @@ impl NavOracleTrait for NavOracle {
             .instance()
             .set(&DataKey::SleeveConfig(sleeve_id.clone()), &config);
 
+        let source_ids: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get::<_, Vec<Symbol>>(&DataKey::SleeveSources(sleeve_id.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let now = env.ledger().timestamp();
+        let mut sources_valid: u32 = 0;
+        for s_id in source_ids.iter() {
+            if let Some(source) = env
+                .storage()
+                .instance()
+                .get::<_, OracleSource>(&DataKey::Source(s_id))
+            {
+                if source.is_active
+                    && source.sleeve == sleeve_id
+                    && source.current_liquidity_depth_usd >= source.min_liquidity_depth_usd
+                    && now.saturating_sub(source.timestamp) <= source.staleness_limit_seconds
+                    && source.price > 0
+                {
+                    sources_valid += 1;
+                }
+            }
+        }
+
         env.events().publish(
             (Symbol::new(&env, "NAV_RESUME"), sleeve_id.clone()),
             NavResumeData {
                 sleeve: sleeve_id,
-                timestamp: env.ledger().timestamp(),
+                sources_valid,
+                timestamp: now,
             },
         );
     }
