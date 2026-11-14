@@ -1,11 +1,45 @@
 #![no_std]
 #![allow(clippy::too_many_arguments)]
 
-use constella_registry::AssetRegistryClient;
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
     FromVal, Symbol, SymbolStr, Vec,
 };
+
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum RegistrySleeveType {
+    Cash = 0,
+    UsdGovFund = 1,
+    EurSovereign = 2,
+    YieldUsd = 3,
+    Lending = 4,
+    Equity = 5,
+    Xlm = 6,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryAssetEntry {
+    pub contract_address: Address,
+    pub asset_id: Symbol,
+    pub sleeve_type: RegistrySleeveType,
+    pub liquidity_tier: u32,
+    pub permissionless: bool,
+    pub oracle_sources: Vec<Symbol>,
+    pub eligible_jurisdictions: Vec<Symbol>,
+    pub blocked_jurisdictions: Vec<Symbol>,
+    pub investor_classes_required: Vec<Symbol>,
+    pub is_active: bool,
+    pub added_at: u64,
+}
+
+#[contractclient(name = "AssetRegistryClient")]
+pub trait AssetRegistryInterface {
+    fn is_registered(env: Env, contract_address: Address) -> bool;
+    fn get_asset(env: Env, asset_id: Symbol) -> Option<RegistryAssetEntry>;
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
