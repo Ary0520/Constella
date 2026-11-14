@@ -159,8 +159,8 @@ pub struct ValidationResult {
 
 ## 4. Acceptance Criteria to Gate Slice 5
 
-- [ ] Cargo workspace configured with `policy` member.
-- [ ] Contract authored with Soroban SDK and compiles cleanly.
-- [ ] `cargo test` in `contracts/policy` passes 100% of T26–T32 test cases.
-- [ ] High-frequency atomic commits and pushes to GitHub.
-- [ ] AI pauses and presents test assertion proofs before touching Slice 6.
+- [x] Cargo workspace configured with `policy` member.
+- [x] Contract authored with Soroban SDK and compiles cleanly.
+- [x] `cargo test` in `contracts/policy` passes 100% of T26–T32 test cases.
+- [x] High-frequency atomic commits and pushes to GitHub.
+- [x] AI pauses and presents test assertion proofs before touching Slice 6.
