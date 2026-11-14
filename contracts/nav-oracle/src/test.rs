@@ -1,0 +1,462 @@
+#![cfg(test)]
+
+extern crate std;
+
+use super::*;
+use soroban_sdk::{
+    testutils::{Address as _, Events, Ledger},
+    Address, Env, Symbol, TryFromVal,
+};
+
+fn setup_oracle(env: &Env) -> (NavOracleClient<'_>, Address, Address) {
+    env.mock_all_auths();
+    let contract_id = env.register(NavOracle, ());
+    let client = NavOracleClient::new(env, &contract_id);
+    let admin = Address::generate(env);
+    let base_asset = Address::generate(env);
+    client.initialize(&admin, &base_asset, &7, &300);
+    (client, admin, base_asset)
+}
+
+fn create_source(
+    env: &Env,
+    source_id: &str,
+    asset: &Address,
+    sleeve: &str,
+    price: i128,
+    depth: i128,
+    timestamp: u64,
+) -> OracleSource {
+    OracleSource {
+        source_id: Symbol::new(env, source_id),
+        asset: asset.clone(),
+        sleeve: Symbol::new(env, sleeve),
+        price,
+        timestamp,
+        staleness_limit_seconds: 14400, // 4 hours
+        min_liquidity_depth_usd: 100_000,
+        current_liquidity_depth_usd: depth,
+        is_active: true,
+    }
+}
+
+#[test]
+fn test_t33_dual_nav_and_pricing_invariant() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &300, &2); // 3% deviation threshold to allow 2% spread
+
+    let benji_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // 3 feeds: $1.00, $1.01, $0.99 (using 6 decimals: 1_000_000, 1_010_000, 990_000)
+    let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    let s2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 150_000, 1000);
+    let s3 = create_source(&env, "REDSTONE_BENJI", &benji_asset, "USD_GOV_FUNDS", 990_000, 180_000, 1000);
+
+    client.register_source(&s1);
+    client.register_source(&s2);
+    client.register_source(&s3);
+
+    let collateral_nav = client.get_collateral_nav(&sleeve).expect("collateral nav should exist");
+    let deposit_nav = client.get_deposit_nav(&sleeve).expect("deposit nav should exist");
+
+    // Collateral NAV must be MINIMUM: 990_000 ($0.99)
+    assert_eq!(collateral_nav.price, 990_000);
+    assert_eq!(collateral_nav.source, Symbol::new(&env, "REDSTONE_BENJI"));
+
+    // Deposit NAV must be MEDIAN: 1_000_000 ($1.00)
+    assert_eq!(deposit_nav.price, 1_000_000);
+    assert_eq!(deposit_nav.source, Symbol::new(&env, "BENJI_NAV"));
+
+    // Invariant: collateral_nav <= deposit_nav
+    assert!(collateral_nav.price <= deposit_nav.price);
+}
+
+#[test]
+fn test_t34_thin_liquidity_depth_exclusion() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &300, &2);
+
+    let benji_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // Feed 1: deep ($200k >= $100k min), price $1.00
+    let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    // Feed 2: deep ($150k >= $100k min), price $1.01
+    let s2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 150_000, 1000);
+    // Feed 3: thin ($50k < $100k min), manipulated YieldBlox-style price $107.00
+    let s3 = create_source(&env, "MANIPULATED_SDEX", &benji_asset, "USD_GOV_FUNDS", 107_000_000, 50_000, 1000);
+
+    client.register_source(&s1);
+    client.register_source(&s2);
+    client.register_source(&s3);
+
+    // The thin feed is completely ignored. NAV is computed only from s1 and s2.
+    let collateral_nav = client.get_collateral_nav(&sleeve).expect("nav should succeed");
+    assert_eq!(collateral_nav.price, 1_000_000);
+    assert_eq!(collateral_nav.source, Symbol::new(&env, "BENJI_NAV"));
+
+    // If s2 is also thin, leaving only 1 valid deep feed:
+    let s2_thin = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 40_000, 1000);
+    client.register_source(&s2_thin);
+
+    // Only 1 valid deep feed remains (< min_valid_sources 2), hard stop triggers!
+    assert!(client.get_collateral_nav(&sleeve).is_none());
+}
+
+#[test]
+fn test_t35_staleness_rejection() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &300, &2);
+
+    let benji_asset = Address::generate(&env);
+    // Current ledger timestamp is 20_000
+    env.ledger().set_timestamp(20_000);
+
+    // Feed 1: timestamp 19_000 (delta = 1000 <= 14400, valid)
+    let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 19_000);
+    // Feed 2: timestamp 18_000 (delta = 2000 <= 14400, valid)
+    let s2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 200_000, 18_000);
+    // Feed 3: timestamp 1_000 (delta = 19000 > 14400, STALE)
+    let s3 = create_source(&env, "REDSTONE_BENJI", &benji_asset, "USD_GOV_FUNDS", 980_000, 200_000, 1_000);
+
+    client.register_source(&s1);
+    client.register_source(&s2);
+    client.register_source(&s3);
+
+    // Stale feed (s3 with 980_000) is rejected. Min of fresh feeds is s1 (1_000_000).
+    let collateral_nav = client.get_collateral_nav(&sleeve).expect("nav should succeed");
+    assert_eq!(collateral_nav.price, 1_000_000);
+    assert_eq!(collateral_nav.source, Symbol::new(&env, "BENJI_NAV"));
+
+    // Advance time to 40_000, so all feeds become stale
+    env.ledger().set_timestamp(40_000);
+    assert!(client.get_collateral_nav(&sleeve).is_none());
+}
+
+#[test]
+fn test_t36_hard_stop_on_insufficient_sources() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &200, &2); // requires >= 2 valid sources
+
+    let benji_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // Only 1 source registered
+    let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    client.register_source(&s1);
+
+    // Rule 5 hard stop: < 2 valid sources returns None
+    assert!(client.get_collateral_nav(&sleeve).is_none());
+    assert!(client.get_deposit_nav(&sleeve).is_none());
+
+    // Register second source with is_active = false
+    let mut s2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 200_000, 1000);
+    s2.is_active = false;
+    client.register_source(&s2);
+
+    // Still only 1 active valid source -> returns None
+    assert!(client.get_collateral_nav(&sleeve).is_none());
+
+    // Activate second source
+    s2.is_active = true;
+    client.register_source(&s2);
+
+    // Now 2 valid sources -> returns valid NAV
+    assert!(client.get_collateral_nav(&sleeve).is_some());
+}
+
+#[test]
+fn test_t37_deviation_circuit_breaker() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    // Deviation threshold: 200 bps (2.0%)
+    client.configure_sleeve(&sleeve, &200, &2);
+
+    let benji_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // 2 feeds: $1.00 and $1.025 (divergence is 2.5% = 250 bps > 200 bps threshold)
+    let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    let s2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_025_000, 200_000, 1000);
+
+    client.register_source(&s1);
+    client.register_source(&s2);
+
+    // Query triggers circuit breaker and returns None
+    assert!(client.get_collateral_nav(&sleeve).is_none());
+
+    // Verify NAV_PAUSE event emission IMMEDIATELY after trigger
+    let events = env.events().all();
+    let nav_pause_sym = Symbol::new(&env, "NAV_PAUSE");
+    let mut found_pause_event = false;
+    for event in events.iter() {
+        let (_cid, topics, data) = event;
+        if topics.len() >= 2 {
+            let t0 = Symbol::try_from_val(&env, &topics.get(0).unwrap());
+            let t1 = Symbol::try_from_val(&env, &topics.get(1).unwrap());
+            if t0 == Ok(nav_pause_sym.clone()) && t1 == Ok(sleeve.clone()) {
+                let pause_data = NavPauseData::try_from_val(&env, &data).unwrap();
+                assert_eq!(pause_data.reason, Symbol::new(&env, "DEVIATION"));
+                assert_eq!(pause_data.deviation_bps, 250);
+                found_pause_event = true;
+                break;
+            }
+        }
+    }
+    assert!(found_pause_event, "NAV_PAUSE event should be emitted");
+
+    // Verify sleeve is paused with reason DEVIATION
+    assert!(client.is_sleeve_paused(&sleeve));
+    let cfg = client.get_sleeve_config(&sleeve).unwrap();
+    assert!(cfg.is_paused);
+    assert_eq!(cfg.pause_reason, Symbol::new(&env, "DEVIATION"));
+
+    // Subsequent calls while paused also return None
+    assert!(client.get_collateral_nav(&sleeve).is_none());
+    assert!(client.get_deposit_nav(&sleeve).is_none());
+}
+
+#[test]
+fn test_t38_per_sleeve_isolation() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve_gov = Symbol::new(&env, "USD_GOV_FUNDS");
+    let sleeve_cash = Symbol::new(&env, "CASH_STABLE");
+
+    client.configure_sleeve(&sleeve_gov, &200, &2);
+    client.configure_sleeve(&sleeve_cash, &200, &2);
+
+    let benji_asset = Address::generate(&env);
+    let usdc_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    // USD_GOV_FUNDS feeds
+    let g1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    let g2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_005_000, 200_000, 1000);
+    client.register_source(&g1);
+    client.register_source(&g2);
+
+    // CASH_STABLE feeds
+    let c1 = create_source(&env, "REFLECTOR_USDC", &usdc_asset, "CASH_STABLE", 1_000_000, 500_000, 1000);
+    let c2 = create_source(&env, "REDSTONE_USDC", &usdc_asset, "CASH_STABLE", 1_000_100, 500_000, 1000);
+    client.register_source(&c1);
+    client.register_source(&c2);
+
+    // Trigger pause exclusively on USD_GOV_FUNDS
+    client.trigger_circuit_breaker(&sleeve_gov, &Symbol::new(&env, "EMERGENCY_HALT"));
+
+    assert!(client.is_sleeve_paused(&sleeve_gov));
+    assert!(!client.is_sleeve_paused(&sleeve_cash));
+
+    // USD_GOV_FUNDS is paused and returns None
+    assert!(client.get_collateral_nav(&sleeve_gov).is_none());
+
+    // CASH_STABLE continues operating normally without interference
+    let cash_nav = client.get_collateral_nav(&sleeve_cash).expect("cash stable should operate");
+    assert_eq!(cash_nav.price, 1_000_000);
+    assert_eq!(cash_nav.source, Symbol::new(&env, "REFLECTOR_USDC"));
+
+    // Clear circuit breaker on USD_GOV_FUNDS
+    client.clear_circuit_breaker(&sleeve_gov);
+
+    // Verify NAV_RESUME event IMMEDIATELY after clear_circuit_breaker
+    let events = env.events().all();
+    let resume_sym = Symbol::new(&env, "NAV_RESUME");
+    let mut found_resume = false;
+    for event in events.iter() {
+        let (_cid, topics, data) = event;
+        if topics.len() >= 2 {
+            let t0 = Symbol::try_from_val(&env, &topics.get(0).unwrap());
+            let t1 = Symbol::try_from_val(&env, &topics.get(1).unwrap());
+            if t0 == Ok(resume_sym.clone()) && t1 == Ok(sleeve_gov.clone()) {
+                let resume_data = NavResumeData::try_from_val(&env, &data).unwrap();
+                assert_eq!(resume_data.sleeve, sleeve_gov);
+                found_resume = true;
+                break;
+            }
+        }
+    }
+    assert!(found_resume, "NAV_RESUME event should be emitted");
+
+    assert!(!client.is_sleeve_paused(&sleeve_gov));
+
+    // USD_GOV_FUNDS resumes functioning
+    let gov_nav = client.get_collateral_nav(&sleeve_gov).expect("gov funds should resume");
+    assert_eq!(gov_nav.price, 1_000_000);
+}
+
+#[test]
+fn test_t39_sep40_interface_conformance() {
+    let env = Env::default();
+    let (client, _admin, base_asset) = setup_oracle(&env);
+
+    // Verify metadata functions
+    assert_eq!(client.base(), base_asset);
+    assert_eq!(client.decimals(), 7);
+    assert_eq!(client.resolution(), 300);
+
+    let benji_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &300, &2);
+
+    let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    let s2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 200_000, 1000);
+    client.register_source(&s1);
+    client.register_source(&s2);
+
+    // assets() returns registered assets
+    let assets = client.assets();
+    assert_eq!(assets.len(), 1);
+    assert_eq!(assets.get(0).unwrap(), benji_asset);
+
+    // price() returns conservative NAV (minimum of valid sources)
+    let p = client.price(&benji_asset).expect("price should return Some");
+    assert_eq!(p.price, 1_000_000);
+    assert_eq!(p.source, Symbol::new(&env, "BENJI_NAV"));
+
+    // lastprice() returns valid price
+    let lp = client.lastprice(&benji_asset).expect("lastprice should return Some");
+    assert_eq!(lp.price, 1_000_000);
+
+    // When time advances past staleness limit:
+    env.ledger().set_timestamp(50_000);
+
+    // Fresh price returns None due to staleness
+    assert!(client.price(&benji_asset).is_none());
+
+    // lastprice still returns the last recorded price (SEP-40 requirement)
+    let lp_stale = client.lastprice(&benji_asset).expect("lastprice returns historical");
+    assert_eq!(lp_stale.price, 1_000_000);
+}
+
+#[test]
+fn test_update_price_and_events() {
+    let env = Env::default();
+    let (client, _admin, _base) = setup_oracle(&env);
+
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &300, &2);
+
+    let benji_asset = Address::generate(&env);
+    env.ledger().set_timestamp(1000);
+
+    let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
+    client.register_source(&s1);
+
+    // Update price
+    client.update_price(&Symbol::new(&env, "BENJI_NAV"), &1_050_000, &250_000, &1500);
+
+    // Verify PRICE_UPDATED event IMMEDIATELY after update_price
+    let events = env.events().all();
+    let price_updated_sym = Symbol::new(&env, "PRICE_UPDATED");
+    let mut found_update_event = false;
+    for event in events.iter() {
+        let (_cid, topics, data) = event;
+        if topics.len() >= 2 {
+            let t0 = Symbol::try_from_val(&env, &topics.get(0).unwrap());
+            let t1 = Symbol::try_from_val(&env, &topics.get(1).unwrap());
+            if t0 == Ok(price_updated_sym.clone()) && t1 == Ok(Symbol::new(&env, "BENJI_NAV")) {
+                let update_data = PriceUpdatedData::try_from_val(&env, &data).unwrap();
+                assert_eq!(update_data.price, 1_050_000);
+                assert_eq!(update_data.liquidity_depth_usd, 250_000);
+                assert_eq!(update_data.timestamp, 1500);
+                found_update_event = true;
+                break;
+            }
+        }
+    }
+    assert!(found_update_event, "PRICE_UPDATED event should be emitted");
+
+    let updated_source = client.get_source(&Symbol::new(&env, "BENJI_NAV")).unwrap();
+    assert_eq!(updated_source.price, 1_050_000);
+    assert_eq!(updated_source.current_liquidity_depth_usd, 250_000);
+    assert_eq!(updated_source.timestamp, 1500);
+}
+
+#[test]
+fn test_uninitialized_and_authorization_checks() {
+    let env = Env::default();
+    let contract_id = env.register(NavOracle, ());
+    let client = NavOracleClient::new(&env, &contract_id);
+
+    // Calling before initialization fails
+    assert_eq!(
+        client.try_get_admin(),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            OracleError::NotInitialized as u32
+        )))
+    );
+    assert_eq!(
+        client.try_base(),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            OracleError::NotInitialized as u32
+        )))
+    );
+
+    // Initialize
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let base = Address::generate(&env);
+    client.initialize(&admin, &base, &7, &300);
+
+    // Duplicate initialization fails
+    assert_eq!(
+        client.try_initialize(&admin, &base, &7, &300),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            OracleError::AlreadyInitialized as u32
+        )))
+    );
+
+    // Invalid threshold fails
+    assert_eq!(
+        client.try_configure_sleeve(&Symbol::new(&env, "SLEEVE"), &0, &2),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            OracleError::InvalidThreshold as u32
+        )))
+    );
+    assert_eq!(
+        client.try_configure_sleeve(&Symbol::new(&env, "SLEEVE"), &15000, &2),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            OracleError::InvalidThreshold as u32
+        )))
+    );
+    assert_eq!(
+        client.try_configure_sleeve(&Symbol::new(&env, "SLEEVE"), &200, &0),
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            OracleError::InvalidThreshold as u32
+        )))
+    );
+
+    // Clear mocked auths -> unauthorized calls fail
+    env.mock_auths(&[]);
+    let unauth_config = client.try_configure_sleeve(&Symbol::new(&env, "SLEEVE"), &200, &2);
+    assert!(unauth_config.is_err());
+
+    let dummy_source = create_source(&env, "S1", &base, "SLEEVE", 100, 100_000, 100);
+    let unauth_reg = client.try_register_source(&dummy_source);
+    assert!(unauth_reg.is_err());
+
+    let unauth_update = client.try_update_price(&Symbol::new(&env, "S1"), &100, &100_000, &100);
+    assert!(unauth_update.is_err());
+
+    let unauth_clear = client.try_clear_circuit_breaker(&Symbol::new(&env, "SLEEVE"));
+    assert!(unauth_clear.is_err());
+}

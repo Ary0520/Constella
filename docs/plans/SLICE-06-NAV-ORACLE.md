@@ -1,7 +1,7 @@
 # Slice 6 Micro-Spec: NAV Oracle Contract (SEP-40 Multi-Source & Deviation Circuit Breakers)
 
 > **Module:** `contracts/nav-oracle`  
-> **Status:** Specification & Plan Phase (Pre-Implementation)  
+> **Status:** Implemented & Verified  
 > **Reference:** [`docs/build-spec/architecture/NAV-ORACLE.md`](../build-spec/architecture/NAV-ORACLE.md), [`docs/build-spec/contracts/CONTRACTS-SPEC.md`](../build-spec/contracts/CONTRACTS-SPEC.md#L197-L240), [`docs/build-spec/contracts/SEPS.md`](../build-spec/contracts/SEPS.md#L87-L111), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 3, 6, 8, 11, 12)
 
 ---
@@ -131,9 +131,9 @@ pub struct SleeveOracleConfig {
 
 ## 4. Acceptance Criteria to Gate Slice 6
 
-- [ ] Cargo workspace configured with `nav-oracle` member.
-- [ ] Contract authored with Soroban SDK and compiles cleanly.
-- [ ] `cargo test` in `contracts/nav-oracle` passes 100% of T33–T39 test cases.
-- [ ] Optimized WASM build generated via `stellar contract build`.
-- [ ] High-frequency atomic commits and pushes to GitHub.
-- [ ] AI pauses and presents test assertion proofs before touching Slice 7.
+- [x] Cargo workspace configured with `nav-oracle` member.
+- [x] Contract authored with Soroban SDK and compiles cleanly.
+- [x] `cargo test` in `contracts/nav-oracle` passes 100% of T33–T39 test cases.
+- [x] Optimized WASM build generated via `stellar contract build`.
+- [x] High-frequency atomic commits and pushes to GitHub.
+- [x] AI pauses and presents test assertion proofs before touching Slice 7.
