@@ -1,0 +1,16 @@
+[package]
+name = "constella-policy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+constella-registry = { path = "../registry" }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
