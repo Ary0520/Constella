@@ -1,0 +1,119 @@
+# Stellar Ecosystem Proposals (SEPs) Reference
+
+> Technical standards powering the Constella architecture. All implementations must strictly conform to these SEPs.
+
+---
+
+## 1. SEP-41: Fungible Token Standard
+
+### Overview
+SEP-41 defines the standard token interface for Soroban smart contracts, acting as the Stellar equivalent of Ethereum's ERC-20.
+
+### Replicating Properties
+- **Decimals & Metadata:** Token name, symbol, decimals (default 7 for classic Stellar asset parity).
+- **Core Operations:** `transfer`, `transfer_from`, `approve`, `balance`, `allowance`.
+- **Status:** Finalized, production-standard across Soroban DeFi.
+
+### Implementation in Constella
+Every Constella basket token (vault share token) **must** implement SEP-41 so that:
+- Users can hold, transfer, and trade shares in standard Stellar wallets (Freighter, xBull, Lobstr).
+- AMMs (Soroswap, Aquarius) and DEX orderbooks can list the basket token.
+- Lending markets (Blend, Liqvid) can accept the basket token as collateral.
+
+---
+
+## 2. SEP-56: Tokenized Vault Standard
+
+### Overview
+SEP-56 is Stellar's ecosystem adaptation of Ethereum's ERC-4626 Tokenized Vault Standard. It provides a standardized API for yield-bearing single-asset deposit vaults.
+
+### Core Functions & Properties
+```rust
+pub trait SEP56Vault {
+    // Deposit / Mint
+    fn deposit(env: Env, assets: i128, receiver: Address) -> i128;
+    fn mint(env: Env, shares: i128, receiver: Address) -> i128;
+
+    // Withdraw / Redeem
+    fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address) -> i128;
+    fn redeem(env: Env, shares: i128, receiver: Address, owner: Address) -> i128;
+
+    // Accounting & Pricing
+    fn total_assets(env: Env) -> i128;
+    fn total_supply(env: Env) -> i128;
+    fn convert_to_shares(env: Env, assets: i128) -> i128;
+    fn convert_to_assets(env: Env, shares: i128) -> i128;
+    fn asset(env: Env) -> Address; // Underlying numéraire
+    
+    // Limits
+    fn max_deposit(env: Env, receiver: Address) -> i128;
+    fn max_mint(env: Env, receiver: Address) -> i128;
+    fn max_withdraw(env: Env, owner: Address) -> i128;
+    fn max_redeem(env: Env, owner: Address) -> i128;
+}
+```
+
+### How Constella Extends SEP-56 for Multi-Asset Baskets
+While classic SEP-56 targets a single underlying asset, Constella achieves SEP-56 compliance for multi-asset baskets by:
+1. **Single Numéraire Settlement:** All deposits and redemptions enter and exit in a single base currency (USDC or EURC).
+2. **Internal Multi-Asset Accounting:** Internally, the vault allocates numéraire across multiple sleeve constituents.
+3. **NAV-Based Conversion:** `convert_to_shares` and `convert_to_assets` evaluate the aggregate basket NAV against the numéraire.
+4. **Base Module:** Implemented directly using OpenZeppelin's audited `stellar-contracts` v0.8.0 SEP-56 implementation.
+
+---
+
+## 3. SEP-57: T-REX (Regulated Token Standard)
+
+### Overview
+SEP-57 is Stellar's standard for compliant permissioned Real-World Assets, modeled after the Ethereum ERC-3643 (T-REX) framework.
+
+### Architecture Components
+1. **Identity Registry:** Maps Stellar addresses to verified identity hashes/claims (KYC/AML status, investor classification, country of residence).
+2. **Compliance Engine:** Modular rule contracts that validate whether a transfer is legal prior to execution.
+3. **Asset Features:**
+   - Enforced transfer restrictions.
+   - Forced transfer / recovery (for legal lost-key recovery).
+   - Issuer freeze and clawback integration.
+   - Lifecycle hooks (dividend distributions, voting snapshots).
+
+### Implementation in Constella
+- **Open Share Classes:** Use standard SEP-41 / SEP-56 (permissionless constituents only).
+- **Gated Share Classes (Phase 3+):** When a basket contains permissioned assets (e.g., BENJI, USDY, Spiko, JQQQ), the basket share token itself must be an SEP-57 token.
+- **Identity Verifier Hook:** Before minting or transferring gated shares, the vault queries the SEP-57 identity registry to confirm the recipient is eligible.
+- **Liquidation Path:** Ensures only compliant, whitelisted liquidators can seize and unwind gated collateral.
+
+---
+
+## 4. SEP-40: Oracle Interface Standard
+
+### Overview
+SEP-40 specifies the standard interface for price oracle contracts on Soroban, standardizing how DeFi protocols fetch asset prices, base assets, and resolution.
+
+### Core Interface
+```rust
+pub trait SEP40Oracle {
+    fn base(env: Env) -> Address;
+    fn decimals(env: Env) -> u32;
+    fn resolution(env: Env) -> u32; // In seconds
+    fn price(env: Env, asset: Address) -> Option<PriceData>;
+    fn lastprice(env: Env, asset: Address) -> Option<PriceData>;
+    fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>;
+    fn assets(env: Env) -> Vec<Address>;
+}
+```
+
+### Implementation in Constella
+- Constella's NAV Oracle contract implements SEP-40.
+- When Blend, Liqvid, or another lending market integrates a Constella basket token, they query our SEP-40 interface.
+- Returns the **Conservative NAV** (minimum of valid sources) to safeguard lenders from collateral inflation.
+
+---
+
+## 5. Other Relevant SEPs
+
+| SEP | Title | Relevance to Constella |
+|---|---|---|
+| **SEP-01** | `stellar.toml` | Declares issuer metadata, currency definitions, documentation, and contract addresses |
+| **SEP-10** | Stellar Web Authentication | Cryptographic challenge-response authentication for API/Web logins using Stellar keypairs |
+| **SEP-24** | Hosted Deposit & Withdrawal | Fiat on/off-ramp integration for partner wallets (fiat → USDC → basket) |
+| **SEP-38** | Anchor RFQ API | Real-time quotes for cross-currency anchor swaps (e.g., fiat EUR to EURC) |

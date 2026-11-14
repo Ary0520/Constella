@@ -1,0 +1,15 @@
+services:
+  stellar-local:
+    image: stellar/quickstart:latest
+    container_name: constella-stellar-local
+    platform: linux/amd64
+    command: ["--standalone", "--enable-soroban-rpc"]
+    ports:
+      - "8000:8000"   # Horizon / Soroban RPC endpoint
+    environment:
+      - NETWORK_PASSPHRASE=Standalone Network ; February 2017
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

@@ -1,0 +1,21 @@
+[project]
+name = "constella-ai-engine"
+version = "0.1.0"
+description = "Constella AI Thesis Engine: Parses user theses, filters candidate assets from on-chain registry, and optimizes risk-bounded policies."
+requires-python = ">=3.11"
+dependencies = [
+    "pydantic>=2.7.0",
+    "numpy>=1.26.0",
+    "pyportfolioopt>=1.5.5",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"
