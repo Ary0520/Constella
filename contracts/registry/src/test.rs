@@ -39,20 +39,49 @@ fn test_t21_initialization_and_admin_auth() {
     let contract_id = env.register(AssetRegistry, ());
     let client = AssetRegistryClient::new(&env, &contract_id);
 
+    // Calling before initialization must fail with NotInitialized
+    let uninit_admin = client.try_get_admin();
+    assert_eq!(
+        uninit_admin,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            RegistryError::NotInitialized as u32
+        )))
+    );
+
+    let dummy_addr = Address::generate(&env);
+    let sample = create_sample_entry(&env, &dummy_addr, "USDC", SleeveType::Cash, 0, "PYTH_USDC");
+    let uninit_add = client.try_add_asset(&sample);
+    assert_eq!(
+        uninit_add,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            RegistryError::NotInitialized as u32
+        )))
+    );
+
+    let uninit_deact = client.try_deactivate_asset(&Symbol::new(&env, "USDC"));
+    assert_eq!(
+        uninit_deact,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            RegistryError::NotInitialized as u32
+        )))
+    );
+
     let admin = Address::generate(&env);
     client.initialize(&admin);
 
     // Verify admin
     assert_eq!(client.get_admin(), admin);
 
-    // Re-initialization must fail
+    // Re-initialization must fail with AlreadyInitialized
     let duplicate_init = client.try_initialize(&admin);
-    assert!(duplicate_init.is_err());
+    assert_eq!(
+        duplicate_init,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            RegistryError::AlreadyInitialized as u32
+        )))
+    );
 
     // Non-admin caller attempting add_asset without mock auths must fail
-    let dummy_addr = Address::generate(&env);
-    let sample = create_sample_entry(&env, &dummy_addr, "USDC", SleeveType::Cash, 0, "PYTH_USDC");
-
     // Clear mocked auths to test authorization failure
     env.mock_auths(&[]);
     let unauth_result = client.try_add_asset(&sample);
@@ -183,6 +212,19 @@ fn test_t23_deactivate_asset() {
 
     // Other active assets remain registered
     assert!(client.is_registered(&eurc_addr));
+
+    // Verify re-activation: admin calls add_asset with is_active = true
+    let mut reactivated_usdc = usdc_entry.clone();
+    reactivated_usdc.is_active = true;
+    client.add_asset(&reactivated_usdc);
+
+    // Verify USDC is active again
+    let re_fetched = client.get_asset(&Symbol::new(&env, "USDC")).unwrap();
+    assert!(re_fetched.is_active);
+    assert!(client.is_registered(&usdc_addr));
+
+    // Verify list_assets count is still 2 (not duplicated)
+    assert_eq!(client.list_assets().len(), 2);
 }
 
 #[test]
@@ -213,6 +255,76 @@ fn test_t24_duplicate_and_unregistered_queries() {
         1
     );
 
+    // Address collision rejection: Attempting to register another asset with an already registered address must fail
+    let collision_entry = create_sample_entry(
+        &env,
+        &usdc_addr,
+        "FAKE_USDC",
+        SleeveType::Cash,
+        0,
+        "PYTH_FAKE",
+    );
+    let collision_err = client.try_add_asset(&collision_entry);
+    assert_eq!(
+        collision_err,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            RegistryError::AddressAlreadyRegistered as u32
+        )))
+    );
+
+    // Updating contract address for an existing asset:
+    let new_usdc_addr = Address::generate(&env);
+    let mut moved_entry = initial_entry.clone();
+    moved_entry.contract_address = new_usdc_addr.clone();
+    client.add_asset(&moved_entry);
+
+    // Old address is no longer registered or queryable
+    assert_eq!(client.get_asset_by_address(&usdc_addr), None);
+    assert!(!client.is_registered(&usdc_addr));
+
+    // New address is registered and maps to USDC
+    assert_eq!(
+        client.get_asset_by_address(&new_usdc_addr).unwrap().asset_id,
+        Symbol::new(&env, "USDC")
+    );
+    assert!(client.is_registered(&new_usdc_addr));
+    assert_eq!(client.list_assets().len(), 1);
+
+    // Input validation: Invalid liquidity tier (> 3)
+    let invalid_tier_entry = create_sample_entry(
+        &env,
+        &Address::generate(&env),
+        "INVALID_TIER",
+        SleeveType::Cash,
+        4,
+        "PYTH_INVALID",
+    );
+    let tier_err = client.try_add_asset(&invalid_tier_entry);
+    assert_eq!(
+        tier_err,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            RegistryError::InvalidLiquidityTier as u32
+        )))
+    );
+
+    // Input validation: Empty oracle sources
+    let mut empty_oracle_entry = create_sample_entry(
+        &env,
+        &Address::generate(&env),
+        "EMPTY_ORACLE",
+        SleeveType::Cash,
+        0,
+        "PYTH_EMPTY",
+    );
+    empty_oracle_entry.oracle_sources = vec![&env];
+    let empty_oracle_err = client.try_add_asset(&empty_oracle_entry);
+    assert_eq!(
+        empty_oracle_err,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            RegistryError::EmptyOracleSources as u32
+        )))
+    );
+
     // Unregistered queries
     let unregistered_addr = Address::generate(&env);
     assert_eq!(client.get_asset_by_address(&unregistered_addr), None);
@@ -221,9 +333,14 @@ fn test_t24_duplicate_and_unregistered_queries() {
     let unregistered_id = Symbol::new(&env, "UNKNOWN_ASSET");
     assert_eq!(client.get_asset(&unregistered_id), None);
 
-    // Deactivating an unregistered asset should fail
+    // Deactivating an unregistered asset should fail with AssetNotFound
     let deactivate_err = client.try_deactivate_asset(&unregistered_id);
-    assert!(deactivate_err.is_err());
+    assert_eq!(
+        deactivate_err,
+        Err(Ok(soroban_sdk::Error::from_contract_error(
+            RegistryError::AssetNotFound as u32
+        )))
+    );
 }
 
 #[test]

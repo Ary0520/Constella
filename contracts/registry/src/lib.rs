@@ -1,8 +1,21 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Symbol,
+    Vec,
 };
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum RegistryError {
+    AlreadyInitialized = 1,
+    NotInitialized = 2,
+    AssetNotFound = 3,
+    AddressAlreadyRegistered = 4,
+    InvalidLiquidityTier = 5,
+    EmptyOracleSources = 6,
+}
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -75,18 +88,37 @@ pub struct AssetRegistry;
 impl AssetRegistryTrait for AssetRegistry {
     fn initialize(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
-            panic!("already initialized");
+            panic_with_error!(&env, RegistryError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
     fn add_asset(env: Env, entry: AssetEntry) {
-        let admin: Address = env
+        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(admin) => admin,
+            None => panic_with_error!(&env, RegistryError::NotInitialized),
+        };
+        admin.require_auth();
+
+        // Input validation
+        if entry.liquidity_tier > 3 {
+            panic_with_error!(&env, RegistryError::InvalidLiquidityTier);
+        }
+        if entry.oracle_sources.is_empty() {
+            panic_with_error!(&env, RegistryError::EmptyOracleSources);
+        }
+
+        // Validate contract address uniqueness:
+        // A contract address cannot be registered to a different asset ID.
+        if let Some(existing_symbol) = env
             .storage()
             .instance()
-            .get(&DataKey::Admin)
-            .expect("not initialized");
-        admin.require_auth();
+            .get::<_, Symbol>(&DataKey::AssetByAddress(entry.contract_address.clone()))
+        {
+            if existing_symbol != entry.asset_id {
+                panic_with_error!(&env, RegistryError::AddressAlreadyRegistered);
+            }
+        }
 
         let mut asset_list: Vec<Symbol> = env
             .storage()
@@ -126,18 +158,20 @@ impl AssetRegistryTrait for AssetRegistry {
     }
 
     fn deactivate_asset(env: Env, asset_id: Symbol) {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("not initialized");
+        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(admin) => admin,
+            None => panic_with_error!(&env, RegistryError::NotInitialized),
+        };
         admin.require_auth();
 
-        let mut entry: AssetEntry = env
+        let mut entry: AssetEntry = match env
             .storage()
             .instance()
             .get(&DataKey::Asset(asset_id.clone()))
-            .expect("asset not found");
+        {
+            Some(entry) => entry,
+            None => panic_with_error!(&env, RegistryError::AssetNotFound),
+        };
 
         entry.is_active = false;
         env.storage()
@@ -186,10 +220,10 @@ impl AssetRegistryTrait for AssetRegistry {
     }
 
     fn get_admin(env: Env) -> Address {
-        env.storage()
-            .instance()
-            .get(&DataKey::Admin)
-            .expect("not initialized")
+        match env.storage().instance().get(&DataKey::Admin) {
+            Some(admin) => admin,
+            None => panic_with_error!(&env, RegistryError::NotInitialized),
+        }
     }
 }
 
