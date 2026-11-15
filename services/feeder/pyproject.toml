@@ -1,0 +1,25 @@
+[project]
+name = "constella-feeder"
+version = "0.1.0"
+description = "Constella price feeder: pushes independently derived prices to the Constella NAV oracle, one key per source (audit O7)."
+requires-python = ">=3.11"
+dependencies = [
+    "stellar-sdk==17.0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.3"]
+
+[project.scripts]
+constella-feeder = "constella_feeder.main:cli"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["localnet: needs a running local Stellar network (see tests/README.md)"]
