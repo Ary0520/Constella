@@ -285,11 +285,11 @@ fn test_t50_recovery_is_threshold_gated_and_cannot_move_funds() {
     let (g1, g2, g3) = (generate_keypair(env), generate_keypair(env), generate_keypair(env));
     let rec = add_recovery(&a, &[&g1, &g2, &g3], 2);
     let p = payload(env, b"t50");
-    let manage = || vec![env, call_ctx(env, &a.id, "add_signer")];
+    let manage = || vec![env, call_ctx(env, &a.id, "propose_recovery")];
 
     // 1 of 3 is not enough.
     assert!(check(&a, &p, auth_payload(&a, &p, &[rec], &[&g1]), manage()).is_err());
-    // 2 of 3 may manage the account.
+    // 2 of 3 may propose a recovery (it then waits 48 h - see s4).
     assert_eq!(check(&a, &p, auth_payload(&a, &p, &[rec], &[&g1, &g3]), manage()), Ok(()));
     // ... but can NOT authorize anything else: a vault deposit, a token transfer.
     let vault = Address::generate(env);
@@ -313,14 +313,14 @@ fn test_t51_owner_rotation_by_recovery_and_anti_bricking() {
     let vault = Address::generate(env);
     let spend = || vec![env, call_ctx(env, &vault, "deposit")];
 
-    // Lost phone: 2 guardians add a new owner passkey, then remove the old one.
+    // Lost phone: 2 guardians propose a new owner passkey; after the 48 h
+    // recovery delay (decision D-F) anyone executes it.
     let new_owner = generate_keypair(env);
     let new_signer = ext(env, &a.verifier, &new_owner);
-    sign_self_call(&a, &[&g1, &g2], rec, "add_signer", (a.owner_rule, new_signer.clone()).into_val(env));
-    a.client.add_signer(&a.owner_rule, &new_signer);
-    let old_id = a.client.get_signer_id(&ext(env, &a.verifier, &a.owner));
-    sign_self_call(&a, &[&g2, &g3], rec, "remove_signer", (a.owner_rule, old_id).into_val(env));
-    a.client.remove_signer(&a.owner_rule, &old_id);
+    sign_self_call(&a, &[&g1, &g2], rec, "propose_recovery", (new_signer.clone(),).into_val(env));
+    a.client.propose_recovery(&new_signer);
+    env.ledger().set_timestamp(env.ledger().timestamp() + s4::DELAY);
+    a.client.execute_recovery();
 
     let p = payload(env, b"after rotation");
     assert!(check(&a, &p, auth_payload(&a, &p, &[a.owner_rule], &[&a.owner]), spend()).is_err(), "old key still works");
@@ -795,5 +795,116 @@ mod s1 {
         let s = std::string::String::from_utf8(cd).unwrap().replace("constella.app", "evil.example");
         sig.client_data = Bytes::from_slice(&a.env, s.as_bytes());
         assert!(check_sig(&a, &p, sig).is_err());
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit S4 / decision D-F (2026-11-15): social recovery waits 48 hours and
+// the owner can cancel it; guardians can never change the account directly.
+// -------------------------------------------------------------------------
+mod s4 {
+    use super::*;
+
+    pub(super) const DELAY: u64 = 48 * 3600;
+    const T0: u64 = 1_000_000;
+
+    fn setup() -> (Acct, KeyPair, KeyPair, KeyPair, u32) {
+        let a = deploy();
+        a.env.ledger().set_timestamp(T0);
+        let (g1, g2, g3) = (generate_keypair(&a.env), generate_keypair(&a.env), generate_keypair(&a.env));
+        let rec = add_recovery(&a, &[&g1, &g2, &g3], 2);
+        (a, g1, g2, g3, rec)
+    }
+
+    fn propose(a: &Acct, signers: &[&KeyPair], rec: u32, new_owner: &Signer) {
+        sign_self_call(a, signers, rec, "propose_recovery", (new_owner.clone(),).into_val(&a.env));
+        a.client.propose_recovery(new_owner);
+    }
+
+    #[test]
+    fn guardians_cannot_change_the_account_directly() {
+        let (a, g1, g2, _g3, rec) = setup();
+        let env = &a.env;
+        let k = ext(env, &a.verifier, &generate_keypair(env));
+        // Real __check_auth: a management call selected under the recovery rule.
+        let p = payload(env, b"s4");
+        for f in ["add_signer", "remove_signer", "add_context_rule", "remove_context_rule", "cancel_recovery"] {
+            let r = check(&a, &p, auth_payload(&a, &p, &[rec], &[&g1, &g2]), vec![env, call_ctx(env, &a.id, f)]);
+            assert!(r.is_err(), "guardians could authorize `{f}`");
+        }
+        // Real signed entry, end to end.
+        sign_self_call(&a, &[&g1, &g2], rec, "add_signer", (a.owner_rule, k.clone()).into_val(env));
+        assert!(a.client.try_add_signer(&a.owner_rule, &k).is_err());
+        assert_eq!(a.client.get_context_rule(&a.owner_rule).signers.len(), 1);
+    }
+
+    #[test]
+    fn recovery_executes_only_after_48_hours_and_then_by_anyone() {
+        let (a, g1, _g2, g3, rec) = setup();
+        let env = &a.env;
+        let new_owner = generate_keypair(env);
+        let ns = ext(env, &a.verifier, &new_owner);
+        propose(&a, &[&g1, &g3], rec, &ns);
+        let pending = a.client.get_pending_recovery().unwrap();
+        assert_eq!((pending.new_owner.clone(), pending.executable_at), (ns.clone(), T0 + DELAY));
+
+        env.ledger().set_timestamp(T0 + DELAY - 1);
+        assert_eq!(a.client.try_execute_recovery().err().unwrap().unwrap(), contract_err(AccError::RecoveryNotReady as u32));
+        // The old owner keeps full control during the window.
+        let vault = Address::generate(env);
+        let p = payload(env, b"during window");
+        assert_eq!(check(&a, &p, auth_payload(&a, &p, &[a.owner_rule], &[&a.owner]), vec![env, call_ctx(env, &vault, "deposit")]), Ok(()));
+
+        env.ledger().set_timestamp(T0 + DELAY);
+        a.client.execute_recovery(); // no authorization needed
+        assert_eq!(a.client.get_context_rule(&a.owner_rule).signers, vec![env, ns.clone()]);
+        assert_eq!(a.client.get_pending_recovery(), None);
+        let p = payload(env, b"after");
+        let spend = || vec![env, call_ctx(env, &vault, "deposit")];
+        assert!(check(&a, &p, auth_payload(&a, &p, &[a.owner_rule], &[&a.owner]), spend()).is_err());
+        assert_eq!(check(&a, &p, auth_payload(&a, &p, &[a.owner_rule], &[&new_owner]), spend()), Ok(()));
+    }
+
+    #[test]
+    fn the_owner_can_cancel_and_guardians_cannot() {
+        let (a, g1, g2, _g3, rec) = setup();
+        let env = &a.env;
+        let attacker_key = ext(env, &a.verifier, &generate_keypair(env));
+        propose(&a, &[&g1, &g2], rec, &attacker_key);
+
+        sign_self_call(&a, &[&g1, &g2], rec, "cancel_recovery", ().into_val(env));
+        assert!(a.client.try_cancel_recovery().is_err());
+        assert!(a.client.get_pending_recovery().is_some());
+
+        sign_self_call(&a, &[&a.owner], a.owner_rule, "cancel_recovery", ().into_val(env));
+        a.client.cancel_recovery();
+        assert_eq!(a.client.get_pending_recovery(), None);
+        env.ledger().set_timestamp(T0 + DELAY);
+        assert_eq!(a.client.try_execute_recovery().err().unwrap().unwrap(), contract_err(AccError::NoPendingRecovery as u32));
+        assert_eq!(a.client.get_context_rule(&a.owner_rule).signers, vec![env, ext(env, &a.verifier, &a.owner)]);
+    }
+
+    #[test]
+    fn a_new_proposal_restarts_the_clock() {
+        let (a, g1, g2, g3, rec) = setup();
+        let env = &a.env;
+        let first = ext(env, &a.verifier, &generate_keypair(env));
+        let second = ext(env, &a.verifier, &generate_keypair(env));
+        propose(&a, &[&g1, &g2], rec, &first);
+        env.ledger().set_timestamp(T0 + 10 * 3600);
+        propose(&a, &[&g2, &g3], rec, &second);
+        let pending = a.client.get_pending_recovery().unwrap();
+        assert_eq!((pending.new_owner, pending.executable_at), (second.clone(), T0 + 10 * 3600 + DELAY));
+        env.ledger().set_timestamp(T0 + DELAY);
+        assert!(a.client.try_execute_recovery().is_err());
+    }
+
+    #[test]
+    fn the_current_owner_key_cannot_be_proposed() {
+        let (a, g1, g2, _g3, rec) = setup();
+        let env = &a.env;
+        let current = ext(env, &a.verifier, &a.owner);
+        sign_self_call(&a, &[&g1, &g2], rec, "propose_recovery", (current.clone(),).into_val(env));
+        assert_eq!(a.client.try_propose_recovery(&current).err().unwrap().unwrap(), contract_err(AccError::AlreadyOwner as u32));
     }
 }
