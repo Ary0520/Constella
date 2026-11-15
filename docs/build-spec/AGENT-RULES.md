@@ -101,7 +101,7 @@ Once a user signs a policy hash, the policy contract enforces it. **No model, ke
 | Policy keys | Descriptive, underscore-separated |
 | Registry IDs | `ISSUER_TICKER` format (e.g. `FRANKLIN_BENJI`) |
 | Sleeve names | Semantic: `USD_GOV_FUNDS`, `EUR_SOVEREIGN`, `CASH_STABLE`, `YIELD_DOLLAR`, `LENDING`, `EQUITY`, `XLM` |
-| Token events | SEP-41 event names (`transfer`, `approve`, `mint`, `burn`) are defined by the standard and take precedence over `SCREAMING_SNAKE_CASE` |
+| Token events | SEP-41 (`transfer`, `approve`, `mint`, `burn`) and SEP-56 (`deposit`, `withdraw`, with the SEP-56 topic layout) event names are defined by the standards and take precedence over `SCREAMING_SNAKE_CASE`; every other event is `SCREAMING_SNAKE_CASE` |
 
 ---
 
