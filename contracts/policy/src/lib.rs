@@ -55,6 +55,7 @@ pub trait OraclePriceInterface {
 pub trait AssetRegistryInterface {
     fn is_registered(env: Env, contract_address: Address) -> bool;
     fn get_asset(env: Env, asset_id: Symbol) -> Option<RegistryAssetEntry>;
+    fn get_asset_by_address(env: Env, contract_address: Address) -> Option<RegistryAssetEntry>;
 }
 
 #[contracterror]
@@ -77,6 +78,10 @@ pub enum PolicyError {
     PolicyAlreadyRegistered = 13,
     /// A traded asset has no valid oracle price, so slippage cannot be measured.
     PriceUnavailable = 14,
+    /// A trade buys an asset that is not declared (with a non-zero band) in the signed policy.
+    AssetNotInPolicy = 15,
+    /// The proposal was built against a different policy hash than the vault's current one.
+    PolicyHashMismatch = 16,
 }
 
 #[contracttype]
@@ -134,6 +139,9 @@ pub struct TradeOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalanceProposal {
     pub vault: Address,
+    /// Hash of the policy the proposer built against; must equal the vault's
+    /// current registered hash (CONTRACTS-SPEC check 1, audit M1).
+    pub policy_hash: BytesN<32>,
     pub operations: Vec<TradeOperation>,
     pub weights_after: Vec<(Symbol, u32)>, // (asset_id, weight_bps)
     pub deadline: u64,
@@ -516,6 +524,21 @@ impl PolicyContractTrait for PolicyContract {
             return res;
         }
 
+        // 0. The proposal must target the vault's CURRENT signed policy (audit M1).
+        // After the owner amends, proposals built for the old policy are void.
+        if proposal.policy_hash != config.policy_hash {
+            let res = ValidationResult {
+                is_valid: false,
+                code: PolicyError::PolicyHashMismatch as u32,
+                message: Symbol::new(&env, "POLICY_HASH_MISMATCH"),
+            };
+            env.events().publish(
+                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                (res.is_valid, res.code),
+            );
+            return res;
+        }
+
         // 1. Verify proposal deadline >= env.ledger().timestamp()
         if proposal.deadline < env.ledger().timestamp() {
             let res = ValidationResult {
@@ -763,6 +786,40 @@ impl PolicyContractTrait for PolicyContract {
                     is_valid: false,
                     code: PolicyError::AssetNotRegistered as u32,
                     message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
+                };
+                env.events().publish(
+                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                    (res.is_valid, res.code),
+                );
+                return res;
+            }
+        }
+
+        // 8c. Exclusions (audit M1, EXECUTION.md "no excluded asset is bought"):
+        // the signed sleeve list is the allow-list. Every asset bought must be
+        // declared there with a non-zero upper band. Selling is not restricted.
+        for i in 0..proposal.operations.len() {
+            let op = proposal.operations.get(i).unwrap();
+            let bought = registry_client.get_asset_by_address(&op.asset_out);
+            let allowed = match bought {
+                Some(entry) => {
+                    let mut ok = false;
+                    for k in 0..sleeves.len() {
+                        let sleeve = sleeves.get(k).unwrap();
+                        if sleeve.asset_id == entry.asset_id && sleeve.max_band_bps > 0 {
+                            ok = true;
+                            break;
+                        }
+                    }
+                    ok
+                }
+                None => false,
+            };
+            if !allowed {
+                let res = ValidationResult {
+                    is_valid: false,
+                    code: PolicyError::AssetNotInPolicy as u32,
+                    message: Symbol::new(&env, "ASSET_NOT_IN_POLICY"),
                 };
                 env.events().publish(
                     (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),

@@ -546,6 +546,7 @@ fn one_trade(s: &Stack, a_in: &Address, a_out: &Address, amount_in: i128, min_ou
     w.push_back((Symbol::new(&s.env, "EURC"), 5000u32));
     RebalanceProposal {
         vault: s.vault_id.clone(),
+        policy_hash: s.policy.get_policy_hash(&s.vault_id),
         operations: Vec::from_array(&s.env, [TradeOperation {
             asset_in: a_in.clone(),
             asset_out: a_out.clone(),
@@ -589,6 +590,7 @@ fn p2_issuer_cap_counts_all_assets_of_the_same_issuer() {
     w.push_back((Symbol::new(&s.env, "BLEND_USDC_SUPPLY"), 4000u32)); // Blend
     let proposal = RebalanceProposal {
         vault: s.vault_id.clone(),
+        policy_hash: s.policy.get_policy_hash(&s.vault_id),
         operations: Vec::new(&s.env),
         weights_after: w,
         deadline: T0 + 600,

@@ -155,6 +155,15 @@ fn price_asset(env: &Env, oracle: &NavOracleClient, asset: &Address, key: &str, 
     }
 }
 
+/// The vault's currently registered policy hash - what an honest keeper builds
+/// its proposal against - or all zeros if no policy is registered.
+fn current_policy_hash(env: &Env, policy: &Address, vault: &Address) -> BytesN<32> {
+    PolicyContractClient::new(env, policy)
+        .get_policy_config(vault)
+        .map(|c| c.policy_hash)
+        .unwrap_or(BytesN::from_array(env, &[0u8; 32]))
+}
+
 fn sample_sleeves(env: &Env) -> Vec<SleeveTarget> {
     vec![
         env,
@@ -420,6 +429,7 @@ fn test_t27_compliant_rebalance_acceptance() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops,
         weights_after,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -474,6 +484,7 @@ fn test_t28_weight_band_breach_rejected() {
     ];
     let proposal1 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_sum_fail,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -495,6 +506,7 @@ fn test_t28_weight_band_breach_rejected() {
     ];
     let proposal2 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_band_max_fail,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -516,6 +528,7 @@ fn test_t28_weight_band_breach_rejected() {
     ];
     let proposal3 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_band_min_fail,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -536,6 +549,7 @@ fn test_t28_weight_band_breach_rejected() {
     ];
     let proposal4 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_undeclared,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -618,6 +632,7 @@ fn test_t29_liquidity_floor_breach_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -702,6 +717,7 @@ fn test_t30_single_asset_cap_and_issuer_cap_rejected() {
     ];
     let proposal1 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_single_asset_breach,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -729,6 +745,7 @@ fn test_t30_single_asset_cap_and_issuer_cap_rejected() {
     // Issuer FRANKLIN: 2500 + 2500 = 5000 > 3000. Fails with IssuerCapExceeded!
     let proposal2 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_franklin_issuer_breach,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -774,6 +791,7 @@ fn test_t31_slippage_and_deadline_rejections() {
     let past_deadline = ctx.env.ledger().timestamp() - 1;
     let proposal1 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: valid_weights.clone(),
         deadline: past_deadline,
@@ -799,6 +817,7 @@ fn test_t31_slippage_and_deadline_rejections() {
     ];
     let proposal2 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_excessive_slippage,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -822,6 +841,7 @@ fn test_t31_slippage_and_deadline_rejections() {
     ];
     let proposal3 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_invalid_amount,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -875,6 +895,7 @@ fn test_t32_closed_universe_registry_cross_check() {
     ];
     let proposal1 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_unregistered_in,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -898,6 +919,7 @@ fn test_t32_closed_universe_registry_cross_check() {
     ];
     let proposal2 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_unregistered_out,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -920,6 +942,7 @@ fn test_t32_closed_universe_registry_cross_check() {
     ];
     let proposal3 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_deactivated,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -984,6 +1007,7 @@ fn test_exact_boundaries_acceptance() {
     // Exact boundary deadline: proposal.deadline == current ledger timestamp
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops,
         weights_after: weights,
         deadline: ctx.env.ledger().timestamp(), // exactly current timestamp!
@@ -1029,6 +1053,7 @@ fn test_rebalance_without_operations_passes() {
     // Proposal with empty operations
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1048,6 +1073,7 @@ fn test_unregistered_vault_rebalance_rejected() {
     let random_vault = Address::generate(&ctx.env);
     let proposal = RebalanceProposal {
         vault: random_vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: vec![&ctx.env],
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1094,6 +1120,7 @@ fn test_duplicate_asset_in_weights_after_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: duplicate_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1151,6 +1178,7 @@ fn test_slippage_overflow_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_overflow,
         weights_after: valid_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1196,6 +1224,7 @@ fn test_vault_mismatch_rejected() {
     let other_vault = Address::generate(&ctx.env);
     let proposal = RebalanceProposal {
         vault: other_vault, // Vault mismatch!
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: valid_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1272,6 +1301,7 @@ fn test_weights_after_with_deactivated_asset_rejected() {
     // Previously passed because check 8 only inspected operations!
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: vec![
             &ctx.env,
@@ -1334,6 +1364,7 @@ fn test_identical_trade_assets_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_identical,
         weights_after: valid_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1389,6 +1420,7 @@ fn test_negative_or_zero_min_amount_out_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_zero_out,
         weights_after: valid_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1677,6 +1709,7 @@ mod p1 {
     fn check(ctx: &TestContext, a_in: &Address, a_out: &Address, amount_in: i128, min_out: i128) -> ValidationResult {
         let proposal = RebalanceProposal {
             vault: ctx.vault.clone(),
+            policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
             operations: vec![&ctx.env, TradeOperation { asset_in: a_in.clone(), asset_out: a_out.clone(), amount_in, min_amount_out: min_out, route: TradeRoute::Soroswap }],
             weights_after: vec![&ctx.env, (Symbol::new(&ctx.env, "CIRCLE_USDC"), 5000u32), (Symbol::new(&ctx.env, "FX_EURC"), 5000u32)],
             deadline: ctx.env.ledger().timestamp() + 600,
@@ -1772,6 +1805,7 @@ mod p2 {
             &ctx.vault,
             &RebalanceProposal {
                 vault: ctx.vault.clone(),
+                policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
                 operations: Vec::new(&ctx.env),
                 weights_after: w,
                 deadline: ctx.env.ledger().timestamp() + 600,
@@ -1807,3 +1841,4 @@ mod p2 {
         assert!(r.is_valid, "different registered issuers must not be merged (code {})", r.code);
     }
 }
+
