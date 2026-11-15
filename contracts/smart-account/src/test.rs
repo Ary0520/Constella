@@ -800,3 +800,83 @@ fn m2_every_account_event_follows_rule_8() {
     n += check(&env);
     assert!(n >= 4, "saw {n} events");
 }
+
+// -------------------------------------------------------------------------
+// Audit W4.1b (2026-11-15): golden event encodings.
+// -------------------------------------------------------------------------
+/// Golden event recorder (audit W4.1b). Captures the exact XDR of every event
+/// the contract under test emits during a scenario and compares it with the
+/// committed `golden/events.txt`, so the `Events::publish` -> `#[contractevent]`
+/// migration is proven byte-for-byte. Regenerate ONLY deliberately with
+/// `UPDATE_GOLDEN=1 cargo test golden_events`.
+struct GoldenEvents {
+    contract: soroban_sdk::Address,
+    lines: std::vec::Vec<std::string::String>,
+    names: std::collections::BTreeSet<std::string::String>,
+}
+
+impl GoldenEvents {
+    fn new(contract: &soroban_sdk::Address) -> Self {
+        Self { contract: contract.clone(), lines: std::vec::Vec::new(), names: Default::default() }
+    }
+
+    fn capture(&mut self, env: &soroban_sdk::Env, step: &str) {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, Limits, ScVal, WriteXdr};
+        for e in env.events().all().filter_by_contract(&self.contract).events() {
+            let ContractEventBody::V0(body) = &e.body;
+            let name = match body.topics.first() {
+                Some(ScVal::Symbol(s)) => std::string::String::from_utf8_lossy(s.0.as_slice()).into_owned(),
+                _ => std::string::String::from("?"),
+            };
+            let b64 = e.body.to_xdr_base64(Limits::none()).unwrap();
+            self.lines.push(std::format!("{step} | {name} | {b64}"));
+            self.names.insert(name);
+        }
+    }
+
+    fn finish(self, expected_names: &[&str]) {
+        for n in expected_names {
+            assert!(self.names.contains(*n), "scenario never emitted `{n}`; coverage incomplete");
+        }
+        let dir = std::format!("{}/golden", env!("CARGO_MANIFEST_DIR"));
+        let path = std::format!("{dir}/events.txt");
+        let text = self.lines.join("\n") + "\n";
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing golden file {path}"));
+            assert_eq!(expected.replace("\r\n", "\n"), text, "event encoding changed vs {path}");
+        }
+    }
+}
+
+#[test]
+fn golden_events_smart_account() {
+    // Fixed keys: golden bytes must not depend on OsRng.
+    let fixed = |b: u8| {
+        let sk = SigningKey::from_slice(&[b; 32]).unwrap();
+        let pt = VerifyingKey::from(&sk).to_encoded_point(false);
+        pt.as_bytes().to_vec()
+    };
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = BytesN::<65>::from_array(&env, fixed(1).as_slice().try_into().unwrap());
+    let backup = BytesN::<65>::from_array(&env, fixed(2).as_slice().try_into().unwrap());
+    let id = env.register(SmartAccountContract, (owner.clone(), 1u32, String::from_str(&env, "owner")));
+    let mut g = GoldenEvents::new(&id);
+    g.capture(&env, "constructor");
+    let client = SmartAccountContractClient::new(&env, &id);
+    client.add_signer(&Signer { public_key: backup.clone(), weight: 1, role: SignerRole::Backup, name: String::from_str(&env, "b") });
+    g.capture(&env, "add_signer");
+    client.update_signer(&Signer { public_key: backup.clone(), weight: 2, role: SignerRole::Backup, name: String::from_str(&env, "b") });
+    g.capture(&env, "update_signer");
+    client.update_threshold(&2);
+    g.capture(&env, "update_threshold");
+    client.update_threshold(&1);
+    client.remove_signer(&backup);
+    g.capture(&env, "remove_signer");
+    g.finish(&["ACCOUNT_INITIALIZED", "SIGNER_ADDED", "SIGNER_UPDATED", "THRESHOLD_UPDATED", "SIGNER_REMOVED"]);
+}

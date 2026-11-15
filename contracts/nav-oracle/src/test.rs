@@ -1054,3 +1054,80 @@ mod asset_price {
         assert!(client.asset_price(&a).is_none(), "paused");
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit W4.1b (2026-11-15): golden event encodings.
+// -------------------------------------------------------------------------
+/// Golden event recorder (audit W4.1b). Captures the exact XDR of every event
+/// the contract under test emits during a scenario and compares it with the
+/// committed `golden/events.txt`, so the `Events::publish` -> `#[contractevent]`
+/// migration is proven byte-for-byte. Regenerate ONLY deliberately with
+/// `UPDATE_GOLDEN=1 cargo test golden_events`.
+struct GoldenEvents {
+    contract: soroban_sdk::Address,
+    lines: std::vec::Vec<std::string::String>,
+    names: std::collections::BTreeSet<std::string::String>,
+}
+
+impl GoldenEvents {
+    fn new(contract: &soroban_sdk::Address) -> Self {
+        Self { contract: contract.clone(), lines: std::vec::Vec::new(), names: Default::default() }
+    }
+
+    fn capture(&mut self, env: &soroban_sdk::Env, step: &str) {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, Limits, ScVal, WriteXdr};
+        for e in env.events().all().filter_by_contract(&self.contract).events() {
+            let ContractEventBody::V0(body) = &e.body;
+            let name = match body.topics.first() {
+                Some(ScVal::Symbol(s)) => std::string::String::from_utf8_lossy(s.0.as_slice()).into_owned(),
+                _ => std::string::String::from("?"),
+            };
+            let b64 = e.body.to_xdr_base64(Limits::none()).unwrap();
+            self.lines.push(std::format!("{step} | {name} | {b64}"));
+            self.names.insert(name);
+        }
+    }
+
+    fn finish(self, expected_names: &[&str]) {
+        for n in expected_names {
+            assert!(self.names.contains(*n), "scenario never emitted `{n}`; coverage incomplete");
+        }
+        let dir = std::format!("{}/golden", env!("CARGO_MANIFEST_DIR"));
+        let path = std::format!("{dir}/events.txt");
+        let text = self.lines.join("\n") + "\n";
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing golden file {path}"));
+            assert_eq!(expected.replace("\r\n", "\n"), text, "event encoding changed vs {path}");
+        }
+    }
+}
+
+#[test]
+fn golden_events_oracle() {
+    let env = Env::default();
+    let (client, admin, _base) = setup_oracle(&env);
+    let mut g = GoldenEvents::new(&client.address);
+    let sleeve = Symbol::new(&env, "USD_GOV_FUNDS");
+    client.configure_sleeve(&sleeve, &200, &2);
+    env.ledger().set_timestamp(1000);
+    let asset = Address::generate(&env);
+    client.register_source(&create_source(&env, "NAV", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000));
+    client.register_source(&create_source(&env, "RFL", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000));
+    g.capture(&env, "register_sources");
+    client.update_price(&Symbol::new(&env, "NAV"), &1_001_000, &250_000, &1000);
+    g.capture(&env, "update_price");
+    client.update_price(&Symbol::new(&env, "RFL"), &1_050_000, &250_000, &1000);
+    g.capture(&env, "update_price_deviation");
+    client.clear_circuit_breaker(&sleeve);
+    g.capture(&env, "clear_circuit_breaker");
+    client.trigger_circuit_breaker(&admin, &sleeve, &Symbol::new(&env, "MANUAL"));
+    g.capture(&env, "trigger_circuit_breaker");
+    client.set_pause_authority(&Address::generate(&env));
+    g.capture(&env, "set_pause_authority");
+    g.finish(&["PRICE_UPDATED", "NAV_PAUSE", "NAV_RESUME", "PAUSE_AUTHORITY_SET"]);
+}

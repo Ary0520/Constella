@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
@@ -351,4 +353,78 @@ fn m2_every_sponsor_event_follows_rule_8() {
     client.remove_contract(&vault); n += check(&env);
     client.set_admin(&Address::generate(&env)); n += check(&env);
     assert!(n >= 7, "saw {n} events");
+}
+
+// -------------------------------------------------------------------------
+// Audit W4.1b (2026-11-15): golden event encodings.
+// -------------------------------------------------------------------------
+/// Golden event recorder (audit W4.1b). Captures the exact XDR of every event
+/// the contract under test emits during a scenario and compares it with the
+/// committed `golden/events.txt`, so the `Events::publish` -> `#[contractevent]`
+/// migration is proven byte-for-byte. Regenerate ONLY deliberately with
+/// `UPDATE_GOLDEN=1 cargo test golden_events`.
+struct GoldenEvents {
+    contract: soroban_sdk::Address,
+    lines: std::vec::Vec<std::string::String>,
+    names: std::collections::BTreeSet<std::string::String>,
+}
+
+impl GoldenEvents {
+    fn new(contract: &soroban_sdk::Address) -> Self {
+        Self { contract: contract.clone(), lines: std::vec::Vec::new(), names: Default::default() }
+    }
+
+    fn capture(&mut self, env: &soroban_sdk::Env, step: &str) {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, Limits, ScVal, WriteXdr};
+        for e in env.events().all().filter_by_contract(&self.contract).events() {
+            let ContractEventBody::V0(body) = &e.body;
+            let name = match body.topics.first() {
+                Some(ScVal::Symbol(s)) => std::string::String::from_utf8_lossy(s.0.as_slice()).into_owned(),
+                _ => std::string::String::from("?"),
+            };
+            let b64 = e.body.to_xdr_base64(Limits::none()).unwrap();
+            self.lines.push(std::format!("{step} | {name} | {b64}"));
+            self.names.insert(name);
+        }
+    }
+
+    fn finish(self, expected_names: &[&str]) {
+        for n in expected_names {
+            assert!(self.names.contains(*n), "scenario never emitted `{n}`; coverage incomplete");
+        }
+        let dir = std::format!("{}/golden", env!("CARGO_MANIFEST_DIR"));
+        let path = std::format!("{dir}/events.txt");
+        let text = self.lines.join("\n") + "\n";
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing golden file {path}"));
+            assert_eq!(expected.replace("\r\n", "\n"), text, "event encoding changed vs {path}");
+        }
+    }
+}
+
+#[test]
+fn golden_events_fee_sponsor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000u64));
+    let mut g = GoldenEvents::new(&id);
+    g.capture(&env, "constructor");
+    let client = FeeSponsorContractClient::new(&env, &id);
+    let vault = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.whitelist_contract(&vault); g.capture(&env, "whitelist_contract");
+    client.record_sponsored_op(&user, &vault, &100); g.capture(&env, "record_sponsored_op");
+    client.set_limits(&20, &60, &2_000_000); g.capture(&env, "set_limits");
+    client.pause(); g.capture(&env, "pause");
+    client.unpause(); g.capture(&env, "unpause");
+    client.remove_contract(&vault); g.capture(&env, "remove_contract");
+    client.set_admin(&Address::generate(&env)); g.capture(&env, "set_admin");
+    g.finish(&["SPONSOR_INITIALIZED", "CONTRACT_WHITELISTED", "SPONSORED_OP", "LIMITS_UPDATED",
+        "SPONSOR_PAUSED", "SPONSOR_UNPAUSED", "CONTRACT_UNWHITELISTED", "SPONSOR_ADMIN_TRANSFERRED"]);
 }

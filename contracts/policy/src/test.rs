@@ -2084,3 +2084,124 @@ mod p4 {
         assert_eq!(p.effective_at - p.proposed_at, 7 * 24 * H, "longer notice applies to new proposals");
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit W4.1b (2026-11-15): golden event encodings.
+// -------------------------------------------------------------------------
+/// Golden event recorder (audit W4.1b). Captures the exact XDR of every event
+/// the contract under test emits during a scenario and compares it with the
+/// committed `golden/events.txt`, so the `Events::publish` -> `#[contractevent]`
+/// migration is proven byte-for-byte. Regenerate ONLY deliberately with
+/// `UPDATE_GOLDEN=1 cargo test golden_events`.
+struct GoldenEvents {
+    contract: soroban_sdk::Address,
+    lines: std::vec::Vec<std::string::String>,
+    names: std::collections::BTreeSet<std::string::String>,
+}
+
+impl GoldenEvents {
+    fn new(contract: &soroban_sdk::Address) -> Self {
+        Self { contract: contract.clone(), lines: std::vec::Vec::new(), names: Default::default() }
+    }
+
+    fn capture(&mut self, env: &soroban_sdk::Env, step: &str) {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, Limits, ScVal, WriteXdr};
+        for e in env.events().all().filter_by_contract(&self.contract).events() {
+            let ContractEventBody::V0(body) = &e.body;
+            let name = match body.topics.first() {
+                Some(ScVal::Symbol(s)) => std::string::String::from_utf8_lossy(s.0.as_slice()).into_owned(),
+                _ => std::string::String::from("?"),
+            };
+            let b64 = e.body.to_xdr_base64(Limits::none()).unwrap();
+            self.lines.push(std::format!("{step} | {name} | {b64}"));
+            self.names.insert(name);
+        }
+    }
+
+    fn finish(self, expected_names: &[&str]) {
+        for n in expected_names {
+            assert!(self.names.contains(*n), "scenario never emitted `{n}`; coverage incomplete");
+        }
+        let dir = std::format!("{}/golden", env!("CARGO_MANIFEST_DIR"));
+        let path = std::format!("{dir}/events.txt");
+        let text = self.lines.join("\n") + "\n";
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing golden file {path}"));
+            assert_eq!(expected.replace("\r\n", "\n"), text, "event encoding changed vs {path}");
+        }
+    }
+}
+
+#[test]
+fn golden_events_policy() {
+    let ctx = setup_test_context();
+    let env = &ctx.env;
+    let p = PolicyContractClient::new(env, &ctx.policy_address);
+    let mut g = GoldenEvents::new(&ctx.policy_address);
+    let st = |id: &str, max: u32, ty: &str| SleeveTarget {
+        asset_id: Symbol::new(env, id), target_weight_bps: 0, min_band_bps: 0, max_band_bps: max, sleeve_type: Symbol::new(env, ty),
+    };
+    let sleeves = vec![env, st("CIRCLE_USDC", 10000, "cash"), st("CIRCLE_EURC", 10000, "cash"),
+        st("FRANKLIN_BENJI", 10000, "usd_gov_fund"), st("SPIKO_EUSTBL", 0, "eur_sovereign")];
+    p.register_policy(&ctx.vault, &ctx.owner, &sample_hash(env, 1), &ctx.registry_address,
+        &1000, &10000, &10000, &50, &500, &sleeves);
+    g.capture(env, "register_policy");
+
+    let w = |pairs: &[(&str, u32)]| {
+        let mut v = Vec::new(env);
+        for (a, b) in pairs { v.push_back((Symbol::new(env, a), *b)); }
+        v
+    };
+    let op = |a: &Address, b: &Address, amt: i128, min: i128| vec![env, TradeOperation {
+        asset_in: a.clone(), asset_out: b.clone(), amount_in: amt, min_amount_out: min, route: TradeRoute::Soroswap }];
+    let prop = |vault: &Address, hash: BytesN<32>, ops: Vec<TradeOperation>, weights: Vec<(Symbol, u32)>, deadline: u64| RebalanceProposal {
+        vault: vault.clone(), policy_hash: hash, operations: ops, weights_after: weights, deadline, proposer: ctx.proposer.clone() };
+    let now = env.ledger().timestamp();
+    let ok_w = || w(&[("CIRCLE_USDC", 5000), ("FRANKLIN_BENJI", 5000)]);
+    let h1 = sample_hash(env, 1);
+    let other = Address::generate(env);
+    let cases: std::vec::Vec<(&str, Address, RebalanceProposal)> = std::vec![
+        ("valid", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), vec![env], ok_w(), now + 600)),
+        ("policy_not_found", other.clone(), prop(&other, h1.clone(), vec![env], ok_w(), now + 600)),
+        ("vault_mismatch", ctx.vault.clone(), prop(&other, h1.clone(), vec![env], ok_w(), now + 600)),
+        ("hash_mismatch", ctx.vault.clone(), prop(&ctx.vault, sample_hash(env, 9), vec![env], ok_w(), now + 600)),
+        ("deadline", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), vec![env], ok_w(), now - 1)),
+        ("weights_sum", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), vec![env], w(&[("CIRCLE_USDC", 5000)]), now + 600)),
+        ("duplicate", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), vec![env], w(&[("CIRCLE_USDC", 5000), ("CIRCLE_USDC", 5000)]), now + 600)),
+        ("band", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), vec![env], w(&[("CIRCLE_USDC", 9000), ("SPIKO_EUSTBL", 1000)]), now + 600)),
+        ("undeclared", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), vec![env], w(&[("CIRCLE_USDC", 5000), ("BLEND_BLND", 5000)]), now + 600)),
+        ("liquidity_floor", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), vec![env], w(&[("FRANKLIN_BENJI", 10000)]), now + 600)),
+        ("invalid_amount", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), op(&ctx.usdc_addr, &ctx.benji_addr, 0, 0), ok_w(), now + 600)),
+        ("identical", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), op(&ctx.usdc_addr, &ctx.usdc_addr, 1000, 999), ok_w(), now + 600)),
+        ("unregistered", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), op(&ctx.unregistered_addr, &ctx.benji_addr, 1000, 999), ok_w(), now + 600)),
+        ("not_in_policy", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), op(&ctx.usdc_addr, &ctx.eustbl_addr, 1000, 999), ok_w(), now + 600)),
+        ("slippage", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), op(&ctx.usdc_addr, &ctx.benji_addr, 1000, 900), ok_w(), now + 600)),
+        ("valid_with_trade", ctx.vault.clone(), prop(&ctx.vault, h1.clone(), op(&ctx.usdc_addr, &ctx.benji_addr, 1000, 999), ok_w(), now + 600)),
+    ];
+    for (name, vault, proposal) in cases.iter() {
+        p.validate_rebalance(vault, proposal);
+        g.capture(env, name);
+    }
+    NavOracleClient::new(env, &ctx.oracle_address)
+        .trigger_circuit_breaker(&ctx.admin, &Symbol::new(env, "P_BENJI"), &Symbol::new(env, "MANUAL"));
+    p.validate_rebalance(&ctx.vault, &prop(&ctx.vault, h1.clone(), op(&ctx.usdc_addr, &ctx.benji_addr, 1000, 999), ok_w(), now + 600));
+    g.capture(env, "price_unavailable");
+
+    p.update_policy(&ctx.vault, &sample_hash(env, 2), &1000, &10000, &10000, &50, &500, &sleeves);
+    g.capture(env, "update_policy");
+    p.set_notice_period(&ctx.vault, &(72 * 3600));
+    g.capture(env, "set_notice_period");
+    p.cancel_policy_update(&ctx.vault);
+    g.capture(env, "cancel_policy_update");
+    p.update_policy(&ctx.vault, &sample_hash(env, 3), &1500, &10000, &10000, &50, &500, &sleeves);
+    env.ledger().set_timestamp(now + 72 * 3600);
+    p.activate_policy_update(&ctx.vault);
+    g.capture(env, "activate_policy_update");
+    g.finish(&["POLICY_REGISTERED", "REBALANCE_VALIDATED", "POLICY_UPDATE_PROPOSED", "POLICY_NOTICE_SET",
+        "POLICY_UPDATE_CANCELLED", "POLICY_UPDATED"]);
+}

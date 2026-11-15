@@ -1832,3 +1832,103 @@ mod m2 {
         assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(3).unwrap()).unwrap(), ctx.alice, "owner");
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit W4.1b (2026-11-15): golden event encodings.
+// -------------------------------------------------------------------------
+/// Golden event recorder (audit W4.1b). Captures the exact XDR of every event
+/// the contract under test emits during a scenario and compares it with the
+/// committed `golden/events.txt`, so the `Events::publish` -> `#[contractevent]`
+/// migration is proven byte-for-byte. Regenerate ONLY deliberately with
+/// `UPDATE_GOLDEN=1 cargo test golden_events`.
+struct GoldenEvents {
+    contract: soroban_sdk::Address,
+    lines: std::vec::Vec<std::string::String>,
+    names: std::collections::BTreeSet<std::string::String>,
+}
+
+impl GoldenEvents {
+    fn new(contract: &soroban_sdk::Address) -> Self {
+        Self { contract: contract.clone(), lines: std::vec::Vec::new(), names: Default::default() }
+    }
+
+    fn capture(&mut self, env: &soroban_sdk::Env, step: &str) {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, Limits, ScVal, WriteXdr};
+        for e in env.events().all().filter_by_contract(&self.contract).events() {
+            let ContractEventBody::V0(body) = &e.body;
+            let name = match body.topics.first() {
+                Some(ScVal::Symbol(s)) => std::string::String::from_utf8_lossy(s.0.as_slice()).into_owned(),
+                _ => std::string::String::from("?"),
+            };
+            let b64 = e.body.to_xdr_base64(Limits::none()).unwrap();
+            self.lines.push(std::format!("{step} | {name} | {b64}"));
+            self.names.insert(name);
+        }
+    }
+
+    fn finish(self, expected_names: &[&str]) {
+        for n in expected_names {
+            assert!(self.names.contains(*n), "scenario never emitted `{n}`; coverage incomplete");
+        }
+        let dir = std::format!("{}/golden", env!("CARGO_MANIFEST_DIR"));
+        let path = std::format!("{dir}/events.txt");
+        let text = self.lines.join("\n") + "\n";
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing golden file {path}"));
+            assert_eq!(expected.replace("\r\n", "\n"), text, "event encoding changed vs {path}");
+        }
+    }
+}
+
+#[test]
+fn golden_events_vault() {
+    let ctx = setup_test_context();
+    let env = &ctx.env;
+    // Fresh vault so the constructor event is captured too.
+    let cfg = ctx.vault_client.get_config();
+    let id = env.register(StrategyVault, (cfg, String::from_str(env, "Golden"), String::from_str(env, "GLD"), 7u32));
+    let v = StrategyVaultClient::new(env, &id);
+    let mut g = GoldenEvents::new(&id);
+    g.capture(env, "constructor");
+    let one = 10_000_000i128;
+    ctx.numeraire_admin.mint(&ctx.alice, &(1000 * one));
+    v.deposit(&(300 * one), &ctx.alice); g.capture(env, "deposit");
+    v.mint(&(100 * one), &ctx.alice); g.capture(env, "mint");
+    v.transfer(&ctx.alice, &ctx.bob, &(10 * one)); g.capture(env, "transfer");
+    v.approve(&ctx.alice, &ctx.bob, &(20 * one), &1000); g.capture(env, "approve");
+    v.transfer_from(&ctx.bob, &ctx.alice, &ctx.bob, &(5 * one)); g.capture(env, "transfer_from");
+    v.redeem(&(10 * one), &ctx.bob, &ctx.alice); g.capture(env, "redeem");
+    v.withdraw(&(10 * one), &ctx.alice, &ctx.alice); g.capture(env, "withdraw");
+    env.ledger().set_timestamp(1_000_000 + 30 * 86_400);
+    v.accrue_fees(); g.capture(env, "accrue_fees");
+    v.lower_caps(&(500_000 * one), &(50_000 * one)); g.capture(env, "lower_caps");
+    let gov = register_gov_fund(&ctx);
+    let cash = v.get_sleeves().get(0).unwrap().current_balance;
+    let mut sleeves = SdkVec::new(env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, cash));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+    v.set_sleeves(&sleeves); g.capture(env, "set_sleeves");
+    v.pause(); g.capture(env, "pause");
+    v.unpause(); g.capture(env, "unpause");
+    v.admin_pause(); g.capture(env, "admin_pause");
+    v.unpause();
+    v.propose_upgrade(&soroban_sdk::BytesN::from_array(env, &[0xAB; 32])); g.capture(env, "propose_upgrade");
+    v.cancel_upgrade(); g.capture(env, "cancel_upgrade");
+    let targets = SdkVec::from_array(env, [PolicySleeveTargetRef {
+        asset_id: Symbol::new(env, "USDC"), target_weight_bps: 10000, min_band_bps: 9000, max_band_bps: 10000,
+        sleeve_type: Symbol::new(env, "cash") }]);
+    // The owner signs register_policy inside the vault's call (a non-root auth).
+    env.mock_all_auths_allowing_non_root_auth();
+    v.bind_policy(&ctx.policy_owner, &soroban_sdk::BytesN::from_array(env, &[0x5A; 32]), &1000, &10000, &10000, &50, &500, &targets);
+    g.capture(env, "bind_policy");
+    // `UPGRADE` is emitted only by a successful execute_upgrade, which needs a
+    // real uploaded WASM; it is verified in the local-network e2e suite.
+    g.finish(&["VAULT_INITIALIZED", "deposit", "mint", "transfer", "approve", "burn", "withdraw", "FEE_ACCRUAL",
+        "CAPS_LOWERED", "SLEEVES_UPDATED", "VAULT_PAUSED", "VAULT_UNPAUSED", "UPGRADE_PROPOSED", "UPGRADE_CANCELLED",
+        "POLICY_BOUND"]);
+}
