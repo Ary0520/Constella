@@ -140,6 +140,11 @@ pub trait NavOracleTrait {
     /// SEP-40: Standard last price query
     fn lastprice(env: Env, asset: Address) -> Option<PriceData>;
 
+    /// Fair price of one asset in the numéraire: median of the asset's own
+    /// valid sources (same validity rules as every other read). The base
+    /// asset is exactly 1.0. Used to value both legs of a trade (audit P1).
+    fn asset_price(env: Env, asset: Address) -> Option<PriceData>;
+
     /// SEP-40: Standard batch price query
     fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>;
 
@@ -203,6 +208,28 @@ fn sort_sources_by_price(mut sources: Vec<OracleSource>) -> Vec<OracleSource> {
         }
     }
     sources
+}
+
+/// Median of an already-validated, non-empty source list.
+fn median_price(sources: Vec<OracleSource>) -> PriceData {
+    let sorted = sort_sources_by_price(sources);
+    let len = sorted.len();
+    if len % 2 == 1 {
+        let m = sorted.get(len / 2).unwrap();
+        PriceData {
+            price: m.price,
+            timestamp: m.timestamp,
+            source: m.source_id.clone(),
+        }
+    } else {
+        let s1 = sorted.get(len / 2 - 1).unwrap();
+        let s2 = sorted.get(len / 2).unwrap();
+        PriceData {
+            price: s1.price + (s2.price - s1.price) / 2,
+            timestamp: s1.timestamp.min(s2.timestamp),
+            source: s2.source_id.clone(),
+        }
+    }
 }
 
 fn evaluate_sources(
@@ -594,30 +621,7 @@ impl NavOracleTrait for NavOracle {
 
         let valid_sources = evaluate_sources(&env, &source_ids, &sleeve_id, &mut config).ok()?;
 
-        let sorted = sort_sources_by_price(valid_sources);
-        let len = sorted.len();
-
-        let price_data = if len % 2 == 1 {
-            let mid = len / 2;
-            let median_source = sorted.get(mid).unwrap();
-            PriceData {
-                price: median_source.price,
-                timestamp: median_source.timestamp,
-                source: median_source.source_id.clone(),
-            }
-        } else {
-            let mid = len / 2;
-            let s1 = sorted.get(mid - 1).unwrap();
-            let s2 = sorted.get(mid).unwrap();
-            let median_price = s1.price + (s2.price - s1.price) / 2;
-            PriceData {
-                price: median_price,
-                timestamp: s1.timestamp.min(s2.timestamp),
-                source: s2.source_id.clone(),
-            }
-        };
-
-        Some(price_data)
+        Some(median_price(valid_sources))
     }
 
     fn price(env: Env, asset: Address) -> Option<PriceData> {
@@ -664,6 +668,40 @@ impl NavOracleTrait for NavOracle {
             .set(&DataKey::LastPrice(asset), &price_data);
 
         Some(price_data)
+    }
+
+    fn asset_price(env: Env, asset: Address) -> Option<PriceData> {
+        let base: Address = env.storage().instance().get(&DataKey::BaseAsset)?;
+        if asset == base {
+            let decimals: u32 = env.storage().instance().get(&DataKey::Decimals)?;
+            return Some(PriceData {
+                price: 10i128.pow(decimals),
+                timestamp: env.ledger().timestamp(),
+                source: Symbol::new(&env, "BASE"),
+            });
+        }
+        let sleeve_id: Symbol = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetSleeve(asset.clone()))?;
+        let mut config: SleeveOracleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::SleeveConfig(sleeve_id.clone()))
+            .unwrap_or(SleeveOracleConfig {
+                sleeve_id: sleeve_id.clone(),
+                deviation_threshold_bps: 200,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
+                is_paused: false,
+                pause_reason: Symbol::new(&env, ""),
+            });
+        let source_ids: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetSources(asset))
+            .unwrap_or_else(|| Vec::new(&env));
+        let valid = evaluate_sources(&env, &source_ids, &sleeve_id, &mut config).ok()?;
+        Some(median_price(valid))
     }
 
     fn lastprice(env: Env, asset: Address) -> Option<PriceData> {

@@ -1003,3 +1003,48 @@ mod o3 {
         assert!(client.get_deposit_nav(&Symbol::new(&env, "XLM")).is_none());
     }
 }
+
+// -------------------------------------------------------------------------
+// asset_price (needed by audit P1): fair per-asset price = median of the
+// asset's own valid sources; the numéraire (base) is exactly 1.
+// -------------------------------------------------------------------------
+mod asset_price {
+    use super::*;
+
+    #[test]
+    fn median_of_the_assets_own_sources() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        env.ledger().set_timestamp(1000);
+        client.configure_sleeve(&Symbol::new(&env, "EURC"), &300, &2);
+        let eurc = Address::generate(&env);
+        client.register_source(&create_source(&env, "E1", &eurc, "EURC", 1_080_000, 200_000, 1000));
+        client.register_source(&create_source(&env, "E2", &eurc, "EURC", 1_090_000, 200_000, 1000));
+        client.register_source(&create_source(&env, "E3", &eurc, "EURC", 1_085_000, 200_000, 1000));
+        assert_eq!(client.asset_price(&eurc).unwrap().price, 1_085_000);
+    }
+
+    #[test]
+    fn base_asset_is_exactly_one() {
+        let env = Env::default();
+        let (client, _admin, base) = setup_oracle(&env);
+        assert_eq!(client.asset_price(&base).unwrap().price, 10_000_000); // 7 decimals
+    }
+
+    #[test]
+    fn unknown_single_source_or_paused_asset_has_no_price() {
+        let env = Env::default();
+        let (client, admin, _base) = setup_oracle(&env);
+        env.ledger().set_timestamp(1000);
+        assert!(client.asset_price(&Address::generate(&env)).is_none());
+
+        let a = Address::generate(&env);
+        client.register_source(&create_source(&env, "A1", &a, "A", 1_000_000, 200_000, 1000));
+        assert!(client.asset_price(&a).is_none(), "single source");
+
+        client.register_source(&create_source(&env, "A2", &a, "A", 1_000_000, 200_000, 1000));
+        assert!(client.asset_price(&a).is_some());
+        client.trigger_circuit_breaker(&admin, &Symbol::new(&env, "A"), &Symbol::new(&env, "MANUAL"));
+        assert!(client.asset_price(&a).is_none(), "paused");
+    }
+}
