@@ -14,7 +14,8 @@ SEP-41 defines the standard token interface for Soroban smart contracts, acting 
 - **Decimals & Metadata:** Token name, symbol, decimals (default 7 for classic Stellar asset parity).
 - **Core Operations:** `allowance`, `approve(from, spender, amount, live_until_ledger)`, `balance`, `transfer(from, to: MuxedAddress, amount)`, `transfer_from(spender, from, to, amount)`, **`burn(from, amount)`**, **`burn_from(spender, from, amount)`**, `decimals`, `name`, `symbol`.
 - **Events (CAP-67 format):** `transfer` topics `["transfer", from, to]` data `amount` (or `{amount, to_muxed_id}`); `approve` topics `["approve", from, spender]` data `[amount, live_until_ledger]`; `mint` topics `["mint", to]` data `amount`; `burn` topics `["burn", from]` data `amount`. Event names are SEP-41-defined lower-case and take precedence over Rule 8 for token events.
-- **Status:** Draft v0.5.2, de-facto standard across Soroban DeFi.
+- **Data formats (v0.5.0+):** every event may use either the single-value/vec format above or a map format (`{amount}`, `{amount, live_until_ledger}`, `{amount, to_muxed_id}`); both conform. Indexers must accept both. Constella emits single-value/vec, like the Stellar Asset Contract. SEP-41 also defines a `clawback` event (`[clawback, from]`, data `amount`); Constella shares have no clawback.
+- **Status:** Draft v0.5.2 (updated 24 Aug 2026; re-verified 15 Nov 2026), de-facto standard across Soroban DeFi.
 
 ### Implementation in Constella
 Every Constella basket token (vault share token) **must** implement SEP-41 so that:

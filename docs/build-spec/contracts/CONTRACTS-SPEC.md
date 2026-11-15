@@ -133,7 +133,7 @@ pub struct TradeOperation {
 
 **Purpose:** Shared vault for multiple holders. Core of Constella for most users.
 
-**Base:** OpenZeppelin stellar-contracts v0.8.0. The share ledger (balances, allowances, total supply) uses `stellar-tokens` fungible storage (audit W4.2a): one **persistent** entry per holder and a persistent total supply, TTL extended on access; allowances are **temporary** entries whose `live_until_ledger` is validated; the instance entry's TTL is extended on use, and per-holder state never lives in instance storage. Routing the SEP-56 entry points through the OZ vault module is W4.2b. Events are the vault's own golden-pinned SEP-41/SEP-56 shapes (OZ 0.8.0 emits mint/burn/approve data as maps, which is not SEP-41).
+**Base:** OpenZeppelin stellar-contracts v0.8.0. The share ledger (balances, allowances, total supply) uses `stellar-tokens` fungible storage (audit W4.2a): one **persistent** entry per holder and a persistent total supply, TTL extended on access; allowances are **temporary** entries whose `live_until_ledger` is validated; the instance entry's TTL is extended on use, and per-holder state never lives in instance storage. Routing the SEP-56 entry points through the OZ vault module is W4.2b. Events are the vault's own golden-pinned shapes. SEP-41 v0.5+ allows a single-value/vec **or** a map data format; the vault uses single-value/vec, the same as the Stellar Asset Contract (OZ 0.8.0 uses maps — also conformant).
 
 **Key functions:**
 ```rust

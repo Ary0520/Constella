@@ -10,7 +10,9 @@ use soroban_sdk::{
 // balance entries and a persistent total supply with TTL extension, and
 // temporary allowance entries whose `live_until_ledger` is validated. Only the
 // non-emitting primitives are used; events stay the golden-pinned SEP-41 shapes
-// below (OZ 0.8.0 encodes mint/burn/approve data as maps, not SEP-41's values).
+// below. SEP-41 v0.5 allows either a single-value/vec or a map data format;
+// OZ 0.8.0 emits maps, this vault emits single-value/vec - the same format as
+// the Stellar Asset Contract - and its bytes are pinned by golden/events.txt.
 use stellar_tokens::fungible::{
     total_supply::{decrease_total_supply, increase_total_supply, total_supply as share_supply},
     Base, INSTANCE_EXTEND_AMOUNT, INSTANCE_TTL_THRESHOLD,
