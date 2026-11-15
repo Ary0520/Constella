@@ -377,7 +377,9 @@ fn test_update_price_and_events() {
     let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
     client.register_source(&s1);
 
-    // Update price
+    // Update price once ledger time has reached the new observation time
+    // (audit O2: future-dated prices are rejected).
+    env.ledger().set_timestamp(1500);
     client.update_price(&Symbol::new(&env, "BENJI_NAV"), &1_050_000, &250_000, &1500);
 
     // Verify PRICE_UPDATED event IMMEDIATELY after update_price

@@ -177,6 +177,12 @@ pub trait NavOracleTrait {
     fn get_sources(env: Env) -> Vec<OracleSource>;
 }
 
+/// A source is fresh only if its timestamp is not in the future and is within
+/// its staleness limit (audit O2: future-dated data must never count as fresh).
+fn is_fresh(now: u64, source: &OracleSource) -> bool {
+    source.timestamp <= now && now - source.timestamp <= source.staleness_limit_seconds
+}
+
 fn sort_sources_by_price(mut sources: Vec<OracleSource>) -> Vec<OracleSource> {
     let len = sources.len();
     if len <= 1 {
@@ -226,8 +232,8 @@ fn evaluate_sources(
             if source.current_liquidity_depth_usd < source.min_liquidity_depth_usd {
                 continue;
             }
-            // Filter 3: Staleness check (Rule 5)
-            if now.saturating_sub(source.timestamp) > source.staleness_limit_seconds {
+            // Filter 3: Staleness check (Rule 5) — future-dated data is invalid too.
+            if !is_fresh(now, &source) {
                 continue;
             }
             // Positive price check
@@ -391,6 +397,9 @@ impl NavOracleTrait for NavOracle {
         if source.min_liquidity_depth_usd < 0 {
             panic_with_error!(&env, OracleError::InsufficientLiquidityDepth);
         }
+        if source.timestamp > env.ledger().timestamp() {
+            panic_with_error!(&env, OracleError::FutureTimestamp);
+        }
 
         env.storage()
             .instance()
@@ -489,6 +498,14 @@ impl NavOracleTrait for NavOracle {
         }
         if liquidity_depth_usd < 0 {
             panic_with_error!(&env, OracleError::InsufficientLiquidityDepth);
+        }
+        // Audit O2: a future timestamp would never go stale; an older one would
+        // overwrite newer data (replay of a still-fresh old price).
+        if timestamp > env.ledger().timestamp() {
+            panic_with_error!(&env, OracleError::FutureTimestamp);
+        }
+        if timestamp < source.timestamp {
+            panic_with_error!(&env, OracleError::OutOfOrderUpdate);
         }
 
         source.price = price;
@@ -798,7 +815,7 @@ impl NavOracleTrait for NavOracle {
                 if source.is_active
                     && source.sleeve == sleeve_id
                     && source.current_liquidity_depth_usd >= source.min_liquidity_depth_usd
-                    && now.saturating_sub(source.timestamp) <= source.staleness_limit_seconds
+                    && is_fresh(now, &source)
                     && source.price > 0
                 {
                     sources_valid += 1;
@@ -858,7 +875,7 @@ impl NavOracleTrait for NavOracle {
                 if source.is_active
                     && source.sleeve == sleeve_id
                     && source.current_liquidity_depth_usd >= source.min_liquidity_depth_usd
-                    && now.saturating_sub(source.timestamp) <= source.staleness_limit_seconds
+                    && is_fresh(now, &source)
                     && source.price > 0
                 {
                     sources_valid += 1;
