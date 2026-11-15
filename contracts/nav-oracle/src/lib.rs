@@ -3,7 +3,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
-    Env, Symbol, Vec,
+    Env, String, Symbol, Vec, U256,
 };
 
 #[contracterror]
@@ -106,6 +106,36 @@ pub struct PendingSource {
 pub enum PendingKind {
     Pushed,
     Pull(PullFeed),
+    RedStone(RedStoneConfig),
+}
+
+/// Configuration of a RedStone pull source (audit O7c). RedStone prices are
+/// in USD, so the adapter's own USDC feed is mandatory for the cross rate:
+/// USD is never assumed to equal USDC. Feed ids are RedStone's exact strings
+/// (EURC/USD is "EUROC", not "EURC").
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedStoneConfig {
+    pub adapter: Address,
+    pub feed_id: String,
+    pub usdc_feed_id: String,
+}
+
+/// RedStone adapter price record (field names as in the deployed adapter):
+/// `price` has 8 decimals, timestamps are milliseconds; `package_timestamp`
+/// is when RedStone's signers signed the data.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RedStonePriceData {
+    pub package_timestamp: u64,
+    pub price: U256,
+    pub write_timestamp: u64,
+}
+
+/// The subset of the RedStone adapter that Constella reads.
+#[contractclient(name = "RedStoneAdapterClient")]
+pub trait RedStoneAdapterInterface {
+    fn read_price_data_for_feed(env: Env, feed_id: String) -> RedStonePriceData;
 }
 
 /// How a Reflector feed's prices relate to this oracle's base (audit O7b).
@@ -288,6 +318,8 @@ pub enum DataKey {
     PendingSource(Symbol),
     /// Reflector pull configuration of a source (audit O7b).
     PullFeed(Symbol),
+    /// RedStone pull configuration of a source (audit O7c).
+    RedStoneFeed(Symbol),
     PauseAuthority,
 }
 
@@ -387,6 +419,13 @@ pub trait NavOracleTrait {
     fn pull_price(env: Env, source_id: Symbol) -> Option<SourcedPrice>;
     /// Pull configuration of a source, if it is a pull source.
     fn get_pull_feed(env: Env, source_id: Symbol) -> Option<PullFeed>;
+
+    /// Register a source whose price is read on-chain from the RedStone
+    /// adapter, cross-rated through RedStone's USDC feed (admin; same
+    /// immediate-or-48h rule). Both feeds must be readable at registration.
+    fn register_redstone_source(env: Env, source: OracleSource, config: RedStoneConfig);
+    /// RedStone configuration of a source, if it is a RedStone source.
+    fn get_redstone_feed(env: Env, source_id: Symbol) -> Option<RedStoneConfig>;
 }
 
 /// A source is fresh only if its timestamp is not in the future and is within
@@ -461,15 +500,14 @@ fn evaluate_sources(
         {
             // Audit O7b: a pull source's price is read live from its feed;
             // an unreadable, gappy or stale feed makes the source invalid.
-            if let Some(feed) = env.storage().instance().get::<_, PullFeed>(&DataKey::PullFeed(source_id.clone())) {
-                match pull_live(env, &feed, source.staleness_limit_seconds) {
-                    Some((price, timestamp)) => {
-                        source.price = price;
-                        source.timestamp = timestamp;
-                        source.current_liquidity_depth_usd = 0;
-                    }
-                    None => continue,
-                }
+            if let Some((price, timestamp)) = match live_price_of(env, &source_id, &source) {
+                Live::Pushed => None,
+                Live::Valid(p, t) => Some((p, t)),
+                Live::Invalid => continue,
+            } {
+                source.price = price;
+                source.timestamp = timestamp;
+                source.current_liquidity_depth_usd = 0;
             }
             // Verify sleeve matches
             if source.sleeve != *sleeve_id {
@@ -751,6 +789,61 @@ fn pull_live(env: &Env, feed: &PullFeed, staleness_limit_seconds: u64) -> Option
     Some((price, oldest))
 }
 
+/// Live price of a RedStone pull source in this oracle's base and decimals:
+/// `price(asset) * 10^ours / price(USDC)` from the same adapter (decimals
+/// cancel), rounding down, stamped with the OLDER signing time. Invalid when
+/// a feed is unreadable, non-positive, overflowing, future-dated or older
+/// than this source's own staleness limit (RedStone itself serves up to 30 h).
+fn redstone_live(env: &Env, cfg: &RedStoneConfig, staleness_limit_seconds: u64) -> Option<(i128, u64)> {
+    let adapter = RedStoneAdapterClient::new(env, &cfg.adapter);
+    let read = |id: &String| -> Option<(i128, u64)> {
+        let d = adapter.try_read_price_data_for_feed(id).ok()?.ok()?;
+        let price = i128::try_from(d.price.to_u128()?).ok()?;
+        if price <= 0 {
+            return None;
+        }
+        Some((price, d.package_timestamp / 1000))
+    };
+    let (asset_px, asset_ts) = read(&cfg.feed_id)?;
+    let (usdc_px, usdc_ts) = read(&cfg.usdc_feed_id)?;
+    let ours: u32 = env.storage().instance().get(&DataKey::Decimals)?;
+    let price = asset_px.checked_mul(pow10(ours)?)? / usdc_px;
+    let now = env.ledger().timestamp();
+    let oldest = asset_ts.min(usdc_ts);
+    if price <= 0 || asset_ts.max(usdc_ts) > now || now - oldest > staleness_limit_seconds {
+        return None;
+    }
+    Some((price, oldest))
+}
+
+enum Live {
+    Pushed,
+    Valid(i128, u64),
+    Invalid,
+}
+
+/// Live value of a pull source (Reflector or RedStone); `Pushed` otherwise.
+fn live_price_of(env: &Env, source_id: &Symbol, source: &OracleSource) -> Live {
+    if let Some(feed) = env.storage().instance().get::<_, PullFeed>(&DataKey::PullFeed(source_id.clone())) {
+        return match pull_live(env, &feed, source.staleness_limit_seconds) {
+            Some((p, t)) => Live::Valid(p, t),
+            None => Live::Invalid,
+        };
+    }
+    if let Some(cfg) = env.storage().instance().get::<_, RedStoneConfig>(&DataKey::RedStoneFeed(source_id.clone())) {
+        return match redstone_live(env, &cfg, source.staleness_limit_seconds) {
+            Some((p, t)) => Live::Valid(p, t),
+            None => Live::Invalid,
+        };
+    }
+    Live::Pushed
+}
+
+fn is_pull_source(env: &Env, source_id: &Symbol) -> bool {
+    env.storage().instance().has(&DataKey::PullFeed(source_id.clone()))
+        || env.storage().instance().has(&DataKey::RedStoneFeed(source_id.clone()))
+}
+
 /// Shared checks for every source registration (pushed or pull).
 fn validate_source(env: &Env, source: &OracleSource) {
     if source.staleness_limit_seconds == 0 {
@@ -775,6 +868,14 @@ fn validate_source(env: &Env, source: &OracleSource) {
     }
 }
 
+fn install_kind(env: &Env, source_id: &Symbol, kind: PendingKind) {
+    match kind {
+        PendingKind::Pushed => {}
+        PendingKind::Pull(feed) => env.storage().instance().set(&DataKey::PullFeed(source_id.clone()), &feed),
+        PendingKind::RedStone(cfg) => env.storage().instance().set(&DataKey::RedStoneFeed(source_id.clone()), &cfg),
+    }
+}
+
 /// Apply now (bootstrap of an unpriced asset) or queue for 48 h (audit O7a).
 fn register_or_queue(env: &Env, source: OracleSource, kind: PendingKind) {
     let exists = env.storage().instance().has(&DataKey::Source(source.source_id.clone()));
@@ -785,9 +886,7 @@ fn register_or_queue(env: &Env, source: OracleSource, kind: PendingKind) {
         SourceChangeProposed { source_id: id, effective_at }.publish(env);
         return;
     }
-    if let PendingKind::Pull(feed) = kind {
-        env.storage().instance().set(&DataKey::PullFeed(source.source_id.clone()), &feed);
-    }
+    install_kind(env, &source.source_id, kind);
     apply_source(env, &source);
 }
 
@@ -948,7 +1047,7 @@ impl NavOracleTrait for NavOracle {
     fn register_source(env: Env, source: OracleSource) {
         admin_of(&env).require_auth();
         validate_source(&env, &source);
-        if env.storage().instance().has(&DataKey::PullFeed(source.source_id.clone())) {
+        if is_pull_source(&env, &source.source_id) {
             panic_with_error!(&env, OracleError::SourceKindMismatch);
         }
         // Audit O7a: changes to an asset that is already priced, and any change
@@ -974,8 +1073,8 @@ impl NavOracleTrait for NavOracle {
             Some(s) => s,
             None => panic_with_error!(&env, OracleError::AssetNotFound),
         };
-        // Audit O7b: pull sources are read on-chain; nobody pushes them.
-        if env.storage().instance().has(&DataKey::PullFeed(source_id.clone())) {
+        // Audit O7b/O7c: pull sources are read on-chain; nobody pushes them.
+        if is_pull_source(&env, &source_id) {
             panic_with_error!(&env, OracleError::NotAPushSource);
         }
         // Audit O7a: only this source's own feeder may push its price.
@@ -1348,9 +1447,7 @@ impl NavOracleTrait for NavOracle {
             source.current_liquidity_depth_usd = current.current_liquidity_depth_usd;
         }
         let feeder = source.feeder.clone();
-        if let PendingKind::Pull(feed) = pending.kind {
-            env.storage().instance().set(&DataKey::PullFeed(source_id.clone()), &feed);
-        }
+        install_kind(&env, &source_id, pending.kind);
         apply_source(&env, &source);
         SourceActivated { source_id, feeder }.publish(&env);
     }
@@ -1421,14 +1518,43 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn pull_price(env: Env, source_id: Symbol) -> Option<SourcedPrice> {
-        let feed: PullFeed = env.storage().instance().get(&DataKey::PullFeed(source_id.clone()))?;
         let source: OracleSource = env.storage().instance().get(&DataKey::Source(source_id.clone()))?;
-        let (price, timestamp) = pull_live(&env, &feed, source.staleness_limit_seconds)?;
-        Some(SourcedPrice { price, timestamp, source: source_id })
+        match live_price_of(&env, &source_id, &source) {
+            Live::Valid(price, timestamp) => Some(SourcedPrice { price, timestamp, source: source_id }),
+            _ => None,
+        }
     }
 
     fn get_pull_feed(env: Env, source_id: Symbol) -> Option<PullFeed> {
         env.storage().instance().get(&DataKey::PullFeed(source_id))
+    }
+
+    fn register_redstone_source(env: Env, source: OracleSource, config: RedStoneConfig) {
+        admin_of(&env).require_auth();
+        validate_source(&env, &source);
+        let id = source.source_id.clone();
+        if env.storage().instance().has(&DataKey::Source(id.clone()))
+            && !env.storage().instance().has(&DataKey::RedStoneFeed(id.clone()))
+        {
+            panic_with_error!(&env, OracleError::SourceKindMismatch);
+        }
+        if source.min_liquidity_depth_usd != 0 {
+            panic_with_error!(&env, OracleError::InvalidPullConfig);
+        }
+        // Both feeds must exist and be readable on this adapter now (catches
+        // wrong feed ids such as "EURC" instead of RedStone's "EUROC").
+        let adapter = RedStoneAdapterClient::new(&env, &config.adapter);
+        for feed in [&config.feed_id, &config.usdc_feed_id] {
+            match adapter.try_read_price_data_for_feed(feed) {
+                Ok(Ok(_)) => {}
+                _ => panic_with_error!(&env, OracleError::InvalidPullConfig),
+            }
+        }
+        register_or_queue(&env, source, PendingKind::RedStone(config));
+    }
+
+    fn get_redstone_feed(env: Env, source_id: Symbol) -> Option<RedStoneConfig> {
+        env.storage().instance().get(&DataKey::RedStoneFeed(source_id))
     }
 
     fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource> {
