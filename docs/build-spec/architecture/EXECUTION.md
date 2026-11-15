@@ -59,6 +59,12 @@ If ANY check fails: **rebalance rejected in its entirety**.
 
 ---
 
+## Implementation status (audit W1a, `c732a97`)
+- `vault.rebalance(proposal)`: only the designated **keeper** (set by the admin) submits; a paused vault refuses; the signed policy's `validate_rebalance` must accept the proposal.
+- **Soroswap legs:** the vault authorizes exactly one `token.transfer(vault → pair, amount_in)` for the router. Spent and received are **measured on the vault's own balances**, so a lying or compromised router cannot over-spend or under-deliver: the vault itself enforces `spent ≤ amount_in` and `received ≥ min_amount_out`. Holdings are booked from those measured deltas only. Events: `REBALANCE_STEP`, `REBALANCE_COMPLETE`.
+- **Routers:** set with `propose_router` and active only after **48 h** (`activate_router`), because a router can move vault funds.
+- **Not yet:** Aquarius, SDEX and issuer routes (refused with `RouteUnavailable`); post-trade verification of **actual** weights against the bands (W1b); the Blend adapter.
+
 ## Execution Order Within a Rebalance
 
 ```

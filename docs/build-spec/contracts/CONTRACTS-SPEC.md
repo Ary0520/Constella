@@ -187,6 +187,12 @@ fn cancel_upgrade(env: Env)                          // admin
 fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade>
 fn lower_caps(env: Env, tvl_cap: i128, per_user_cap: i128)  // admin; decrease only
 fn max_deposit(env: Env, receiver: Address) -> i128  // real remaining room under both caps
+// Rebalancing (audit W1a)
+fn set_keeper(env: Env, keeper: Address)                        // admin
+fn rebalance(env: Env, proposal: RebalanceProposal)              // keeper; policy-validated; measured swaps
+fn propose_router(env: Env, route: TradeRoute, router: Address)  // admin; active after 48h
+fn activate_router(env: Env, route: TradeRoute)                  // anyone, after the delay
+fn get_router(env: Env, route: TradeRoute) -> Option<Address>
 ```
 
 **VaultState struct:**
