@@ -67,6 +67,7 @@ pub enum SleeveType {
 pub struct AssetEntry {
     pub contract_address: Address,
     pub asset_id: Symbol,
+    pub issuer: Symbol, // required; used for issuer caps (audit P2, 15 Nov 2026)
     pub sleeve_type: SleeveType,
     pub liquidity_tier: u32, // 0=instant, 1=24h, 2=1week, 3=illiquid
     pub permissionless: bool,
