@@ -1842,3 +1842,91 @@ mod p2 {
     }
 }
 
+// -------------------------------------------------------------------------
+// Audit M1 (2026-11-15): proposals must target the CURRENT policy hash, and
+// may only BUY assets declared (with a non-zero band) in the signed policy.
+// -------------------------------------------------------------------------
+mod m1 {
+    use super::*;
+
+    const ONE: i128 = 10_000_000;
+
+    fn signed_policy(ctx: &TestContext, hash: u8) {
+        let sleeves = vec![
+            &ctx.env,
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"), target_weight_bps: 5000, min_band_bps: 0, max_band_bps: 10000, sleeve_type: Symbol::new(&ctx.env, "cash") },
+            // Declared but capped at zero: holding/buying it is not allowed.
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "CIRCLE_EURC"), target_weight_bps: 0, min_band_bps: 0, max_band_bps: 0, sleeve_type: Symbol::new(&ctx.env, "cash") },
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "FRANKLIN_BENJI"), target_weight_bps: 5000, min_band_bps: 0, max_band_bps: 10000, sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund") },
+        ];
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(
+            &ctx.vault, &ctx.owner, &sample_hash(&ctx.env, hash), &ctx.registry_address,
+            &1000, &10000, &10000, &50, &500, &sleeves,
+        );
+    }
+
+    fn proposal(ctx: &TestContext, hash: BytesN<32>, ops: Vec<TradeOperation>) -> RebalanceProposal {
+        RebalanceProposal {
+            vault: ctx.vault.clone(),
+            policy_hash: hash,
+            operations: ops,
+            weights_after: vec![
+                &ctx.env,
+                (Symbol::new(&ctx.env, "CIRCLE_USDC"), 5000u32),
+                (Symbol::new(&ctx.env, "CIRCLE_EURC"), 0u32),
+                (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 5000u32),
+            ],
+            deadline: ctx.env.ledger().timestamp() + 600,
+            proposer: ctx.proposer.clone(),
+        }
+    }
+
+    fn buy(ctx: &TestContext, a_in: &Address, a_out: &Address) -> ValidationResult {
+        let ops = vec![&ctx.env, TradeOperation { asset_in: a_in.clone(), asset_out: a_out.clone(), amount_in: 1000 * ONE, min_amount_out: 999 * ONE, route: TradeRoute::Issuer }];
+        let p = proposal(ctx, current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault), ops);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).validate_rebalance(&ctx.vault, &p)
+    }
+
+    #[test]
+    fn proposal_for_an_amended_policy_is_void() {
+        let ctx = setup_test_context();
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        signed_policy(&ctx, 0x01);
+        let old = sample_hash(&ctx.env, 0x01);
+        assert!(policy.validate_rebalance(&ctx.vault, &proposal(&ctx, old.clone(), vec![&ctx.env])).is_valid);
+
+        // Owner amends (re-signs) the policy.
+        let new = sample_hash(&ctx.env, 0x02);
+        let cfg = policy.get_policy_config(&ctx.vault).unwrap();
+        policy.update_policy(&ctx.vault, &new, &cfg.min_liquidity_sleeve_bps, &cfg.max_single_asset_bps,
+            &cfg.max_issuer_bps, &cfg.max_slippage_bps, &cfg.rebalance_band_bps, &policy.get_sleeve_targets(&ctx.vault));
+
+        let stale = policy.validate_rebalance(&ctx.vault, &proposal(&ctx, old, vec![&ctx.env]));
+        assert_eq!((stale.is_valid, stale.code), (false, PolicyError::PolicyHashMismatch as u32));
+        assert_eq!(stale.message, Symbol::new(&ctx.env, "POLICY_HASH_MISMATCH"));
+        assert!(policy.validate_rebalance(&ctx.vault, &proposal(&ctx, new, vec![&ctx.env])).is_valid);
+    }
+
+    #[test]
+    fn may_buy_only_declared_assets_with_nonzero_band() {
+        let ctx = setup_test_context();
+        signed_policy(&ctx, 0x01);
+        assert!(buy(&ctx, &ctx.usdc_addr, &ctx.benji_addr).is_valid, "declared asset");
+
+        let zero_band = buy(&ctx, &ctx.usdc_addr, &ctx.eurc_addr);
+        assert_eq!((zero_band.is_valid, zero_band.code), (false, PolicyError::AssetNotInPolicy as u32));
+
+        let undeclared = buy(&ctx, &ctx.usdc_addr, &ctx.eustbl_addr); // registered, not signed
+        assert_eq!((undeclared.is_valid, undeclared.code), (false, PolicyError::AssetNotInPolicy as u32));
+        assert_eq!(undeclared.message, Symbol::new(&ctx.env, "ASSET_NOT_IN_POLICY"));
+    }
+
+    #[test]
+    fn selling_an_undeclared_asset_is_allowed() {
+        let ctx = setup_test_context();
+        signed_policy(&ctx, 0x01);
+        // e.g. tokens sent to the vault unsolicited can be sold into the policy.
+        let r = buy(&ctx, &ctx.eustbl_addr, &ctx.benji_addr);
+        assert!(r.is_valid, "selling into a declared asset must be allowed (code {})", r.code);
+    }
+}
