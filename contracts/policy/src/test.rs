@@ -14,6 +14,7 @@ use soroban_sdk::{
 struct TestContext {
     env: Env,
     admin: Address,
+    owner: Address,
     vault: Address,
     proposer: Address,
     registry_address: Address,
@@ -57,6 +58,7 @@ fn setup_test_context() -> TestContext {
     env.ledger().set_timestamp(1731600000);
 
     let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
     let vault = Address::generate(&env);
     let proposer = Address::generate(&env);
 
@@ -93,6 +95,7 @@ fn setup_test_context() -> TestContext {
     TestContext {
         env,
         admin,
+        owner,
         vault,
         proposer,
         registry_address: reg_id,
@@ -167,6 +170,7 @@ fn test_t26_policy_registration_and_hash_storage() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000, // min_liquidity_sleeve_bps
@@ -202,14 +206,18 @@ fn test_t26_policy_registration_and_hash_storage() {
     assert_eq!(config.max_slippage_bps, 50);
     assert_eq!(config.rebalance_band_bps, 500);
     assert_eq!(config.is_active, true);
-    assert_eq!(config.admin, ctx.admin);
+    assert_eq!(config.owner, ctx.owner);
+    assert_eq!(
+        config.terms_hash,
+        compute_terms_hash(&ctx.env, &ctx.registry_address, 1000, 2500, 3000, 50, 500, &sleeves)
+    );
 
     let stored_sleeves = policy.get_sleeve_targets(&ctx.vault);
     assert_eq!(stored_sleeves.len(), 5);
 
     // 5. Update policy
     let new_hash = sample_hash(&ctx.env, 0xBB);
-    policy.update_policy(&ctx.vault, &new_hash, &sleeves);
+    policy.update_policy(&ctx.vault, &new_hash, &1000, &2500, &3000, &50, &500, &sleeves);
 
     // Verify update event IMMEDIATELY after update_policy
     let events_after_upd = ctx.env.events().all();
@@ -255,12 +263,14 @@ fn test_t26_uninitialized_and_unauthorized_checks() {
 
     // Calling register_policy on uninitialized contract fails
     let vault = Address::generate(&env);
+    let owner = Address::generate(&env);
     let reg_addr = Address::generate(&env);
     let p_hash = sample_hash(&env, 0x01);
     let sleeves = sample_sleeves(&env);
 
     let reg_res = policy.try_register_policy(
         &vault,
+        &owner,
         &p_hash,
         &reg_addr,
         &1000,
@@ -290,10 +300,11 @@ fn test_t26_uninitialized_and_unauthorized_checks() {
         )))
     );
 
-    // Non-admin caller attempting register_policy without admin auth fails
+    // Registration without owner + vault authorization fails
     env.mock_auths(&[]);
     let unauth_reg = policy.try_register_policy(
         &vault,
+        &owner,
         &p_hash,
         &reg_addr,
         &1000,
@@ -306,7 +317,7 @@ fn test_t26_uninitialized_and_unauthorized_checks() {
     assert!(unauth_reg.is_err(), "Unauthorized registration should fail");
 
     let new_hash = sample_hash(&env, 0x02);
-    let unauth_upd = policy.try_update_policy(&vault, &new_hash, &sleeves);
+    let unauth_upd = policy.try_update_policy(&vault, &new_hash, &1000, &2500, &3000, &50, &500, &sleeves);
     assert!(unauth_upd.is_err(), "Unauthorized update should fail");
 }
 
@@ -320,6 +331,7 @@ fn test_t27_compliant_rebalance_acceptance() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -395,6 +407,7 @@ fn test_t28_weight_band_breach_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -537,6 +550,7 @@ fn test_t29_liquidity_floor_breach_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000, // min cash liquidity sleeve = 1000 bps
@@ -620,6 +634,7 @@ fn test_t30_single_asset_cap_and_issuer_cap_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000, // min_liquidity
@@ -690,6 +705,7 @@ fn test_t31_slippage_and_deadline_rejections() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -781,6 +797,7 @@ fn test_t32_closed_universe_registry_cross_check() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -878,6 +895,7 @@ fn test_exact_boundaries_acceptance() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000, // min liquidity = 1000 bps
@@ -943,6 +961,7 @@ fn test_rebalance_without_operations_passes() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1006,6 +1025,7 @@ fn test_duplicate_asset_in_weights_after_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1051,6 +1071,7 @@ fn test_slippage_overflow_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1107,6 +1128,7 @@ fn test_vault_mismatch_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1190,6 +1212,7 @@ fn test_weights_after_with_deactivated_asset_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1233,6 +1256,7 @@ fn test_identical_trade_assets_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1287,6 +1311,7 @@ fn test_negative_or_zero_min_amount_out_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1339,6 +1364,7 @@ fn test_policy_registration_invalid_parameters_rejected() {
     // 1. max_slippage_bps > 10000
     let res_slippage = policy.try_register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1358,6 +1384,7 @@ fn test_policy_registration_invalid_parameters_rejected() {
     // 2. min_liquidity_sleeve_bps > 10000
     let res_liq = policy.try_register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &10001, // > 10000
@@ -1387,6 +1414,7 @@ fn test_policy_registration_invalid_parameters_rejected() {
     ];
     let res_band = policy.try_register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1423,6 +1451,7 @@ fn test_policy_registration_invalid_parameters_rejected() {
     ];
     let res_dup = policy.try_register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1439,3 +1468,4 @@ fn test_policy_registration_invalid_parameters_rejected() {
         )))
     );
 }
+

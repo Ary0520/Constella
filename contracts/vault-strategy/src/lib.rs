@@ -195,7 +195,8 @@ pub struct PolicyConfigRef {
     pub max_slippage_bps: u32,
     pub rebalance_band_bps: u32,
     pub is_active: bool,
-    pub admin: Address,
+    pub owner: Address,
+    pub terms_hash: BytesN<32>,
 }
 
 #[contractclient(name = "PolicyClient")]

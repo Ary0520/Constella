@@ -19,6 +19,7 @@ use soroban_sdk::{
 struct TestContext<'a> {
     env: Env,
     admin: Address,
+    policy_owner: Address,
     pause_authority: Address,
     treasury: Address,
     alice: Address,
@@ -40,6 +41,7 @@ fn setup_test_context() -> TestContext<'static> {
     env.ledger().set_sequence_number(100);
 
     let admin = Address::generate(&env);
+    let policy_owner = Address::generate(&env);
     let pause_authority = Address::generate(&env);
     let treasury = Address::generate(&env);
     let alice = Address::generate(&env);
@@ -109,6 +111,7 @@ fn setup_test_context() -> TestContext<'static> {
     TestContext {
         env,
         admin,
+        policy_owner,
         pause_authority,
         treasury,
         alice,
@@ -526,6 +529,7 @@ fn test_t46_liquidity_sleeve_floor_protection() {
     });
     ctx.policy_client.register_policy(
         &ctx.vault_id,
+        &ctx.policy_owner,
         &dummy_hash,
         &ctx.registry_client.address,
         &1000, // 10% min liquidity sleeve floor
@@ -741,6 +745,7 @@ fn test_exact_liquidity_floor_boundary() {
     });
     ctx.policy_client.register_policy(
         &ctx.vault_id,
+        &ctx.policy_owner,
         &dummy_hash,
         &ctx.registry_client.address,
         &1000, // 10% floor
@@ -862,6 +867,7 @@ fn test_dual_nav_asymmetric_max_redeem() {
     });
     ctx.policy_client.register_policy(
         &ctx.vault_id,
+        &ctx.policy_owner,
         &dummy_hash,
         &ctx.registry_client.address,
         &0, // 0% floor
@@ -972,6 +978,7 @@ fn test_upgrade_and_policy_hash() {
     });
     ctx.policy_client.register_policy(
         &ctx.vault_id,
+        &ctx.policy_owner,
         &dummy_hash,
         &ctx.registry_client.address,
         &1000,

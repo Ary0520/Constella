@@ -5,6 +5,7 @@ use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
     FromVal, Symbol, SymbolStr, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,6 +58,8 @@ pub enum PolicyError {
     LiquidityFloorBreached = 10,
     AssetNotRegistered = 11,
     SlippageLimitExceeded = 12,
+    /// A vault's policy can be registered once; afterwards only the owner may amend it.
+    PolicyAlreadyRegistered = 13,
 }
 
 #[contracttype]
@@ -82,7 +85,12 @@ pub struct PolicyConfig {
     pub max_slippage_bps: u32,
     pub rebalance_band_bps: u32,
     pub is_active: bool,
-    pub admin: Address,
+    /// The policy signer (user smart account or treasury multisig). Only this
+    /// address can amend the policy (audit P3).
+    pub owner: Address,
+    /// SHA-256 of the XDR encoding of the stored terms
+    /// (registry, caps, sleeves) - lets anyone verify what was signed.
+    pub terms_hash: BytesN<32>,
 }
 
 #[contracttype]
@@ -138,10 +146,13 @@ pub trait PolicyContractTrait {
     /// Initialize the policy contract with a governance admin
     fn initialize(env: Env, admin: Address);
 
-    /// Register a signed policy hash and configuration for a vault
+    /// Register the signed policy for a vault. Requires authorization from BOTH
+    /// the policy `owner` (who signs the hash and every term) and the `vault`
+    /// itself. One-time: re-registration fails with `PolicyAlreadyRegistered`.
     fn register_policy(
         env: Env,
         vault: Address,
+        owner: Address,
         policy_hash: BytesN<32>,
         registry_address: Address,
         min_liquidity_sleeve_bps: u32,
@@ -152,11 +163,17 @@ pub trait PolicyContractTrait {
         sleeves: Vec<SleeveTarget>,
     );
 
-    /// Update a vault's policy hash upon user re-signing
+    /// Amend a vault's policy. Requires a fresh signature from the stored
+    /// policy owner; the protocol admin cannot amend (audit P3).
     fn update_policy(
         env: Env,
         vault: Address,
         new_hash: BytesN<32>,
+        min_liquidity_sleeve_bps: u32,
+        max_single_asset_bps: u32,
+        max_issuer_bps: u32,
+        max_slippage_bps: u32,
+        rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     );
 
@@ -211,6 +228,62 @@ fn is_cash_sleeve(env: &Env, st: &Symbol) -> bool {
         || bytes.eq_ignore_ascii_case(b"cash_sleeve")
 }
 
+fn validate_terms(
+    env: &Env,
+    min_liquidity_sleeve_bps: u32,
+    max_single_asset_bps: u32,
+    max_issuer_bps: u32,
+    max_slippage_bps: u32,
+    sleeves: &Vec<SleeveTarget>,
+) {
+    if max_slippage_bps > 10000 {
+        panic_with_error!(env, PolicyError::SlippageLimitExceeded);
+    }
+    if min_liquidity_sleeve_bps > 10000 {
+        panic_with_error!(env, PolicyError::LiquidityFloorBreached);
+    }
+    if max_single_asset_bps > 10000 {
+        panic_with_error!(env, PolicyError::SingleAssetCapExceeded);
+    }
+    if max_issuer_bps > 10000 {
+        panic_with_error!(env, PolicyError::IssuerCapExceeded);
+    }
+    for i in 0..sleeves.len() {
+        let sleeve_i = sleeves.get(i).unwrap();
+        if sleeve_i.min_band_bps > sleeve_i.max_band_bps {
+            panic_with_error!(env, PolicyError::WeightBandExceeded);
+        }
+        for j in (i + 1)..sleeves.len() {
+            if sleeve_i.asset_id == sleeves.get(j).unwrap().asset_id {
+                panic_with_error!(env, PolicyError::WeightBandExceeded);
+            }
+        }
+    }
+}
+
+/// SHA-256 over the XDR of every enforced term, in a fixed order.
+pub fn compute_terms_hash(
+    env: &Env,
+    registry_address: &Address,
+    min_liquidity_sleeve_bps: u32,
+    max_single_asset_bps: u32,
+    max_issuer_bps: u32,
+    max_slippage_bps: u32,
+    rebalance_band_bps: u32,
+    sleeves: &Vec<SleeveTarget>,
+) -> BytesN<32> {
+    let terms = (
+        registry_address.clone(),
+        min_liquidity_sleeve_bps,
+        max_single_asset_bps,
+        max_issuer_bps,
+        max_slippage_bps,
+        rebalance_band_bps,
+        sleeves.clone(),
+    );
+    env.crypto().sha256(&terms.to_xdr(env)).to_bytes()
+}
+
 #[contractimpl]
 impl PolicyContractTrait for PolicyContract {
     fn initialize(env: Env, admin: Address) {
@@ -223,6 +296,7 @@ impl PolicyContractTrait for PolicyContract {
     fn register_policy(
         env: Env,
         vault: Address,
+        owner: Address,
         policy_hash: BytesN<32>,
         registry_address: Address,
         min_liquidity_sleeve_bps: u32,
@@ -232,48 +306,45 @@ impl PolicyContractTrait for PolicyContract {
         rebalance_band_bps: u32,
         sleeves: Vec<SleeveTarget>,
     ) {
-        let admin = Self::get_admin(env.clone());
-        admin.require_auth();
+        // Fail fast if the contract was never initialized.
+        let _ = Self::get_admin(env.clone());
+        // The vault must consent to being governed by this policy, and the
+        // owner signs the hash together with every enforced term (audit P3).
+        vault.require_auth();
+        owner.require_auth();
 
-        if max_slippage_bps > 10000 {
-            panic_with_error!(&env, PolicyError::SlippageLimitExceeded);
-        }
-        if min_liquidity_sleeve_bps > 10000 {
-            panic_with_error!(&env, PolicyError::LiquidityFloorBreached);
-        }
-        if max_single_asset_bps > 10000 {
-            panic_with_error!(&env, PolicyError::SingleAssetCapExceeded);
-        }
-        if max_issuer_bps > 10000 {
-            panic_with_error!(&env, PolicyError::IssuerCapExceeded);
-        }
-
-        // Validate sleeve band sanity if sleeves provided
-        for i in 0..sleeves.len() {
-            let sleeve_i = sleeves.get(i).unwrap();
-            if sleeve_i.min_band_bps > sleeve_i.max_band_bps {
-                panic_with_error!(&env, PolicyError::WeightBandExceeded);
-            }
-            // Check for duplicate sleeves
-            for j in (i + 1)..sleeves.len() {
-                let sleeve_j = sleeves.get(j).unwrap();
-                if sleeve_i.asset_id == sleeve_j.asset_id {
-                    panic_with_error!(&env, PolicyError::WeightBandExceeded);
-                }
-            }
-        }
-
-        let existing_version = env
+        if env
             .storage()
             .instance()
-            .get::<_, PolicyConfig>(&DataKey::PolicyConfig(vault.clone()))
-            .map(|c| c.version)
-            .unwrap_or(0);
+            .has(&DataKey::PolicyConfig(vault.clone()))
+        {
+            panic_with_error!(&env, PolicyError::PolicyAlreadyRegistered);
+        }
+
+        validate_terms(
+            &env,
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            &sleeves,
+        );
+
+        let terms_hash = compute_terms_hash(
+            &env,
+            &registry_address,
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            rebalance_band_bps,
+            &sleeves,
+        );
 
         let config = PolicyConfig {
             vault: vault.clone(),
             policy_hash: policy_hash.clone(),
-            version: existing_version + 1,
+            version: 1,
             registry_address,
             min_liquidity_sleeve_bps,
             max_single_asset_bps,
@@ -281,7 +352,8 @@ impl PolicyContractTrait for PolicyContract {
             max_slippage_bps,
             rebalance_band_bps,
             is_active: true,
-            admin: admin.clone(),
+            owner: owner.clone(),
+            terms_hash: terms_hash.clone(),
         };
 
         env.storage()
@@ -293,7 +365,7 @@ impl PolicyContractTrait for PolicyContract {
 
         env.events().publish(
             (Symbol::new(&env, "POLICY_REGISTERED"), vault),
-            policy_hash,
+            (policy_hash, owner, terms_hash),
         );
     }
 
@@ -301,25 +373,13 @@ impl PolicyContractTrait for PolicyContract {
         env: Env,
         vault: Address,
         new_hash: BytesN<32>,
+        min_liquidity_sleeve_bps: u32,
+        max_single_asset_bps: u32,
+        max_issuer_bps: u32,
+        max_slippage_bps: u32,
+        rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     ) {
-        let admin = Self::get_admin(env.clone());
-        admin.require_auth();
-
-        // Validate new sleeve sanity
-        for i in 0..new_sleeves.len() {
-            let sleeve_i = new_sleeves.get(i).unwrap();
-            if sleeve_i.min_band_bps > sleeve_i.max_band_bps {
-                panic_with_error!(&env, PolicyError::WeightBandExceeded);
-            }
-            for j in (i + 1)..new_sleeves.len() {
-                let sleeve_j = new_sleeves.get(j).unwrap();
-                if sleeve_i.asset_id == sleeve_j.asset_id {
-                    panic_with_error!(&env, PolicyError::WeightBandExceeded);
-                }
-            }
-        }
-
         let mut config: PolicyConfig = match env
             .storage()
             .instance()
@@ -328,9 +388,35 @@ impl PolicyContractTrait for PolicyContract {
             Some(cfg) => cfg,
             None => panic_with_error!(&env, PolicyError::PolicyNotFound),
         };
+        // Only the policy owner can amend — never the protocol admin (audit P3).
+        config.owner.require_auth();
+
+        validate_terms(
+            &env,
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            &new_sleeves,
+        );
 
         config.policy_hash = new_hash.clone();
         config.version += 1;
+        config.min_liquidity_sleeve_bps = min_liquidity_sleeve_bps;
+        config.max_single_asset_bps = max_single_asset_bps;
+        config.max_issuer_bps = max_issuer_bps;
+        config.max_slippage_bps = max_slippage_bps;
+        config.rebalance_band_bps = rebalance_band_bps;
+        config.terms_hash = compute_terms_hash(
+            &env,
+            &config.registry_address,
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            rebalance_band_bps,
+            &new_sleeves,
+        );
 
         env.storage()
             .instance()
@@ -341,7 +427,7 @@ impl PolicyContractTrait for PolicyContract {
 
         env.events().publish(
             (Symbol::new(&env, "POLICY_UPDATED"), vault),
-            new_hash,
+            (new_hash, config.version, config.terms_hash),
         );
     }
 

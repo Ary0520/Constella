@@ -258,25 +258,56 @@ fn p3_admin_alone_cannot_replace_a_signed_policy() {
     let forged_hash = soroban_sdk::BytesN::from_array(&s.env, &[0xBA; 32]);
     let empty: Vec<SleeveTarget> = Vec::new(&s.env);
 
-    s.env.mock_all_auths(); // setup: policy exists for the vault
+    let owner = Address::generate(&s.env); // the user's / treasury's signing account
+
+    s.env.mock_all_auths(); // setup: owner + vault registered the signed policy
     s.policy.register_policy(
-        &s.vault_id, &signed_hash, &s.registry_id,
+        &s.vault_id, &owner, &signed_hash, &s.registry_id,
         &1000, &10_000, &10_000, &50, &500, &cash_only_targets(&s.env),
     );
 
-    // Attack: ONLY the protocol admin authorizes a replacement that wipes all bands.
+    // Attack: ONLY the protocol admin authorizes a replacement that wipes all
+    // bands and drops the liquidity floor to 0.
     s.env.mock_auths(&[MockAuth {
         address: &s.admin,
         invoke: &MockAuthInvoke {
             contract: &s.policy.address,
             fn_name: "update_policy",
-            args: (s.vault_id.clone(), forged_hash.clone(), empty.clone()).into_val(&s.env),
+            args: (s.vault_id.clone(), forged_hash.clone(), 0u32, 10_000u32, 10_000u32, 10_000u32, 10_000u32, empty.clone())
+                .into_val(&s.env),
             sub_invokes: &[],
         },
     }]);
-    let res = s.policy.try_update_policy(&s.vault_id, &forged_hash, &empty);
+    let res = s.policy.try_update_policy(&s.vault_id, &forged_hash, &0, &10_000, &10_000, &10_000, &10_000, &empty);
 
     assert!(res.is_err(), "admin alone must not be able to amend a signed policy");
     assert_eq!(s.policy.get_policy_hash(&s.vault_id), signed_hash);
     assert_eq!(s.policy.get_sleeve_targets(&s.vault_id).len(), 1);
+    assert_eq!(s.policy.get_policy_config(&s.vault_id).unwrap().min_liquidity_sleeve_bps, 1000);
+
+    // Attack 2: admin tries to register a fresh policy over the existing one.
+    s.env.mock_all_auths();
+    let squat = s.policy.try_register_policy(
+        &s.vault_id, &s.admin, &forged_hash, &s.registry_id,
+        &0, &10_000, &10_000, &10_000, &10_000, &empty,
+    );
+    assert!(squat.is_err(), "a signed policy cannot be re-registered");
+    assert_eq!(s.policy.get_policy_config(&s.vault_id).unwrap().owner, owner);
+
+    // The legitimate owner can still amend by re-signing.
+    let amended = soroban_sdk::BytesN::from_array(&s.env, &[0x52; 32]);
+    let targets = cash_only_targets(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &owner,
+        invoke: &MockAuthInvoke {
+            contract: &s.policy.address,
+            fn_name: "update_policy",
+            args: (s.vault_id.clone(), amended.clone(), 1500u32, 10_000u32, 10_000u32, 50u32, 500u32, targets.clone())
+                .into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    s.policy.update_policy(&s.vault_id, &amended, &1500, &10_000, &10_000, &50, &500, &targets);
+    assert_eq!(s.env.auths()[0].0, owner);
+    assert_eq!(s.policy.get_policy_hash(&s.vault_id), amended);
 }
