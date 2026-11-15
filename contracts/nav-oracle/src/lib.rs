@@ -1,13 +1,8 @@
 #![no_std]
-// TEMPORARY (audit W4.1, 15 Nov 2026): `Events::publish` is deprecated since
-// soroban-sdk 23 in favour of `#[contractevent]`. Publishing behaves exactly as
-// before; the migration to `#[contractevent]` (with byte-for-byte event
-// encoding tests) is sub-step W4.1b, which removes this allowance.
-#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Symbol,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address, Env, Symbol,
     Vec,
 };
 
@@ -62,6 +57,53 @@ pub struct SleeveOracleConfig {
     pub min_valid_sources: u32,
     pub is_paused: bool,
     pub pause_reason: Symbol,
+}
+
+// Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
+// Events::publish encodings; pinned by golden/events.txt). Map-format events
+// use sparse = false so every field is always written, exactly like the
+// contracttype data structs below (which remain for decoding event data).
+
+/// Topics: [NAV_PAUSE, sleeve_id]. Data: map shaped like `NavPauseData`.
+#[contractevent(topics = ["NAV_PAUSE"], data_format = "map", sparse = false)]
+pub struct NavPause {
+    #[topic]
+    pub sleeve_id: Symbol,
+    pub reason: Symbol,
+    pub sleeve: Symbol,
+    pub sources_valid: u32,
+    pub sources_total: u32,
+    pub deviation_bps: u32,
+    pub timestamp: u64,
+}
+
+/// Topics: [NAV_RESUME, sleeve_id]. Data: map shaped like `NavResumeData`.
+#[contractevent(topics = ["NAV_RESUME"], data_format = "map", sparse = false)]
+pub struct NavResume {
+    #[topic]
+    pub sleeve_id: Symbol,
+    pub sleeve: Symbol,
+    pub sources_valid: u32,
+    pub timestamp: u64,
+}
+
+/// Topics: [PRICE_UPDATED, source_id]. Data: map shaped like `PriceUpdatedData`.
+#[contractevent(topics = ["PRICE_UPDATED"], data_format = "map", sparse = false)]
+pub struct PriceUpdated {
+    #[topic]
+    pub id: Symbol,
+    pub source_id: Symbol,
+    pub price: i128,
+    pub liquidity_depth_usd: i128,
+    pub timestamp: u64,
+}
+
+/// Topics: [PAUSE_AUTHORITY_SET, old_authority]. Data: new authority.
+#[contractevent(topics = ["PAUSE_AUTHORITY_SET"], data_format = "single-value")]
+pub struct PauseAuthoritySet {
+    #[topic]
+    pub old_authority: Address,
+    pub new_authority: Address,
 }
 
 #[contracttype]
@@ -313,17 +355,16 @@ fn evaluate_sources(
             dev_bps as u32
         };
 
-        env.events().publish(
-            (Symbol::new(env, "NAV_PAUSE"), sleeve_id.clone()),
-            NavPauseData {
-                reason: Symbol::new(env, "DEVIATION"),
-                sleeve: sleeve_id.clone(),
-                sources_valid: valid_sources.len(),
-                sources_total: source_ids.len(),
-                deviation_bps: dev_bps_clamped,
-                timestamp: now,
-            },
-        );
+        NavPause {
+            sleeve_id: sleeve_id.clone(),
+            reason: Symbol::new(env, "DEVIATION"),
+            sleeve: sleeve_id.clone(),
+            sources_valid: valid_sources.len(),
+            sources_total: source_ids.len(),
+            deviation_bps: dev_bps_clamped,
+            timestamp: now,
+        }
+        .publish(env);
         return Err(OracleError::DeviationExceeded);
     }
 
@@ -551,15 +592,14 @@ impl NavOracleTrait for NavOracle {
             .instance()
             .set(&DataKey::Source(source_id.clone()), &source);
 
-        env.events().publish(
-            (Symbol::new(&env, "PRICE_UPDATED"), source_id.clone()),
-            PriceUpdatedData {
-                source_id,
-                price,
-                liquidity_depth_usd,
-                timestamp,
-            },
-        );
+        PriceUpdated {
+            id: source_id.clone(),
+            source_id,
+            price,
+            liquidity_depth_usd,
+            timestamp,
+        }
+        .publish(&env);
 
         latch_deviation_on_write(&env, &source.sleeve);
     }
@@ -870,17 +910,16 @@ impl NavOracleTrait for NavOracle {
             }
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "NAV_PAUSE"), sleeve_id.clone()),
-            NavPauseData {
-                reason,
-                sleeve: sleeve_id,
-                sources_valid,
-                sources_total: source_ids.len(),
-                deviation_bps: 0,
-                timestamp: now,
-            },
-        );
+        NavPause {
+            sleeve_id: sleeve_id.clone(),
+            reason,
+            sleeve: sleeve_id,
+            sources_valid,
+            sources_total: source_ids.len(),
+            deviation_bps: 0,
+            timestamp: now,
+        }
+        .publish(&env);
     }
 
     fn clear_circuit_breaker(env: Env, sleeve_id: Symbol) {
@@ -930,14 +969,13 @@ impl NavOracleTrait for NavOracle {
             }
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "NAV_RESUME"), sleeve_id.clone()),
-            NavResumeData {
-                sleeve: sleeve_id,
-                sources_valid,
-                timestamp: now,
-            },
-        );
+        NavResume {
+            sleeve_id: sleeve_id.clone(),
+            sleeve: sleeve_id,
+            sources_valid,
+            timestamp: now,
+        }
+        .publish(&env);
     }
 
     fn set_pause_authority(env: Env, new_authority: Address) {
@@ -954,10 +992,11 @@ impl NavOracleTrait for NavOracle {
         env.storage()
             .instance()
             .set(&DataKey::PauseAuthority, &new_authority);
-        env.events().publish(
-            (Symbol::new(&env, "PAUSE_AUTHORITY_SET"), old),
+        PauseAuthoritySet {
+            old_authority: old,
             new_authority,
-        );
+        }
+        .publish(&env);
     }
 
     fn get_pause_authority(env: Env) -> Address {
