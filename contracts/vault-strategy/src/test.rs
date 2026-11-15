@@ -330,6 +330,18 @@ fn test_t43_collateral_passport_views() {
     assert_eq!(kit.recommended_ltv_bps, 9800);
     assert_eq!(kit.recommended_haircut_bps, 200);
     assert_eq!(kit.liquidation_threshold_bps, 9900);
+
+    // 6. Oracle Status
+    let oracle_status = ctx.vault_client.get_oracle_status();
+    assert!(!oracle_status.is_empty());
+    let mut found_median = false;
+    for src in oracle_status.iter() {
+        if src.source_id == Symbol::new(&ctx.env, "MEDIAN_SRC") {
+            found_median = true;
+            assert_eq!(src.price, 10_000_000);
+        }
+    }
+    assert!(found_median);
 }
 
 // -------------------------------------------------------------------------
@@ -371,6 +383,21 @@ fn test_t44_emergency_pause_and_unpause() {
     let shares = ctx.vault_client.deposit(&50_0000000, &ctx.alice);
     assert_eq!(shares, 50_0000000);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 50_0000000);
+
+    // Admin direct pause
+    ctx.vault_client.admin_pause();
+    assert!(ctx.vault_client.is_paused());
+    ctx.vault_client.unpause();
+    assert!(!ctx.vault_client.is_paused());
+
+    // Update pause authority
+    let new_pause_auth = Address::generate(&ctx.env);
+    ctx.vault_client.set_pause_authority(&new_pause_auth);
+    assert_eq!(ctx.vault_client.get_config().pause_authority, new_pause_auth);
+    ctx.vault_client.pause();
+    assert!(ctx.vault_client.is_paused());
+    ctx.vault_client.unpause();
+    assert!(!ctx.vault_client.is_paused());
 }
 
 // -------------------------------------------------------------------------
@@ -568,6 +595,16 @@ fn test_t46_liquidity_sleeve_floor_protection() {
     // Trying to redeem 30,000 shares (~29,760 USDC > 20,504 cash)
     let res_cap = ctx.vault_client.try_redeem(&30_000_0000000, &ctx.admin, &ctx.admin);
     assert_eq!(res_cap.unwrap_err().unwrap(), VaultError::ExceedsRedemptionCapacity.into());
+
+    // Verify oracle status returns BENJI sources via registry lookup
+    let oracle_status = ctx.vault_client.get_oracle_status();
+    let mut found_benji = false;
+    for src in oracle_status.iter() {
+        if src.source_id == Symbol::new(&ctx.env, "BENJI_MEDIAN") {
+            found_benji = true;
+        }
+    }
+    assert!(found_benji);
 }
 
 // -------------------------------------------------------------------------
@@ -640,4 +677,307 @@ fn test_edge_cases_and_authorizations() {
 
     let zero_transfer = ctx.vault_client.try_transfer(&ctx.alice, &ctx.bob, &0);
     assert_eq!(zero_transfer.unwrap_err().unwrap(), VaultError::ZeroAmount.into());
+}
+
+// -------------------------------------------------------------------------
+// Boundary & Dual NAV Edge Cases
+// -------------------------------------------------------------------------
+#[test]
+fn test_exact_liquidity_floor_boundary() {
+    let ctx = setup_test_context();
+
+    let benji_admin = Address::generate(&ctx.env);
+    let benji_sac = ctx.env.register_stellar_asset_contract_v2(benji_admin);
+    let benji_address = benji_sac.address();
+
+    let mut benji_sources = SdkVec::new(&ctx.env);
+    benji_sources.push_back(Symbol::new(&ctx.env, "BENJI_MEDIAN"));
+    ctx.registry_client.add_asset(&AssetEntry {
+        contract_address: benji_address.clone(),
+        asset_id: Symbol::new(&ctx.env, "BENJI"),
+        sleeve_type: RegSleeveType::UsdGovFund,
+        liquidity_tier: 1,
+        permissionless: true,
+        oracle_sources: benji_sources,
+        eligible_jurisdictions: SdkVec::new(&ctx.env),
+        blocked_jurisdictions: SdkVec::new(&ctx.env),
+        investor_classes_required: SdkVec::new(&ctx.env),
+        is_active: true,
+        added_at: 1_000_000,
+    });
+
+    let gov_sym = Symbol::new(&ctx.env, "USD_GOV_FUNDS");
+    ctx.oracle_client.configure_sleeve(&gov_sym, &300, &1);
+    ctx.oracle_client.register_source(&ExtOracleSource {
+        source_id: Symbol::new(&ctx.env, "BENJI_MEDIAN"),
+        asset: benji_address.clone(),
+        sleeve: gov_sym,
+        price: 10_000_000, // $1.00
+        timestamp: 1_000_000,
+        staleness_limit_seconds: 14400,
+        min_liquidity_depth_usd: 100_000,
+        current_liquidity_depth_usd: 200_000,
+        is_active: true,
+    });
+
+    // 10% liquidity floor (1000 bps)
+    let dummy_hash = soroban_sdk::BytesN::from_array(&ctx.env, &[7u8; 32]);
+    let mut policy_targets = SdkVec::new(&ctx.env);
+    policy_targets.push_back(SleeveTarget {
+        asset_id: Symbol::new(&ctx.env, "USDC"),
+        target_weight_bps: 1000,
+        min_band_bps: 500,
+        max_band_bps: 1500,
+        sleeve_type: Symbol::new(&ctx.env, "cash"),
+    });
+    policy_targets.push_back(SleeveTarget {
+        asset_id: Symbol::new(&ctx.env, "BENJI"),
+        target_weight_bps: 9000,
+        min_band_bps: 8500,
+        max_band_bps: 9500,
+        sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund"),
+    });
+    ctx.policy_client.register_policy(
+        &ctx.vault_id,
+        &dummy_hash,
+        &ctx.registry_client.address,
+        &1000, // 10% floor
+        &9000,
+        &9000,
+        &50,
+        &200,
+        &policy_targets,
+    );
+
+    // Seed vault with $10,000 cash and $90,000 BENJI = $100,000 total assets
+    // Cash is exactly 10,000 / 100,000 = 10.00%
+    ctx.numeraire_admin.mint(&ctx.admin, &100_000_0000000);
+    ctx.vault_client.deposit(&100_000_0000000, &ctx.admin);
+
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(SleeveState {
+        asset_id: String::from_str(&ctx.env, "USDC"),
+        contract_address: ctx.numeraire_address.clone(),
+        target_weight_bps: 1000,
+        band_bps: 200,
+        current_balance: 10_000_0000000, // Exactly 10%
+        sleeve_type: SleeveType::CashStable,
+        liquidity_tier: 0,
+    });
+    sleeves.push_back(SleeveState {
+        asset_id: String::from_str(&ctx.env, "BENJI"),
+        contract_address: benji_address,
+        target_weight_bps: 9000,
+        band_bps: 200,
+        current_balance: 90_000_0000000, // 90%
+        sleeve_type: SleeveType::UsdGovFunds,
+        liquidity_tier: 1,
+    });
+    ctx.vault_client.set_sleeves(&sleeves);
+
+    // Exact boundary assertions:
+    let cap = ctx.vault_client.get_redemption_capacity();
+    assert_eq!(cap.instant, 0); // Zero instant capacity because floor is reached exactly!
+    assert_eq!(ctx.vault_client.max_withdraw(&ctx.admin), 0);
+    assert_eq!(ctx.vault_client.max_redeem(&ctx.admin), 0);
+
+    // Any withdraw or redeem attempt must be rejected with LiquidityFloorBreached
+    let res = ctx.vault_client.try_withdraw(&1_0000000, &ctx.admin, &ctx.admin);
+    assert_eq!(res.unwrap_err().unwrap(), VaultError::LiquidityFloorBreached.into());
+
+    let res_redeem = ctx.vault_client.try_redeem(&1_0000000, &ctx.admin, &ctx.admin);
+    assert_eq!(res_redeem.unwrap_err().unwrap(), VaultError::LiquidityFloorBreached.into());
+}
+
+#[test]
+fn test_dual_nav_asymmetric_max_redeem() {
+    let ctx = setup_test_context();
+
+    // Deploy an RWA token with 50% conservative haircut vs median
+    let benji_admin = Address::generate(&ctx.env);
+    let benji_sac = ctx.env.register_stellar_asset_contract_v2(benji_admin);
+    let benji_address = benji_sac.address();
+
+    let mut benji_sources = SdkVec::new(&ctx.env);
+    benji_sources.push_back(Symbol::new(&ctx.env, "BENJI_MED"));
+    ctx.registry_client.add_asset(&AssetEntry {
+        contract_address: benji_address.clone(),
+        asset_id: Symbol::new(&ctx.env, "BENJI"),
+        sleeve_type: RegSleeveType::UsdGovFund,
+        liquidity_tier: 1,
+        permissionless: true,
+        oracle_sources: benji_sources,
+        eligible_jurisdictions: SdkVec::new(&ctx.env),
+        blocked_jurisdictions: SdkVec::new(&ctx.env),
+        investor_classes_required: SdkVec::new(&ctx.env),
+        is_active: true,
+        added_at: 1_000_000,
+    });
+
+    let gov_sym = Symbol::new(&ctx.env, "USD_GOV_FUNDS");
+    ctx.oracle_client.configure_sleeve(&gov_sym, &10000, &2);
+    // Median = $1.00 (10_000_000), Conservative = $0.50 (5_000_000)
+    ctx.oracle_client.register_source(&ExtOracleSource {
+        source_id: Symbol::new(&ctx.env, "BENJI_MED"),
+        asset: benji_address.clone(),
+        sleeve: gov_sym.clone(),
+        price: 10_000_000,
+        timestamp: 1_000_000,
+        staleness_limit_seconds: 14400,
+        min_liquidity_depth_usd: 100_000,
+        current_liquidity_depth_usd: 200_000,
+        is_active: true,
+    });
+    ctx.oracle_client.register_source(&ExtOracleSource {
+        source_id: Symbol::new(&ctx.env, "BENJI_LOW"),
+        asset: benji_address.clone(),
+        sleeve: gov_sym,
+        price: 5_000_000,
+        timestamp: 1_000_000,
+        staleness_limit_seconds: 14400,
+        min_liquidity_depth_usd: 100_000,
+        current_liquidity_depth_usd: 200_000,
+        is_active: true,
+    });
+
+    // Policy: 0% floor to isolate capacity check
+    let dummy_hash = soroban_sdk::BytesN::from_array(&ctx.env, &[7u8; 32]);
+    let mut policy_targets = SdkVec::new(&ctx.env);
+    policy_targets.push_back(SleeveTarget {
+        asset_id: Symbol::new(&ctx.env, "USDC"),
+        target_weight_bps: 5000,
+        min_band_bps: 0,
+        max_band_bps: 10000,
+        sleeve_type: Symbol::new(&ctx.env, "cash"),
+    });
+    policy_targets.push_back(SleeveTarget {
+        asset_id: Symbol::new(&ctx.env, "BENJI"),
+        target_weight_bps: 5000,
+        min_band_bps: 0,
+        max_band_bps: 10000,
+        sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund"),
+    });
+    ctx.policy_client.register_policy(
+        &ctx.vault_id,
+        &dummy_hash,
+        &ctx.registry_client.address,
+        &0, // 0% floor
+        &10000,
+        &10000,
+        &50,
+        &200,
+        &policy_targets,
+    );
+
+    // Initial deposit: 1000 USDC -> 1000 shares
+    ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
+    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
+
+    // Configure sleeves: 500 USDC cash, 500 BENJI
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(SleeveState {
+        asset_id: String::from_str(&ctx.env, "USDC"),
+        contract_address: ctx.numeraire_address.clone(),
+        target_weight_bps: 5000,
+        band_bps: 200,
+        current_balance: 500_0000000,
+        sleeve_type: SleeveType::CashStable,
+        liquidity_tier: 0,
+    });
+    sleeves.push_back(SleeveState {
+        asset_id: String::from_str(&ctx.env, "BENJI"),
+        contract_address: benji_address,
+        target_weight_bps: 5000,
+        band_bps: 200,
+        current_balance: 500_0000000,
+        sleeve_type: SleeveType::UsdGovFunds,
+        liquidity_tier: 1,
+    });
+    ctx.vault_client.set_sleeves(&sleeves);
+
+    // Conservative NAV: (500 + 500 * 0.50) / 1000 = 0.750 ($0.75)
+    let cons_nav = ctx.vault_client.get_nav_conservative().unwrap();
+    assert_eq!(cons_nav.price, 7_500_000); // 0.75
+
+    // Cash = 500 USDC. Instant capacity = 500 USDC.
+    let cap = ctx.vault_client.get_redemption_capacity();
+    assert_eq!(cap.instant, 500_0000000);
+
+    // Shares needed to redeem 500 USDC at 0.75 conservative NAV:
+    // 500 / 0.75 = 666.6666666 shares
+    let max_red = ctx.vault_client.max_redeem(&ctx.alice);
+    assert_eq!(max_red, 666_6666666);
+
+    // Alice redeems exactly max_redeem shares
+    let assets_out = ctx.vault_client.redeem(&max_red, &ctx.alice, &ctx.alice);
+    assert!(assets_out <= cap.instant);
+    assert_eq!(assets_out, 499_9999999);
+}
+
+#[test]
+fn test_mint_ceiling_rounding() {
+    let ctx = setup_test_context();
+    configure_vault_oracle_feeds(&ctx);
+
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+
+    // When NAV is $1.00 (10_000_000), minting 1 share requires (1 * 10_000_000 + 10_000_000 - 1) / 10_000_000 = 1 stroop of assets
+    let assets_paid = ctx.vault_client.mint(&1, &ctx.alice);
+    assert_eq!(assets_paid, 1);
+    assert_eq!(ctx.vault_client.balance(&ctx.alice), 1);
+}
+
+#[test]
+fn test_storage_cleanup_zero_balance_and_allowance() {
+    let ctx = setup_test_context();
+    configure_vault_oracle_feeds(&ctx);
+
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    assert_eq!(ctx.vault_client.balance(&ctx.alice), 100_0000000);
+
+    // Transfer entire balance to Bob
+    ctx.vault_client.transfer(&ctx.alice, &ctx.bob, &100_0000000);
+    assert_eq!(ctx.vault_client.balance(&ctx.alice), 0);
+    assert_eq!(ctx.vault_client.balance(&ctx.bob), 100_0000000);
+
+    // Approve Bob 50, then revoke to 0
+    ctx.vault_client.approve(&ctx.bob, &ctx.alice, &50_0000000, &200);
+    assert_eq!(ctx.vault_client.allowance(&ctx.bob, &ctx.alice), 50_0000000);
+    ctx.vault_client.approve(&ctx.bob, &ctx.alice, &0, &200);
+    assert_eq!(ctx.vault_client.allowance(&ctx.bob, &ctx.alice), 0);
+
+    // Approve and transfer_from to zero
+    ctx.vault_client.approve(&ctx.bob, &ctx.alice, &50_0000000, &200);
+    ctx.vault_client.transfer_from(&ctx.alice, &ctx.bob, &ctx.alice, &50_0000000);
+    assert_eq!(ctx.vault_client.allowance(&ctx.bob, &ctx.alice), 0);
+}
+
+#[test]
+fn test_upgrade_and_policy_hash() {
+    let ctx = setup_test_context();
+
+    // Verify policy hash query matches policy contract
+    let dummy_hash = soroban_sdk::BytesN::from_array(&ctx.env, &[42u8; 32]);
+    let mut targets = SdkVec::new(&ctx.env);
+    targets.push_back(SleeveTarget {
+        asset_id: Symbol::new(&ctx.env, "USDC"),
+        target_weight_bps: 10000,
+        min_band_bps: 0,
+        max_band_bps: 10000,
+        sleeve_type: Symbol::new(&ctx.env, "cash"),
+    });
+    ctx.policy_client.register_policy(
+        &ctx.vault_id,
+        &dummy_hash,
+        &ctx.registry_client.address,
+        &1000,
+        &10000,
+        &10000,
+        &50,
+        &200,
+        &targets,
+    );
+    let hash_opt = ctx.vault_client.get_policy_hash();
+    assert_eq!(hash_opt, Some(dummy_hash));
 }
