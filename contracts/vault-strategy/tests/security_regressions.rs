@@ -569,3 +569,68 @@ fn p1_slippage_is_measured_in_value_not_token_units() {
     let bad = s.policy.validate_rebalance(&s.vault_id, &one_trade(&s, &eurc, &s.usdc_addr, 1000 * ONE, 1000 * ONE));
     assert!(!bad.is_valid, "7.4%-loss EURC->USDC trade must be rejected");
 }
+
+// ---------------------------------------------------------------------------
+// P2 — the issuer cap inferred the issuer from the asset_id prefix, so USDC
+// and EURC (both Circle) counted as different issuers and Circle could exceed
+// its cap. REGISTRY.md models the issuer per asset; the cap must use it.
+// ---------------------------------------------------------------------------
+#[test]
+fn p2_issuer_cap_counts_all_assets_of_the_same_issuer() {
+    let s = deploy_stack();
+    let eurc = usdc_eurc_policy_with_caps(&s, 4000); // issuer cap 40%
+    let _ = eurc;
+    let mut w = Vec::new(&s.env);
+    w.push_back((Symbol::new(&s.env, "USDC"), 3000u32)); // Circle
+    w.push_back((Symbol::new(&s.env, "EURC"), 3000u32)); // Circle
+    w.push_back((Symbol::new(&s.env, "BLEND_USDC_SUPPLY"), 4000u32)); // Blend
+    let proposal = RebalanceProposal {
+        vault: s.vault_id.clone(),
+        operations: Vec::new(&s.env),
+        weights_after: w,
+        deadline: T0 + 600,
+        proposer: s.admin.clone(),
+    };
+    let r = s.policy.validate_rebalance(&s.vault_id, &proposal);
+    assert!(!r.is_valid, "Circle at 60% must breach a 40% issuer cap");
+    assert_eq!(r.message, Symbol::new(&s.env, "ISSUER_CAP_EXCEEDED"));
+}
+
+fn usdc_eurc_policy_with_caps(s: &Stack, max_issuer_bps: u32) -> Address {
+    let registry = AssetRegistryClient::new(&s.env, &s.registry_id);
+    let mut eurc = Address::generate(&s.env);
+    for (id, st) in [("EURC", RegSleeve::Cash), ("BLEND_USDC_SUPPLY", RegSleeve::Lending)] {
+        let addr = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+        if id == "EURC" {
+            eurc = addr.clone();
+        }
+        registry.add_asset(&AssetEntry {
+            contract_address: addr,
+            asset_id: Symbol::new(&s.env, id),
+            sleeve_type: st,
+            liquidity_tier: 0,
+            permissionless: true,
+            oracle_sources: Vec::from_array(&s.env, [Symbol::new(&s.env, "SRC_A"), Symbol::new(&s.env, "SRC_B")]),
+            eligible_jurisdictions: Vec::new(&s.env),
+            blocked_jurisdictions: Vec::new(&s.env),
+            investor_classes_required: Vec::new(&s.env),
+            is_active: true,
+            added_at: T0,
+        });
+    }
+    let mut targets = Vec::new(&s.env);
+    for (id, st) in [("USDC", "cash"), ("EURC", "cash"), ("BLEND_USDC_SUPPLY", "lending")] {
+        targets.push_back(SleeveTarget {
+            asset_id: Symbol::new(&s.env, id),
+            target_weight_bps: 3333,
+            min_band_bps: 0,
+            max_band_bps: 10_000,
+            sleeve_type: Symbol::new(&s.env, st),
+        });
+    }
+    s.policy.register_policy(
+        &s.vault_id, &Address::generate(&s.env), &soroban_sdk::BytesN::from_array(&s.env, &[0x22; 32]),
+        &s.registry_id, &1000, &10_000, &max_issuer_bps, &50, &500, &targets,
+    );
+    eurc
+}
