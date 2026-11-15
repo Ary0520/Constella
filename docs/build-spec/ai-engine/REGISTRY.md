@@ -100,6 +100,9 @@ Higher yield, higher risk. Hard-capped at 15% in any basket by default.
 
 ## Issuer Concentration Policy
 
+The issuer cap is computed from the **`issuer` field of each on-chain registry entry** (audit P2, 15 Nov 2026) — never inferred from the asset ID. USDC and EURC both carry `issuer = CIRCLE`, so they share one cap; Spiko USD and Spiko EUR both count toward `SPIKO`.
+
+
 | Constraint | Default | Configurable by user? |
 |---|---|---|
 | Max single issuer | 30% | Yes, in signed policy |
