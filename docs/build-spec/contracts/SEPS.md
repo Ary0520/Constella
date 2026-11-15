@@ -22,7 +22,7 @@ Every Constella basket token (vault share token) **must** implement SEP-41 so th
 - AMMs (Soroswap, Aquarius) and DEX orderbooks can list the basket token.
 - Lending markets (Blend, Liqvid) can accept the basket token as collateral.
 
-**Status (15 Nov 2026, audit W6 fixed):** all core operations and events above are implemented on the vault share token, including `burn`/`burn_from`, validated `live_until_ledger`, and `mint` events for accrued fee shares. One gap remains: `transfer` takes `to: Address`, not `MuxedAddress` (W4.2b).
+**Status (15 Nov 2026, audit W6 fixed):** all core operations and events above are implemented on the vault share token, including `burn`/`burn_from`, validated `live_until_ledger`, and `mint` events for accrued fee shares. `transfer` accepts a muxed destination (W4.2b) and reports its id in the event.
 
 ---
 

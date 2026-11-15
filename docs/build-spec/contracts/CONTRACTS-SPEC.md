@@ -148,7 +148,7 @@ fn asset(env: Env) -> Address   // the numéraire
 
 // SEP-41 share token
 fn balance(env: Env, id: Address) -> i128
-fn transfer(env: Env, from: Address, to: Address, amount: i128)        // muxed `to` in W4.2b
+fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128)   // credits the underlying account
 fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128)
 fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32)
     // expired (amount > 0) or beyond the network max TTL -> error #102 InvalidLiveUntilLedger
@@ -374,7 +374,7 @@ Data: { relevant fields, timestamp }
 |---|---|
 | `deposit` | SEP-56 event (name defined by the standard): topics `[deposit, operator, from, receiver]`, data `(assets, shares)`; emitted by `deposit` and `mint` |
 | `withdraw` | SEP-56 event: topics `[withdraw, operator, receiver, owner]`, data `(assets, shares)`; emitted by `withdraw` and `redeem` |
-| `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard): `transfer` `[transfer, from, to]` data `amount`; `approve` `[approve, from, spender]` data `[amount, live_until_ledger]`; `mint` `[mint, to]` data `amount` (deposits, mints **and accrued fee shares** to the treasury); `burn` `[burn, from]` data `amount` (redeem, withdraw, `burn`, `burn_from`) |
+| `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard): `transfer` `[transfer, from, to]` data `amount`, or map `{amount, to_muxed_id}` when `to` is muxed; `approve` `[approve, from, spender]` data `[amount, live_until_ledger]`; `mint` `[mint, to]` data `amount` (deposits, mints **and accrued fee shares** to the treasury); `burn` `[burn, from]` data `amount` (redeem, withdraw, `burn`, `burn_from`) |
 | `REBALANCE_STEP` | Each trade in a rebalance |
 | `REBALANCE_COMPLETE` | Full rebalance completed |
 | `NAV_PAUSE` | Circuit breaker triggered |
