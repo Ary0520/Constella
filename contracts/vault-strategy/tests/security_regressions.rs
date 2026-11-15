@@ -830,3 +830,48 @@ fn v5_share_price_comes_from_holdings_not_an_oracle_override() {
     assert_eq!(s.vault.deposit(&(100 * ONE), &alice), 100 * ONE, "100 USDC buys 100 shares, not 50");
     assert_eq!(s.vault.redeem(&(100 * ONE), &alice, &alice), 100 * ONE);
 }
+
+// ---------------------------------------------------------------------------
+// M3 — every contract had a public, unauthenticated `initialize`. Between
+// deployment and initialization anyone could call it first and become admin.
+// Fix: Soroban constructors (`__constructor`) run inside the deployment itself.
+// ---------------------------------------------------------------------------
+fn stranger_initializes(env: &Env, contract: &Address, args: soroban_sdk::Vec<soroban_sdk::Val>) -> bool {
+    matches!(
+        env.try_invoke_contract::<(), soroban_sdk::Error>(contract, &Symbol::new(env, "initialize"), args),
+        Ok(Ok(()))
+    )
+}
+
+#[test]
+fn m3_fresh_deployments_cannot_be_taken_over() {
+    let env = Env::default();
+    env.ledger().set_timestamp(T0);
+    let attacker = Address::generate(&env);
+    let usdc = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+
+    let registry = env.register(AssetRegistry, ());
+    assert!(!stranger_initializes(&env, &registry, (attacker.clone(),).into_val(&env)), "registry hijack");
+
+    let oracle = env.register(NavOracle, ());
+    assert!(!stranger_initializes(&env, &oracle, (attacker.clone(), usdc.clone(), 7u32, 300u32).into_val(&env)), "oracle hijack");
+
+    let policy = env.register(PolicyContract, ());
+    assert!(!stranger_initializes(&env, &policy, (attacker.clone(), oracle.clone()).into_val(&env)), "policy hijack");
+
+    let vault = env.register(StrategyVault, ());
+    let cfg = VaultConfig {
+        admin: attacker.clone(),
+        pause_authority: attacker.clone(),
+        numeraire: usdc,
+        policy_contract: policy,
+        oracle_contract: oracle,
+        registry_contract: registry,
+        treasury: attacker.clone(),
+        management_fee_bps: 10_000,
+        tvl_cap: i128::MAX,
+        per_user_cap: i128::MAX,
+    };
+    let args = (cfg, String::from_str(&env, "Evil"), String::from_str(&env, "EVIL"), 7u32).into_val(&env);
+    assert!(!stranger_initializes(&env, &vault, args), "vault hijack");
+}

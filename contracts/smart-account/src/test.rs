@@ -787,3 +787,19 @@ fn test_t55_sponsored_passkey_vault_deposit() {
     assert_eq!(global_stats.total_ops_today, 1);
     assert_eq!(global_stats.total_fees_today_stroops, fee_bid_stroops);
 }
+
+// -------------------------------------------------------------------------
+// Audit M3 (2026-11-15): a freshly deployed passkey account must not be
+// claimable by whoever calls `initialize` first.
+// -------------------------------------------------------------------------
+#[test]
+fn m3_fresh_account_cannot_be_claimed_by_a_stranger() {
+    use soroban_sdk::IntoVal;
+    let env = Env::default();
+    let account = env.register(SmartAccountContract, ());
+    let mut attacker_key = [7u8; 65];
+    attacker_key[0] = 0x04;
+    let args = (BytesN::from_array(&env, &attacker_key), 1u32, String::from_str(&env, "attacker")).into_val(&env);
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(&account, &Symbol::new(&env, "initialize"), args);
+    assert!(!matches!(r, Ok(Ok(()))), "a stranger must not be able to install their key");
+}

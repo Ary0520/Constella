@@ -290,3 +290,18 @@ fn test_fee_sponsor_admin_transfer_and_limits_reconfiguration() {
         Err(Ok(SponsorError::NotInitialized))
     );
 }
+
+// -------------------------------------------------------------------------
+// Audit M3 (2026-11-15): a freshly deployed sponsor must not be claimable by
+// whoever calls `initialize` first (they would control the fee budget).
+// -------------------------------------------------------------------------
+#[test]
+fn m3_fresh_sponsor_cannot_be_claimed_by_a_stranger() {
+    use soroban_sdk::{testutils::Address as _, IntoVal};
+    let env = Env::default();
+    let sponsor = env.register(FeeSponsorContract, ());
+    let attacker = Address::generate(&env);
+    let args = (attacker, 1_000u32, 1_000u32, u64::MAX).into_val(&env);
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(&sponsor, &Symbol::new(&env, "initialize"), args);
+    assert!(!matches!(r, Ok(Ok(()))), "a stranger must not be able to claim the sponsor");
+}
