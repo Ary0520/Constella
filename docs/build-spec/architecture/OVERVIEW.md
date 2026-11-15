@@ -189,7 +189,7 @@
 
 | Layer | Primary Tech |
 |---|---|
-| Smart contracts | Rust · Soroban SDK v28+ · OpenZeppelin stellar-contracts |
+| Smart contracts | Rust · Soroban SDK 28.x · OpenZeppelin stellar-contracts v0.8.0 |
 | Frontend | TypeScript · React/Next.js · Stellar Wallets Kit |
 | AI engine | Python · LangChain · PyPortfolioOpt · pgvector |
 | Data | PostgreSQL · Galexie · Stellar RPC |
@@ -208,6 +208,6 @@
 | Cost per classic op | < $0.001 |
 | Ledger close (post-Adapter) | ~5 seconds |
 | Uptime | 99.99% |
-| Soroban SDK | v28 (shipped Sep 30) |
+| Soroban SDK | 28.0.0 (18 Sep); latest stable 29.0.1; 30.0.0-rc.1 only |
 | Active protocol | 28 (Adapter) |
 | Next protocol | 30 (Bell) — testnet vote Nov 3, mainnet vote Nov 23 |
