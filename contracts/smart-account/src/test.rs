@@ -880,3 +880,126 @@ fn golden_events_smart_account() {
     g.capture(&env, "remove_signer");
     g.finish(&["ACCOUNT_INITIALIZED", "SIGNER_ADDED", "SIGNER_UPDATED", "THRESHOLD_UPDATED", "SIGNER_REMOVED"]);
 }
+
+// -------------------------------------------------------------------------
+// Audit S1 (2026-11-15): real passkeys sign a WebAuthn assertion, not the raw
+// Soroban payload. W3C WebAuthn L2 §7.2: the authenticator signs
+// SHA-256(authenticatorData || SHA-256(clientDataJSON)), where clientDataJSON
+// carries type "webauthn.get" and challenge = base64url(signature payload).
+// Assertions below are built byte-for-byte in that format with real P-256 keys.
+// -------------------------------------------------------------------------
+mod s1 {
+    use super::*;
+    use stellar_accounts::verifiers::webauthn::WebAuthnSigData;
+
+    const UP: u8 = 0x01; // user present
+    const UV: u8 = 0x04; // user verified (biometric / PIN)
+
+    /// RFC 4648 §5 base64url without padding (independent of the contract code).
+    fn b64url(bytes: &[u8]) -> std::string::String {
+        const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut out = std::string::String::new();
+        for chunk in bytes.chunks(3) {
+            let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+            let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+            for i in 0..(chunk.len() + 1) {
+                out.push(A[((n >> (18 - 6 * i)) & 63) as usize] as char);
+            }
+        }
+        out
+    }
+
+    fn sha(env: &Env, data: &[u8]) -> [u8; 32] {
+        env.crypto().sha256(&Bytes::from_slice(env, data)).to_array()
+    }
+
+    /// An assertion as a platform authenticator (Face ID / Touch ID) returns it.
+    pub(super) fn assertion(env: &Env, kp: &KeyPair, challenge: &[u8; 32], flags: u8, typ: &str) -> WebAuthnSigData {
+        let mut auth_data = sha(env, b"constella.app").to_vec(); // rpIdHash
+        auth_data.push(flags);
+        auth_data.extend_from_slice(&[0, 0, 0, 7]); // signCount
+        let client_data = std::format!(
+            r#"{{"type":"{typ}","challenge":"{}","origin":"https://constella.app","crossOrigin":false}}"#,
+            b64url(challenge)
+        );
+        let mut msg = auth_data.clone();
+        msg.extend_from_slice(&sha(env, client_data.as_bytes()));
+        let digest = sha(env, &msg);
+        WebAuthnSigData {
+            signature: sign_payload(env, kp, &digest),
+            authenticator_data: Bytes::from_slice(env, &auth_data),
+            client_data: Bytes::from_slice(env, client_data.as_bytes()),
+        }
+    }
+
+    fn check(env: &Env, account: &soroban_sdk::Address, payload: &BytesN<32>, kp: &KeyPair, sig: WebAuthnSigData)
+        -> Result<(), Result<AccError, soroban_sdk::InvokeError>> {
+        let auth = PasskeyAuth { signatures: vec![env, PasskeySignature { public_key: kp.public_key_bytes.clone(), signature: sig }] };
+        let ctx: Vec<Context> = vec![env];
+        env.try_invoke_contract_check_auth::<AccError>(account, payload, auth.into_val(env), &ctx)
+    }
+
+    fn setup(env: &Env) -> (soroban_sdk::Address, KeyPair, BytesN<32>, [u8; 32]) {
+        let kp = generate_keypair(env);
+        let id = env.register(SmartAccountContract, (kp.public_key_bytes.clone(), 1u32, String::from_str(env, "Face ID")));
+        let (_h, payload, raw) = make_payload_hash(env, b"s1-transaction");
+        (id, kp, payload, raw)
+    }
+
+    #[test]
+    fn a_real_webauthn_assertion_authorizes() {
+        let env = Env::default();
+        let (id, kp, payload, raw) = setup(&env);
+        assert_eq!(check(&env, &id, &payload, &kp, assertion(&env, &kp, &raw, UP | UV, "webauthn.get")), Ok(()));
+    }
+
+    #[test]
+    fn a_signature_over_the_raw_payload_is_rejected() {
+        // The pre-fix scheme: P-256 directly over the 32-byte payload. Real
+        // authenticators never produce this, so accepting it was the bug.
+        let env = Env::default();
+        let (id, kp, payload, raw) = setup(&env);
+        let mut sig = assertion(&env, &kp, &raw, UP | UV, "webauthn.get");
+        sig.signature = sign_payload(&env, &kp, &raw);
+        assert!(check(&env, &id, &payload, &kp, sig).is_err());
+    }
+
+    #[test]
+    fn an_assertion_for_another_transaction_is_rejected() {
+        let env = Env::default();
+        let (id, kp, payload, _raw) = setup(&env);
+        let (_h, _p, other) = make_payload_hash(&env, b"some-other-transaction");
+        let res = check(&env, &id, &payload, &kp, assertion(&env, &kp, &other, UP | UV, "webauthn.get"));
+        assert_eq!(res, Err(Err(soroban_sdk::InvokeError::Contract(3114))), "ChallengeInvalid");
+    }
+
+    #[test]
+    fn user_verification_is_required() {
+        let env = Env::default();
+        let (id, kp, payload, raw) = setup(&env);
+        let res = check(&env, &id, &payload, &kp, assertion(&env, &kp, &raw, UP, "webauthn.get"));
+        assert_eq!(res, Err(Err(soroban_sdk::InvokeError::Contract(3117))), "VerifiedBitNotSet");
+        let res = check(&env, &id, &payload, &kp, assertion(&env, &kp, &raw, UV, "webauthn.get"));
+        assert_eq!(res, Err(Err(soroban_sdk::InvokeError::Contract(3116))), "PresentBitNotSet");
+    }
+
+    #[test]
+    fn a_registration_ceremony_is_not_an_authorization() {
+        let env = Env::default();
+        let (id, kp, payload, raw) = setup(&env);
+        let res = check(&env, &id, &payload, &kp, assertion(&env, &kp, &raw, UP | UV, "webauthn.create"));
+        assert_eq!(res, Err(Err(soroban_sdk::InvokeError::Contract(3113))), "TypeFieldInvalid");
+    }
+
+    #[test]
+    fn tampered_client_data_breaks_the_signature() {
+        let env = Env::default();
+        let (id, kp, payload, raw) = setup(&env);
+        let mut sig = assertion(&env, &kp, &raw, UP | UV, "webauthn.get");
+        let mut cd: std::vec::Vec<u8> = sig.client_data.iter().collect();
+        let s = std::string::String::from_utf8(cd.clone()).unwrap().replace("constella.app", "evil.example");
+        cd = s.into_bytes();
+        sig.client_data = Bytes::from_slice(&env, &cd);
+        assert!(check(&env, &id, &payload, &kp, sig).is_err());
+    }
+}
