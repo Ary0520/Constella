@@ -981,3 +981,110 @@ fn test_upgrade_and_policy_hash() {
     let hash_opt = ctx.vault_client.get_policy_hash();
     assert_eq!(hash_opt, Some(dummy_hash));
 }
+
+// -------------------------------------------------------------------------
+// Audit V1 (2026-11-15): self-transfer must never change balances or supply.
+// Auth for the call under test is mocked EXPLICITLY (not mock_all_auths) and
+// the recorded authorization tree is asserted.
+// -------------------------------------------------------------------------
+fn sum_of_balances(ctx: &TestContext, holders: &[&Address]) -> i128 {
+    holders.iter().map(|h| ctx.vault_client.balance(h)).sum()
+}
+
+#[test]
+fn test_self_transfer_does_not_mint_shares() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+    let ctx = setup_test_context();
+    configure_vault_oracle_feeds(&ctx);
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    let before = ctx.vault_client.balance(&ctx.alice);
+    let supply = ctx.vault_client.total_supply();
+
+    for _ in 0..3 {
+        ctx.env.mock_auths(&[MockAuth {
+            address: &ctx.alice,
+            invoke: &MockAuthInvoke {
+                contract: &ctx.vault_id,
+                fn_name: "transfer",
+                args: (ctx.alice.clone(), ctx.alice.clone(), before).into_val(&ctx.env),
+                sub_invokes: &[],
+            },
+        }]);
+        ctx.vault_client.transfer(&ctx.alice, &ctx.alice, &before);
+        let auths = ctx.env.auths();
+        assert_eq!(auths.len(), 1);
+        assert_eq!(auths[0].0, ctx.alice);
+    }
+
+    assert_eq!(ctx.vault_client.balance(&ctx.alice), before);
+    assert_eq!(ctx.vault_client.total_supply(), supply);
+    assert_eq!(sum_of_balances(&ctx, &[&ctx.alice, &ctx.treasury]), supply);
+}
+
+#[test]
+fn test_self_transfer_more_than_balance_rejected() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+    let ctx = setup_test_context();
+    configure_vault_oracle_feeds(&ctx);
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    let bal = ctx.vault_client.balance(&ctx.alice);
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.alice,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.vault_id,
+            fn_name: "transfer",
+            args: (ctx.alice.clone(), ctx.alice.clone(), bal + 1).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(ctx.vault_client.try_transfer(&ctx.alice, &ctx.alice, &(bal + 1)).is_err());
+    assert_eq!(ctx.vault_client.balance(&ctx.alice), bal);
+}
+
+#[test]
+fn test_self_transfer_from_does_not_mint_shares() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+    let ctx = setup_test_context();
+    configure_vault_oracle_feeds(&ctx);
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    let bal = ctx.vault_client.balance(&ctx.alice);
+    let supply = ctx.vault_client.total_supply();
+    ctx.vault_client.approve(&ctx.alice, &ctx.bob, &bal, &1000);
+
+    ctx.env.mock_auths(&[MockAuth {
+        address: &ctx.bob,
+        invoke: &MockAuthInvoke {
+            contract: &ctx.vault_id,
+            fn_name: "transfer_from",
+            args: (ctx.bob.clone(), ctx.alice.clone(), ctx.alice.clone(), bal).into_val(&ctx.env),
+            sub_invokes: &[],
+        },
+    }]);
+    ctx.vault_client.transfer_from(&ctx.bob, &ctx.alice, &ctx.alice, &bal);
+    assert_eq!(ctx.env.auths()[0].0, ctx.bob);
+
+    assert_eq!(ctx.vault_client.balance(&ctx.alice), bal);
+    assert_eq!(ctx.vault_client.total_supply(), supply);
+    // Allowance is still consumed: the spender used its approval.
+    assert_eq!(ctx.vault_client.allowance(&ctx.alice, &ctx.bob), 0);
+}
+
+#[test]
+fn test_transfer_conserves_total_supply() {
+    let ctx = setup_test_context();
+    configure_vault_oracle_feeds(&ctx);
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    let supply = ctx.vault_client.total_supply();
+    ctx.vault_client.transfer(&ctx.alice, &ctx.bob, &40_0000000);
+    ctx.vault_client.transfer(&ctx.bob, &ctx.alice, &15_0000000);
+    assert_eq!(ctx.vault_client.balance(&ctx.alice), 75_0000000);
+    assert_eq!(ctx.vault_client.balance(&ctx.bob), 25_0000000);
+    assert_eq!(sum_of_balances(&ctx, &[&ctx.alice, &ctx.bob, &ctx.treasury]), supply);
+}
