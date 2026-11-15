@@ -419,3 +419,30 @@ fn test_t25_event_emissions_verification() {
     assert!(found_deactivated, "ASSET_DEACTIVATED event not found");
 }
 
+// -------------------------------------------------------------------------
+// Audit P2 (2026-11-15): every asset records its issuer; empty is refused.
+// -------------------------------------------------------------------------
+mod p2 {
+    use super::*;
+
+    #[test]
+    fn issuer_is_stored_and_required() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register(AssetRegistry, ());
+        let client = AssetRegistryClient::new(&env, &id);
+        client.initialize(&Address::generate(&env));
+
+        let usdc = Address::generate(&env);
+        client.add_asset(&create_sample_entry(&env, &usdc, "USDC", SleeveType::Cash, 0, "PYTH_USDC"));
+        assert_eq!(client.get_asset(&Symbol::new(&env, "USDC")).unwrap().issuer, Symbol::new(&env, "CIRCLE"));
+
+        let mut nameless = create_sample_entry(&env, &Address::generate(&env), "MYSTERY", SleeveType::Cash, 0, "PYTH_X");
+        nameless.issuer = Symbol::new(&env, "");
+        assert_eq!(
+            client.try_add_asset(&nameless),
+            Err(Ok(soroban_sdk::Error::from_contract_error(RegistryError::EmptyIssuer as u32)))
+        );
+        assert!(client.get_asset(&Symbol::new(&env, "MYSTERY")).is_none());
+    }
+}

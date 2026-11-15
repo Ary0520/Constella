@@ -1740,3 +1740,70 @@ mod p1 {
     }
 }
 
+// -------------------------------------------------------------------------
+// Audit P2 (2026-11-15): issuer caps use the registry's issuer field.
+// -------------------------------------------------------------------------
+mod p2 {
+    use super::*;
+
+    fn policy_for(ctx: &TestContext, ids: &[(&str, &str)], max_issuer: u32) {
+        let mut sleeves = Vec::new(&ctx.env);
+        for (id, st) in ids {
+            sleeves.push_back(SleeveTarget {
+                asset_id: Symbol::new(&ctx.env, id),
+                target_weight_bps: 0,
+                min_band_bps: 0,
+                max_band_bps: 10000,
+                sleeve_type: Symbol::new(&ctx.env, st),
+            });
+        }
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(
+            &ctx.vault, &ctx.owner, &sample_hash(&ctx.env, 0x02), &ctx.registry_address,
+            &1000, &10000, &max_issuer, &50, &500, &sleeves,
+        );
+    }
+
+    fn validate(ctx: &TestContext, weights: &[(&str, u32)]) -> ValidationResult {
+        let mut w = Vec::new(&ctx.env);
+        for (id, bps) in weights {
+            w.push_back((Symbol::new(&ctx.env, id), *bps));
+        }
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).validate_rebalance(
+            &ctx.vault,
+            &RebalanceProposal {
+                vault: ctx.vault.clone(),
+                operations: Vec::new(&ctx.env),
+                weights_after: w,
+                deadline: ctx.env.ledger().timestamp() + 600,
+                proposer: ctx.proposer.clone(),
+            },
+        )
+    }
+
+    #[test]
+    fn assets_of_one_issuer_share_its_cap() {
+        let ctx = setup_test_context();
+        policy_for(&ctx, &[("CIRCLE_USDC", "cash"), ("CIRCLE_EURC", "cash"), ("FRANKLIN_BENJI", "usd_gov_fund"), ("SPIKO_EUSTBL", "eur_sovereign")], 4000);
+        // CIRCLE_USDC and CIRCLE_EURC are both issuer CIRCLE in the registry.
+        let r = validate(&ctx, &[("CIRCLE_USDC", 3000), ("CIRCLE_EURC", 3000), ("FRANKLIN_BENJI", 4000)]);
+        assert_eq!((r.is_valid, r.code), (false, PolicyError::IssuerCapExceeded as u32));
+        assert!(validate(&ctx, &[("CIRCLE_USDC", 2000), ("CIRCLE_EURC", 2000), ("FRANKLIN_BENJI", 6000)]).code
+            == PolicyError::IssuerCapExceeded as u32, "Franklin at 60% also breaches");
+        let ok = validate(&ctx, &[("CIRCLE_USDC", 2000), ("CIRCLE_EURC", 2000), ("FRANKLIN_BENJI", 4000), ("SPIKO_EUSTBL", 2000)]);
+        assert!(ok.is_valid, "40/40/20 respects a 40% cap (code {})", ok.code);
+    }
+
+    #[test]
+    fn shared_prefix_with_different_issuers_is_not_merged() {
+        let ctx = setup_test_context();
+        let reg = AssetRegistryClient::new(&ctx.env, &ctx.registry_address);
+        let one = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
+        let two = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
+        register_registry_asset(&ctx.env, &reg, &one, "ACME_ONE", "ACME_INC", SleeveType::UsdGovFund);
+        register_registry_asset(&ctx.env, &reg, &two, "ACME_TWO", "OTHER_CO", SleeveType::UsdGovFund);
+        policy_for(&ctx, &[("CIRCLE_USDC", "cash"), ("ACME_ONE", "usd_gov_fund"), ("ACME_TWO", "usd_gov_fund")], 4000);
+        // A prefix guess would merge ACME_ONE + ACME_TWO into 70% and reject.
+        let r = validate(&ctx, &[("CIRCLE_USDC", 3000), ("ACME_ONE", 3500), ("ACME_TWO", 3500)]);
+        assert!(r.is_valid, "different registered issuers must not be merged (code {})", r.code);
+    }
+}
