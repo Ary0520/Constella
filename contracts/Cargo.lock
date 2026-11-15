@@ -348,6 +348,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "constella-threshold-policy"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+ "stellar-accounts",
+]
+
+[[package]]
 name = "constella-vault-strategy"
 version = "0.1.0"
 dependencies = [
