@@ -119,6 +119,7 @@ trait IssuerAdapter {
 | SDEX | 3 | 0.3% | Classic DEX; thin for most assets |
 
 **Rules:**
+- Slippage is measured in value against the oracle's fair price for each asset (audit P1), so cross-currency legs (e.g. USDC ↔ EURC) are judged on real loss, not token counts
 - If a route would exceed the slippage cap: skip that route, try next
 - If all routes exceed cap: **abort that trade leg**, leave sleeve slightly out-of-band, alert operators
 - Never force a trade into a thin market
