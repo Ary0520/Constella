@@ -1,0 +1,22 @@
+[package]
+name = "constella-smart-account"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+constella-registry = { path = "../registry" }
+constella-policy = { path = "../policy" }
+constella-nav-oracle = { path = "../nav-oracle" }
+constella-vault-strategy = { path = "../vault-strategy" }
+constella-fee-sponsor = { path = "../fee-sponsor" }
