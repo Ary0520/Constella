@@ -53,6 +53,7 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 ### Rule 5: Staleness limits and hard stop
 - Every source has a **staleness limit** (time since last update, defined per-source in registry)
 - Sources beyond staleness limit are treated as invalid (same as unavailable)
+- **Timestamp integrity (audit O2, 15 Nov 2026):** a price stamped later than the current ledger time is rejected on write and treated as invalid if found in storage (otherwise it would never go stale); a feed update older than the stored one is rejected (prevents replaying an old-but-fresh price over newer data)
 - If **fewer than 2 valid sources** remain for a sleeve:
   - **Hard stop**: deposits, redemptions, and rebalancing for that sleeve are halted
   - Operators alerted
