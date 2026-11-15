@@ -89,6 +89,8 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 - Unaffected sleeves continue normally
 - **Where it is detected (audit O4, 15 Nov 2026):** the deviation check runs inside every price write (`update_price`, `register_source`), so the pause and its `NAV_PAUSE` event persist in that successful transaction. Reads re-check as defence in depth, but a pause first seen inside a caller that reverts would be rolled back — so writes are the authoritative trigger. Staleness and insufficient sources (Rule 5) are evaluated live on every read and are not latched.
 
+- **Limits (audit O5, decision D-G, `ae8e790`):** `deviation_threshold_bps` may never exceed **500** (5 %). Defaults are **200** for stablecoins and cash and **300** for tokenized money-market funds. Loosening a sleeve (a wider threshold or fewer required sources) waits **48 h** (`SLEEVE_CONFIG_PROPOSED`; anyone activates, the admin can cancel). Tightening is immediate.
+
 ### Rule 5: Staleness limits and hard stop
 - Every source has a **staleness limit** (time since last update, defined per-source in registry)
 - Sources beyond staleness limit are treated as invalid (same as unavailable)
