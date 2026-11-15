@@ -66,9 +66,8 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
     let sac = env.register_stellar_asset_contract_v2(Address::generate(&env));
     let usdc_addr = sac.address();
 
-    let registry_id = env.register(AssetRegistry, ());
+    let registry_id = env.register(AssetRegistry, (admin.clone(),));
     let registry = AssetRegistryClient::new(&env, &registry_id);
-    registry.initialize(&admin);
     registry.add_asset(&AssetEntry {
         contract_address: usdc_addr.clone(),
         asset_id: Symbol::new(&env, "USDC"),
@@ -850,7 +849,8 @@ fn m3_fresh_deployments_cannot_be_taken_over() {
     let attacker = Address::generate(&env);
     let usdc = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
 
-    let registry = env.register(AssetRegistry, ());
+    let owner = Address::generate(&env);
+    let registry = env.register(AssetRegistry, (owner.clone(),));
     assert!(!stranger_initializes(&env, &registry, (attacker.clone(),).into_val(&env)), "registry hijack");
 
     let oracle = env.register(NavOracle, ());

@@ -647,9 +647,8 @@ fn test_t55_sponsored_passkey_vault_deposit() {
     let numeraire_client = soroban_sdk::token::Client::new(&env, &numeraire_address);
 
     // 2. Deploy Registry
-    let registry_id = env.register(constella_registry::AssetRegistry, ());
+    let registry_id = env.register(constella_registry::AssetRegistry, (admin.clone(),));
     let registry_client = constella_registry::AssetRegistryClient::new(&env, &registry_id);
-    registry_client.initialize(&admin);
 
     let mut usdc_sources = Vec::new(&env);
     usdc_sources.push_back(Symbol::new(&env, "USDC_SRC"));

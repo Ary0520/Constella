@@ -55,9 +55,8 @@ fn setup_test_context() -> TestContext<'static> {
     let numeraire_client = soroban_sdk::token::Client::new(&env, &numeraire_address);
 
     // Deploy Registry
-    let registry_id = env.register(AssetRegistry, ());
+    let registry_id = env.register(AssetRegistry, (admin.clone(),));
     let registry_client = AssetRegistryClient::new(&env, &registry_id);
-    registry_client.initialize(&admin);
 
     // Register USDC in registry as Cash
     let mut usdc_sources = SdkVec::new(&env);

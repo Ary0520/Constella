@@ -48,50 +48,24 @@ fn test_t21_initialization_and_admin_auth() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(AssetRegistry, ());
+    // Audit M3: the admin is set by the constructor, atomically with deployment.
+    let admin = Address::generate(&env);
+    let contract_id = env.register(AssetRegistry, (admin.clone(),));
     let client = AssetRegistryClient::new(&env, &contract_id);
+    assert_eq!(client.get_admin(), admin);
 
-    // Calling before initialization must fail with NotInitialized
-    let uninit_admin = client.try_get_admin();
-    assert_eq!(
-        uninit_admin,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            RegistryError::NotInitialized as u32
-        )))
+    // There is no `initialize` entrypoint left to front-run.
+    let attacker = Address::generate(&env);
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "initialize"),
+        soroban_sdk::vec![&env, soroban_sdk::IntoVal::into_val(&attacker, &env)],
     );
+    assert!(!matches!(r, Ok(Ok(()))));
+    assert_eq!(client.get_admin(), admin);
 
     let dummy_addr = Address::generate(&env);
     let sample = create_sample_entry(&env, &dummy_addr, "USDC", SleeveType::Cash, 0, "PYTH_USDC");
-    let uninit_add = client.try_add_asset(&sample);
-    assert_eq!(
-        uninit_add,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            RegistryError::NotInitialized as u32
-        )))
-    );
-
-    let uninit_deact = client.try_deactivate_asset(&Symbol::new(&env, "USDC"));
-    assert_eq!(
-        uninit_deact,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            RegistryError::NotInitialized as u32
-        )))
-    );
-
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
-
-    // Verify admin
-    assert_eq!(client.get_admin(), admin);
-
-    // Re-initialization must fail with AlreadyInitialized
-    let duplicate_init = client.try_initialize(&admin);
-    assert_eq!(
-        duplicate_init,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            RegistryError::AlreadyInitialized as u32
-        )))
-    );
 
     // Non-admin caller attempting add_asset without mock auths must fail
     // Clear mocked auths to test authorization failure
@@ -108,11 +82,10 @@ fn test_t22_register_permissionless_assets_phase1() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(AssetRegistry, ());
+    let admin = Address::generate(&env);
+    let contract_id = env.register(AssetRegistry, (admin.clone(),));
     let client = AssetRegistryClient::new(&env, &contract_id);
 
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
 
     let usdc_addr = Address::generate(&env);
     let eurc_addr = Address::generate(&env);
@@ -179,11 +152,10 @@ fn test_t23_deactivate_asset() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(AssetRegistry, ());
+    let admin = Address::generate(&env);
+    let contract_id = env.register(AssetRegistry, (admin.clone(),));
     let client = AssetRegistryClient::new(&env, &contract_id);
 
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
 
     let usdc_addr = Address::generate(&env);
     let eurc_addr = Address::generate(&env);
@@ -244,11 +216,10 @@ fn test_t24_duplicate_and_unregistered_queries() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(AssetRegistry, ());
+    let admin = Address::generate(&env);
+    let contract_id = env.register(AssetRegistry, (admin.clone(),));
     let client = AssetRegistryClient::new(&env, &contract_id);
 
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
 
     let usdc_addr = Address::generate(&env);
     let initial_entry = create_sample_entry(&env, &usdc_addr, "USDC", SleeveType::Cash, 0, "PYTH_USDC");
@@ -360,11 +331,10 @@ fn test_t25_event_emissions_verification() {
     let env = Env::default();
     env.mock_all_auths();
 
-    let contract_id = env.register(AssetRegistry, ());
+    let admin = Address::generate(&env);
+    let contract_id = env.register(AssetRegistry, (admin.clone(),));
     let client = AssetRegistryClient::new(&env, &contract_id);
 
-    let admin = Address::generate(&env);
-    client.initialize(&admin);
 
     let usdc_addr = Address::generate(&env);
     let usdc_entry = create_sample_entry(&env, &usdc_addr, "USDC", SleeveType::Cash, 0, "PYTH_USDC");
@@ -429,9 +399,8 @@ mod p2 {
     fn issuer_is_stored_and_required() {
         let env = Env::default();
         env.mock_all_auths();
-        let id = env.register(AssetRegistry, ());
+        let id = env.register(AssetRegistry, (Address::generate(&env),));
         let client = AssetRegistryClient::new(&env, &id);
-        client.initialize(&Address::generate(&env));
 
         let usdc = Address::generate(&env);
         client.add_asset(&create_sample_entry(&env, &usdc, "USDC", SleeveType::Cash, 0, "PYTH_USDC"));

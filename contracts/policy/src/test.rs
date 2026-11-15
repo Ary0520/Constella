@@ -67,9 +67,8 @@ fn setup_test_context() -> TestContext {
     let proposer = Address::generate(&env);
 
     // Register closed universe asset registry
-    let reg_id = env.register(AssetRegistry, ());
+    let reg_id = env.register(AssetRegistry, (admin.clone(),));
     let reg_client = AssetRegistryClient::new(&env, &reg_id);
-    reg_client.initialize(&admin);
 
     // Real token contracts (SACs, 7 decimals): slippage valuation reads decimals.
     let token = |env: &Env| env.register_stellar_asset_contract_v2(Address::generate(env)).address();

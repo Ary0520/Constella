@@ -60,9 +60,6 @@ pub enum DataKey {
 }
 
 pub trait AssetRegistryTrait {
-    /// Initialize the registry with an authorized admin address (multisig)
-    fn initialize(env: Env, admin: Address);
-
     /// Add an approved asset to the closed universe (admin only)
     fn add_asset(env: Env, entry: AssetEntry);
 
@@ -89,13 +86,16 @@ pub trait AssetRegistryTrait {
 pub struct AssetRegistry;
 
 #[contractimpl]
-impl AssetRegistryTrait for AssetRegistry {
-    fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, RegistryError::AlreadyInitialized);
-        }
+impl AssetRegistry {
+    /// Runs atomically as part of deployment, so no one can claim an
+    /// uninitialized registry (audit M3). There is no `initialize` entrypoint.
+    pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
+}
+
+#[contractimpl]
+impl AssetRegistryTrait for AssetRegistry {
 
     fn add_asset(env: Env, entry: AssetEntry) {
         let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
