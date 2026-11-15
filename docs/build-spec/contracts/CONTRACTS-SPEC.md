@@ -47,6 +47,7 @@ fn is_registered(env: Env, contract_address: Address) -> bool
 pub struct AssetEntry {
     contract_address: Address,
     asset_id: String,            // e.g. "FRANKLIN_BENJI"
+    issuer: Symbol,              // e.g. "CIRCLE" for USDC and EURC; required (audit P2)
     sleeve_type: SleeveType,     // cash | usd_gov_fund | eur_sovereign | yield_usd | lending | equity
     liquidity_tier: u8,          // 0=instant, 1=24h, 2=1week, 3=illiquid
     permissionless: bool,
