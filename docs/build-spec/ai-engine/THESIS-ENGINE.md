@@ -143,9 +143,10 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 1. Engine generates the final Policy object (not a draft — final)
 2. Policy is serialized to canonical JSON (deterministic field ordering)
 3. Policy hash = SHA-256(canonical JSON)
-4. User (or multisig) signs the policy hash via Stellar smart account
-5. Policy contract on-chain stores the hash
-6. Vault is instantiated against this policy hash
+4. User (or multisig) — the policy *owner* — signs the policy hash together with every enforced term
+   (Soroban authorization of `register_policy`, invoked by the vault through `vault.bind_policy`)
+5. Policy contract on-chain stores the hash, the terms, and terms_hash = SHA-256(XDR(terms))
+6. Vault is bound to this policy; only the owner can amend it later (re-sign `update_policy`)
 7. The on-chain vault enforces only operations consistent with the signed policy
 ```
 
