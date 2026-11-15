@@ -34,36 +34,40 @@ SEP-56 (Draft v0.1.2, authored by OpenZeppelin) is Stellar's ecosystem adaptatio
 
 ### Core Functions & Properties
 ```rust
-pub trait SEP56Vault {
-    // Deposit / Mint
-    fn deposit(env: Env, assets: i128, receiver: Address) -> i128;
-    fn mint(env: Env, shares: i128, receiver: Address) -> i128;
+// SEP-56 v0.1.2 (Created 2025-11-04, Updated 2025-11-06; re-verified 15 Nov 2026).
+// `trait TokenizedVault: TokenInterface` — the vault is also a SEP-41 token.
+pub trait TokenizedVault {
+    fn total_supply(e: &Env) -> i128;
+    fn query_asset(e: &Env) -> Address;          // underlying asset (numéraire); there is no `asset`
+    fn total_assets(e: &Env) -> i128;
+    fn convert_to_shares(e: &Env, assets: i128) -> i128;
+    fn convert_to_assets(e: &Env, shares: i128) -> i128;
 
-    // Withdraw / Redeem
-    fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address) -> i128;
-    fn redeem(env: Env, shares: i128, receiver: Address, owner: Address) -> i128;
+    fn max_deposit(e: &Env, receiver: Address) -> i128;
+    fn preview_deposit(e: &Env, assets: i128) -> i128;   // rounds down
+    fn deposit(e: &Env, assets: i128, receiver: Address, from: Address, operator: Address) -> i128;
+    fn max_mint(e: &Env, receiver: Address) -> i128;
+    fn preview_mint(e: &Env, shares: i128) -> i128;      // rounds up
+    fn mint(e: &Env, shares: i128, receiver: Address, from: Address, operator: Address) -> i128;
 
-    // Accounting & Pricing
-    fn total_assets(env: Env) -> i128;
-    fn total_supply(env: Env) -> i128;
-    fn convert_to_shares(env: Env, assets: i128) -> i128;
-    fn convert_to_assets(env: Env, shares: i128) -> i128;
-    fn asset(env: Env) -> Address; // Underlying numéraire
-    
-    // Limits
-    fn max_deposit(env: Env, receiver: Address) -> i128;
-    fn max_mint(env: Env, receiver: Address) -> i128;
-    fn max_withdraw(env: Env, owner: Address) -> i128;
-    fn max_redeem(env: Env, owner: Address) -> i128;
+    fn max_withdraw(e: &Env, owner: Address) -> i128;
+    fn preview_withdraw(e: &Env, assets: i128) -> i128;  // rounds up
+    fn withdraw(e: &Env, assets: i128, receiver: Address, owner: Address, operator: Address) -> i128;
+    fn max_redeem(e: &Env, owner: Address) -> i128;
+    fn preview_redeem(e: &Env, shares: i128) -> i128;    // rounds down
+    fn redeem(e: &Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> i128;
 }
 ```
+
+- **Events:** `Deposit` (topics `operator, from, receiver`) and `Withdraw` (topics `operator, receiver, owner`), each with data fields `assets: i128, shares: i128`, defined as `#[contractevent]` structs (v0.1.1). With the SDK's default format the data is the map `{assets, shares}`, which is also what the OpenZeppelin reference implementation emits.
+- **Authorization:** the standard enforces no pattern; implementations use `operator.require_auth()`. Constella: when `operator != from`, the numéraire is pulled with `transfer_from` under `from`'s allowance to the operator; when `operator != owner`, the owner's **share** allowance to the operator is spent.
 
 ### How Constella Extends SEP-56 for Multi-Asset Baskets
 While classic SEP-56 targets a single underlying asset, Constella achieves SEP-56 compliance for multi-asset baskets by:
 1. **Single Numéraire Settlement:** All deposits and redemptions enter and exit in a single base currency (USDC or EURC).
 2. **Internal Multi-Asset Accounting:** Internally, the vault allocates numéraire across multiple sleeve constituents.
 3. **NAV-Based Conversion:** `convert_to_shares` and `convert_to_assets` evaluate the aggregate basket NAV against the numéraire.
-4. **Base Module:** OpenZeppelin `stellar-contracts` v0.8.0. Status (15 Nov 2026): the share ledger runs on OZ `stellar-tokens` fungible storage (audit W4.2a); routing the SEP-56 entry points through the OZ vault module, where it can carry dual NAV, caps, fees and the liquidity floor, is W4.2b.
+4. **Base Module:** OpenZeppelin `stellar-contracts` v0.8.0. The share ledger runs on OZ `stellar-tokens` fungible storage (W4.2a). The SEP-56 interface (W4.2b, `87e532b`) moves assets and applies operator/allowance rules through OZ `Vault::deposit_internal` / `withdraw_internal`. OZ's single-NAV share maths is **not** used, because dual NAV prices deposits at the median and redemptions at the conservative NAV. Previews include pending management fees, so `preview_*` equals execution.
 
 ---
 

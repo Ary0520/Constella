@@ -137,14 +137,20 @@ pub struct TradeOperation {
 
 **Key functions:**
 ```rust
-// SEP-56 required
-fn deposit(env: Env, assets: i128, receiver: Address) -> i128   // returns shares
-fn redeem(env: Env, shares: i128, receiver: Address, owner: Address) -> i128  // returns assets
+// SEP-56 v0.1.2 (operator authorizes; see SEPS.md for allowance rules)
+fn deposit(env: Env, assets: i128, receiver: Address, from: Address, operator: Address) -> i128  // shares, median NAV
+fn mint(env: Env, shares: i128, receiver: Address, from: Address, operator: Address) -> i128     // assets paid
+fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address, operator: Address) -> i128 // shares burned
+fn redeem(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> i128   // assets, conservative NAV
+fn preview_deposit(env: Env, assets: i128) -> i128   // == deposit result, pending fees included
+fn preview_mint(env: Env, shares: i128) -> i128
+fn preview_withdraw(env: Env, assets: i128) -> i128
+fn preview_redeem(env: Env, shares: i128) -> i128
 fn total_assets(env: Env) -> i128
 fn total_supply(env: Env) -> i128
 fn convert_to_shares(env: Env, assets: i128) -> i128
 fn convert_to_assets(env: Env, shares: i128) -> i128
-fn asset(env: Env) -> Address   // the numéraire
+fn query_asset(env: Env) -> Address   // the numéraire
 
 // SEP-41 share token
 fn balance(env: Env, id: Address) -> i128
@@ -372,8 +378,8 @@ Data: { relevant fields, timestamp }
 
 | Event | Trigger |
 |---|---|
-| `deposit` | SEP-56 event (name defined by the standard): topics `[deposit, operator, from, receiver]`, data `(assets, shares)`; emitted by `deposit` and `mint` |
-| `withdraw` | SEP-56 event: topics `[withdraw, operator, receiver, owner]`, data `(assets, shares)`; emitted by `withdraw` and `redeem` |
+| `deposit` | SEP-56 event (name defined by the standard): topics `[deposit, operator, from, receiver]`, data map `{assets, shares}`; emitted by `deposit` and `mint` |
+| `withdraw` | SEP-56 event: topics `[withdraw, operator, receiver, owner]`, data map `{assets, shares}`; emitted by `withdraw` and `redeem` |
 | `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard): `transfer` `[transfer, from, to]` data `amount`, or map `{amount, to_muxed_id}` when `to` is muxed; `approve` `[approve, from, spender]` data `[amount, live_until_ledger]`; `mint` `[mint, to]` data `amount` (deposits, mints **and accrued fee shares** to the treasury); `burn` `[burn, from]` data `amount` (redeem, withdraw, `burn`, `burn_from`) |
 | `REBALANCE_STEP` | Each trade in a rebalance |
 | `REBALANCE_COMPLETE` | Full rebalance completed |
