@@ -163,6 +163,7 @@ The 15 Nov 2026 audit (`docs/audit/AUDIT-2026-11-15.md`) found bugs that a green
 - **Every fix ships with:** (1) an isolated unit test, (2) a regression test that fails on the pre-fix code, (3) the full workspace suite green.
 - **Write adversarial cases**: self-transfers, zero/max amounts, future timestamps, unauthorized callers, reverts mid-call.
 - **Cross-contract mirror structs** (e.g. the vault's `PolicyConfigRef`, `RegistryAssetEntryRef`) must change in lockstep with the source struct. Since soroban-sdk 28, decoding a `contracttype` silently ignores unknown fields and only errors on a missing non-`Option` field, so a stale mirror can drop data instead of failing. Every mirror must be exercised by a cross-contract test.
+- **Events are typed `#[contractevent]` structs** (never `Events::publish`, deprecated since soroban-sdk 23). Each crate has a `golden_events_*` test pinning the exact XDR of every event type it emits in `golden/events.txt`; an encoding change must be deliberate, reviewed, and regenerated with `UPDATE_GOLDEN=1`.
 - **Release builds use `stellar contract build`** (stellar-cli v25.2.0+), required by soroban-sdk 28 spec shaking; plain `cargo build --target wasm32v1-none` is refused by the SDK.
 
 
