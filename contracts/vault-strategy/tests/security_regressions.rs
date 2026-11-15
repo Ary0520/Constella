@@ -638,3 +638,43 @@ fn usdc_eurc_policy_with_caps(s: &Stack, max_issuer_bps: u32) -> Address {
     );
     eurc
 }
+
+// ---------------------------------------------------------------------------
+// M1a — a rebalance could BUY an asset that is not in the signed policy, as
+// long as the claimed weights_after omitted it. EXECUTION.md: "no excluded
+// asset is bought". The signed sleeve list is the allow-list.
+// ---------------------------------------------------------------------------
+#[test]
+fn m1_rebalance_cannot_buy_an_asset_outside_the_signed_policy() {
+    let s = deploy_stack();
+    let _eurc = usdc_eurc_policy(&s); // signed sleeves: USDC, EURC
+    // A registered, properly priced asset the owner did NOT sign up for.
+    let registry = AssetRegistryClient::new(&s.env, &s.registry_id);
+    let jqqq = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+    registry.add_asset(&AssetEntry {
+        contract_address: jqqq.clone(),
+        asset_id: Symbol::new(&s.env, "JH_JQQQ"),
+        issuer: Symbol::new(&s.env, "JANUS_HENDERSON"),
+        sleeve_type: RegSleeve::Equity,
+        liquidity_tier: 2,
+        permissionless: true,
+        oracle_sources: Vec::from_array(&s.env, [Symbol::new(&s.env, "JQQQ_A"), Symbol::new(&s.env, "JQQQ_B")]),
+        eligible_jurisdictions: Vec::new(&s.env),
+        blocked_jurisdictions: Vec::new(&s.env),
+        investor_classes_required: Vec::new(&s.env),
+        is_active: true,
+        added_at: T0,
+    });
+    let key = Symbol::new(&s.env, "JQQQ");
+    s.oracle.configure_sleeve(&key, &200, &2);
+    for id in ["JQQQ_A", "JQQQ_B"] {
+        let mut src = oracle_source(&s.env, id, &jqqq, 50 * ONE);
+        src.sleeve = key.clone();
+        s.oracle.register_source(&src);
+    }
+
+    // Fairly priced trade into JQQQ (1000 USDC -> 19.95 JQQQ at $50, 0.25% slippage).
+    let r = s.policy.validate_rebalance(&s.vault_id, &one_trade(&s, &s.usdc_addr, &jqqq, 1000 * ONE, 1995 * ONE / 100));
+    assert!(!r.is_valid, "buying an asset outside the signed policy must be rejected");
+    assert_eq!(r.message, Symbol::new(&s.env, "ASSET_NOT_IN_POLICY"));
+}
