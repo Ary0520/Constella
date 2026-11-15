@@ -82,6 +82,21 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 
 ---
 
+## Production Price Flow (target design — not yet built, audit O7)
+
+```
+ Reflector (Stellar oracle network) ──┐
+ RedStone  (Stellar oracle network) ──┼──► NAV Oracle contract ──► Strategy Vault ──► share prices
+ Blend contract (supply exchange rate)┤    (2+ sources, staleness,                  │
+ Issuer NAV APIs ──► feeder service ──┘     deviation, min/median)                  ▼
+   (Franklin, Spiko, Ondo)  per-source key,                              Blend / Liqvid read the
+                            issuer signature verified where available    conservative price (SEP-40)
+```
+
+- **On-chain providers** (Reflector, RedStone, Blend) are read directly by the oracle contract; no one pushes these prices.
+- **Issuer NAVs** originate off-chain and are carried in by a Constella feeder service signing with a dedicated key per source — never the admin key. Where an issuer signs its NAV, the contract verifies that signature.
+- **Current state (15 Nov 2026):** the safety rules are implemented and tested, but every source is written via admin-only `update_price`. Tracked as audit O7.
+
 ## SEP-40 Compatible Interface
 
 The vault publishes its NAV through a SEP-40 compatible interface so lenders can integrate using the standard Stellar oracle pattern:
