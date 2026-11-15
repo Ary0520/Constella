@@ -1629,3 +1629,105 @@ mod w3 {
     }
 }
 
+// -------------------------------------------------------------------------
+// Audit W7 (2026-11-15): Collateral Passport derived from the basket.
+// Haircuts per COLLATERAL-PASSPORT Pillar 3; liquidators per Pillar 4.
+// -------------------------------------------------------------------------
+mod w7 {
+    use super::*;
+
+    fn asset(ctx: &TestContext, id: &str, st: RegSleeveType, permissionless: bool) -> Address {
+        let addr = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
+        ctx.registry_client.add_asset(&AssetEntry {
+            contract_address: addr.clone(),
+            asset_id: Symbol::new(&ctx.env, id),
+            issuer: Symbol::new(&ctx.env, "TEST_ISSUER"),
+            sleeve_type: st,
+            liquidity_tier: 1,
+            permissionless,
+            oracle_sources: SdkVec::from_array(&ctx.env, [Symbol::new(&ctx.env, "S1")]),
+            eligible_jurisdictions: SdkVec::new(&ctx.env),
+            blocked_jurisdictions: SdkVec::new(&ctx.env),
+            investor_classes_required: SdkVec::new(&ctx.env),
+            is_active: true,
+            added_at: 1_000_000,
+        });
+        addr
+    }
+
+    /// Empty vault with targets: cash `cash_bps`, other sleeve the remainder.
+    fn targets(ctx: &TestContext, cash_bps: u32, other: &Address, id: &str, st: SleeveType) {
+        let mut v = SdkVec::new(&ctx.env);
+        v.push_back(sleeve(ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, cash_bps, 0));
+        v.push_back(sleeve(ctx, id, other, st, 10000 - cash_bps, 0));
+        ctx.vault_client.set_sleeves(&v);
+    }
+
+    fn haircut(ctx: &TestContext) -> u32 {
+        let r = ctx.vault_client.get_risk_sheet();
+        assert_eq!(r.recommended_ltv_bps + r.recommended_haircut_bps, 10000);
+        r.recommended_haircut_bps
+    }
+
+    #[test]
+    fn pillar3_haircut_classes_from_target_weights() {
+        let ctx = setup_test_context();
+        let gov = asset(&ctx, "SPIKO_USD", RegSleeveType::UsdGovFund, true);
+        targets(&ctx, 4000, &gov, "SPIKO_USD", SleeveType::UsdGovFunds);
+        assert_eq!(haircut(&ctx), 1300); // 40% x 10% + 60% x 15%
+
+        let ctx = setup_test_context();
+        let blend = asset(&ctx, "BLEND_USDC_SUPPLY", RegSleeveType::Lending, true);
+        targets(&ctx, 5000, &blend, "BLEND_USDC_SUPPLY", SleeveType::Lending);
+        assert_eq!(haircut(&ctx), 2000); // 50% x 10% + 50% x 30%
+
+        let ctx = setup_test_context();
+        let ylds = asset(&ctx, "FIGURE_YLDS", RegSleeveType::YieldUsd, true);
+        targets(&ctx, 5000, &ylds, "FIGURE_YLDS", SleeveType::YieldDollar);
+        assert_eq!(haircut(&ctx), 1750); // 50% x 10% + 50% x 25%
+    }
+
+    #[test]
+    fn unspecified_classes_carry_no_borrowing_power() {
+        let ctx = setup_test_context();
+        let jqqq = asset(&ctx, "JH_JQQQ", RegSleeveType::Equity, true);
+        targets(&ctx, 5000, &jqqq, "JH_JQQQ", SleeveType::Equity);
+        assert_eq!(haircut(&ctx), 5500); // 50% x 10% + 50% x 100%
+    }
+
+    #[test]
+    fn haircut_rounds_up() {
+        let ctx = setup_test_context();
+        let gov = asset(&ctx, "SPIKO_USD", RegSleeveType::UsdGovFund, true);
+        targets(&ctx, 3333, &gov, "SPIKO_USD", SleeveType::UsdGovFunds);
+        assert_eq!(haircut(&ctx), 1334); // 1333.35 -> 1334
+    }
+
+    #[test]
+    fn held_value_overrides_targets_once_funded() {
+        let ctx = setup_test_context();
+        let gov = asset(&ctx, "SPIKO_USD", RegSleeveType::UsdGovFund, true);
+        targets(&ctx, 1000, &gov, "SPIKO_USD", SleeveType::UsdGovFunds);
+        assert_eq!(haircut(&ctx), 1450); // target-weighted while empty
+        ctx.numeraire_admin.mint(&ctx.alice, &(100 * 10_000_000));
+        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice);
+        assert_eq!(haircut(&ctx), 1000, "the vault actually holds only cash");
+        assert_eq!(ctx.vault_client.get_listing_kit().liquidation_threshold_bps, 9000);
+    }
+
+    #[test]
+    fn liquidators_open_only_for_all_permissionless_baskets() {
+        let ctx = setup_test_context();
+        let anyone = Address::generate(&ctx.env);
+        assert!(ctx.vault_client.is_eligible_liquidator(&anyone), "USDC-only basket is open");
+
+        let blend = asset(&ctx, "BLEND_USDC_SUPPLY", RegSleeveType::Lending, true);
+        targets(&ctx, 5000, &blend, "BLEND_USDC_SUPPLY", SleeveType::Lending);
+        assert!(ctx.vault_client.is_eligible_liquidator(&anyone), "all permissionless: open");
+
+        let benji = asset(&ctx, "FRANKLIN_BENJI", RegSleeveType::UsdGovFund, false);
+        targets(&ctx, 5000, &benji, "FRANKLIN_BENJI", SleeveType::UsdGovFunds);
+        assert!(!ctx.vault_client.is_eligible_liquidator(&anyone), "permissioned constituent: gated");
+        assert!(!ctx.vault_client.is_eligible_liquidator(&ctx.admin), "not even the admin until SEP-57 exists");
+    }
+}
