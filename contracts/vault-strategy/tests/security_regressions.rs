@@ -9,7 +9,9 @@
 extern crate std;
 
 use constella_nav_oracle::{NavOracle, NavOracleClient, OracleSource};
-use constella_policy::{PolicyContract, PolicyContractClient, SleeveTarget};
+use constella_policy::{
+    PolicyContract, PolicyContractClient, RebalanceProposal, SleeveTarget, TradeOperation, TradeRoute,
+};
 use constella_registry::{AssetEntry, AssetRegistry, AssetRegistryClient, SleeveType as RegSleeve};
 use constella_vault_strategy::{SleeveState, SleeveType, StrategyVault, StrategyVaultClient, VaultConfig};
 use soroban_sdk::{
@@ -485,4 +487,85 @@ fn o3_single_source_configuration_is_refused() {
     s.oracle.register_source(&src);
     assert!(s.oracle.price(&asset).is_none(), "a single source must not produce a price");
     assert!(s.oracle.get_collateral_nav(&xlm_sleeve).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// P1 — slippage was checked as min_amount_out >= amount_in * (1 - cap) in RAW
+// token units, ignoring the exchange rate. With EUR/USD = 1.08 a fair
+// USDC->EURC trade was rejected and a 7.4%-loss EURC->USDC trade accepted.
+// EXECUTION.md: "estimated slippage <= cap per route" (value-based).
+// ---------------------------------------------------------------------------
+fn usdc_eurc_policy(s: &Stack) -> Address {
+    let registry = AssetRegistryClient::new(&s.env, &s.registry_id);
+    let eurc = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+    registry.add_asset(&AssetEntry {
+        contract_address: eurc.clone(),
+        asset_id: Symbol::new(&s.env, "EURC"),
+        sleeve_type: RegSleeve::Cash,
+        liquidity_tier: 0,
+        permissionless: true,
+        oracle_sources: Vec::from_array(&s.env, [Symbol::new(&s.env, "EURC_A"), Symbol::new(&s.env, "EURC_B")]),
+        eligible_jurisdictions: Vec::new(&s.env),
+        blocked_jurisdictions: Vec::new(&s.env),
+        investor_classes_required: Vec::new(&s.env),
+        is_active: true,
+        added_at: T0,
+    });
+    // EUR priced in USDC: two independent feeds at 1.08 under its own key.
+    let eurc_key = Symbol::new(&s.env, "EURC");
+    s.oracle.configure_sleeve(&eurc_key, &200, &2);
+    for id in ["EURC_A", "EURC_B"] {
+        let mut src = oracle_source(&s.env, id, &eurc, ONE * 108 / 100);
+        src.sleeve = eurc_key.clone();
+        s.oracle.register_source(&src);
+    }
+    let mut targets = Vec::new(&s.env);
+    for id in ["USDC", "EURC"] {
+        targets.push_back(SleeveTarget {
+            asset_id: Symbol::new(&s.env, id),
+            target_weight_bps: 5000,
+            min_band_bps: 0,
+            max_band_bps: 10_000,
+            sleeve_type: Symbol::new(&s.env, "cash"),
+        });
+    }
+    let owner = Address::generate(&s.env);
+    s.policy.register_policy(
+        &s.vault_id, &owner, &soroban_sdk::BytesN::from_array(&s.env, &[0x77; 32]), &s.registry_id,
+        &1000, &10_000, &10_000, &50, &500, &targets,
+    );
+    eurc
+}
+
+fn one_trade(s: &Stack, a_in: &Address, a_out: &Address, amount_in: i128, min_out: i128) -> RebalanceProposal {
+    let mut w = Vec::new(&s.env);
+    w.push_back((Symbol::new(&s.env, "USDC"), 5000u32));
+    w.push_back((Symbol::new(&s.env, "EURC"), 5000u32));
+    RebalanceProposal {
+        vault: s.vault_id.clone(),
+        operations: Vec::from_array(&s.env, [TradeOperation {
+            asset_in: a_in.clone(),
+            asset_out: a_out.clone(),
+            amount_in,
+            min_amount_out: min_out,
+            route: TradeRoute::Soroswap,
+        }]),
+        weights_after: w,
+        deadline: T0 + 600,
+        proposer: s.admin.clone(),
+    }
+}
+
+#[test]
+fn p1_slippage_is_measured_in_value_not_token_units() {
+    let s = deploy_stack();
+    let eurc = usdc_eurc_policy(&s);
+
+    // 1000 USDC is worth 925.93 EURC at 1.08; min_out 925 = ~0.1% slippage (cap 0.5%).
+    let fair = s.policy.validate_rebalance(&s.vault_id, &one_trade(&s, &s.usdc_addr, &eurc, 1000 * ONE, 925 * ONE));
+    assert!(fair.is_valid, "fair USDC->EURC trade must be accepted (code {})", fair.code);
+
+    // 1000 EURC is worth 1080 USDC; accepting 1000 USDC = 7.4% loss.
+    let bad = s.policy.validate_rebalance(&s.vault_id, &one_trade(&s, &eurc, &s.usdc_addr, 1000 * ONE, 1000 * ONE));
+    assert!(!bad.is_valid, "7.4%-loss EURC->USDC trade must be rejected");
 }
