@@ -103,12 +103,14 @@ fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfig> // includ
 5. Liquidity sleeve minimum maintained
 6. All assets in proposal are in the registry and active
 7. Proposal deadline not exceeded (prevents replays)
+9. Every asset **bought** is declared in the signed sleeves with a non-zero upper band — the signed list is the allow-list that enforces exclusions (audit M1). Selling undeclared assets is allowed.
 8. Slippage per operation within limit — measured in **value**, not token units (audit P1): each leg is `amount × asset_price / 10^token_decimals` using the NAV oracle's per-asset median (numéraire = 1.0); require `min_value_out ≥ value_in × (1 − max_slippage_bps/10000)`. No valid price → proposal invalid (`PriceUnavailable`). The policy contract's oracle is set once in `initialize(admin, oracle)` and has no setter.
 
 **RebalanceProposal struct:**
 ```rust
 pub struct RebalanceProposal {
     vault: Address,
+    policy_hash: BytesN<32>,  // must equal the vault's current hash (check 1)
     operations: Vec<TradeOperation>,
     weights_after: Vec<(String, u32)>, // (asset_id, weight_bps)
     deadline: u64,
