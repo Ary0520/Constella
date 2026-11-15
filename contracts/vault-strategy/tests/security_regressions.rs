@@ -1335,9 +1335,11 @@ fn sep56_previews_equal_execution_even_with_pending_fees() {
 // 15 Nov 2026 (router CAG5LRYQ..., factory CA4HEQTL..., pair CC7CDFY2...;
 // pair sha256 18051456... equals Soroswap's published pair_wasm_hash).
 // ---------------------------------------------------------------------------
+#[allow(clippy::too_many_arguments)] // generated client for Soroswap's own interface
 mod soroswap_router {
     soroban_sdk::contractimport!(file = "testdata/soroswap_router_mainnet.wasm");
 }
+#[allow(clippy::too_many_arguments)] // generated client for Soroswap's own interface
 mod soroswap_factory {
     soroban_sdk::contractimport!(file = "testdata/soroswap_factory_mainnet.wasm");
 }
@@ -1444,7 +1446,15 @@ mod w1 {
         let out = quote(&r, 1_000 * ONE);
         let p = proposal(&r, 1_000 * ONE, out);
         as_keeper(&r, &p);
+        // The SDK's auth-snapshot code for env.auths() (test observation, run in
+        // the host's shadow budget) exhausts the default test budget on this deep
+        // cross-contract tree. Lift the harness cap, then enforce the REAL limit
+        // explicitly: the rebalance must fit a mainnet transaction.
+        r.s.env.cost_estimate().budget().reset_unlimited();
         r.s.vault.rebalance(&p);
+        let used = r.s.env.cost_estimate().resources();
+        assert!(used.instructions < 100_000_000, "rebalance needs {} instructions (mainnet tx limit 100M)", used.instructions);
+        assert!(used.mem_bytes < 40 * 1024 * 1024, "rebalance needs {} bytes (mainnet tx limit 40 MB)", used.mem_bytes);
         assert!(r.s.env.auths().iter().all(|(a, _)| *a == r.keeper), "only the keeper signs");
         // Booked from measured token deltas, equal to the real balances.
         assert_eq!(holdings(&r), (9_000 * ONE, out));

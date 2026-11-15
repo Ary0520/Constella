@@ -2,8 +2,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
+    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    token, Address, BytesN, Env, FromVal, MuxedAddress, String, Symbol, SymbolStr, Vec,
+    symbol_short, token, vec, Address, BytesN, Env, FromVal, IntoVal, MuxedAddress, String, Symbol, SymbolStr, Vec,
 };
 // Audit W2/W4.2: the share ledger (balances, allowances, total supply) uses the
 // OpenZeppelin stellar-tokens storage primitives: per-holder persistent
@@ -76,6 +77,34 @@ pub struct Burn {
     #[topic]
     pub from: Address,
     pub amount: i128,
+}
+
+/// Topics: [REBALANCE_STEP, proposer]. Data: [asset_in, asset_out, spent, received] (audit W1).
+#[contractevent(topics = ["REBALANCE_STEP"], data_format = "vec")]
+pub struct RebalanceStep {
+    #[topic]
+    pub proposer: Address,
+    pub asset_in: Address,
+    pub asset_out: Address,
+    pub spent: i128,
+    pub received: i128,
+}
+
+/// Topics: [REBALANCE_COMPLETE, proposer]. Data: number of executed steps.
+#[contractevent(topics = ["REBALANCE_COMPLETE"], data_format = "single-value")]
+pub struct RebalanceComplete {
+    #[topic]
+    pub proposer: Address,
+    pub steps: u32,
+}
+
+/// Topics: [ROUTER_PROPOSED, route]. Data: [router, effective_at].
+#[contractevent(topics = ["ROUTER_PROPOSED"], data_format = "vec")]
+pub struct RouterProposed {
+    #[topic]
+    pub route: u32,
+    pub router: Address,
+    pub effective_at: u64,
 }
 
 /// SEP-56 v0.1.2 `Deposit`: topics [deposit, operator, from, receiver]; data
@@ -223,6 +252,15 @@ pub enum VaultError {
     UpgradeNotReady = 21,
     /// No upgrade has been proposed.
     NoPendingUpgrade = 22,
+    /// The policy contract rejected the rebalance proposal (audit W1).
+    RebalanceRejected = 23,
+    /// No executor is configured for the proposal's trade route.
+    RouteUnavailable = 24,
+    /// A swap returned less than the proposal's min_amount_out, or spent more
+    /// than amount_in, as measured on the vault's own balances.
+    SlippageExceeded = 25,
+    /// The pending router change's 48h delay has not elapsed / none pending.
+    RouterNotReady = 26,
 }
 
 /// Timelock between proposing and executing a WASM upgrade (CONTRACTS-SPEC:
@@ -344,6 +382,69 @@ pub enum DataKey {
     IsPaused,
     LastFeeAccrual,
     PendingUpgrade,
+    /// Address allowed to submit rebalance proposals (audit W1).
+    Keeper,
+    /// Executor contract per trade route (u32 = TradeRoute discriminant).
+    Router(u32),
+    PendingRouter(u32),
+}
+
+// Rebalance proposal types - mirrors of constella-policy (keep in lockstep;
+// contracttype decoding is lenient, so a drift would not fail loudly).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TradeRoute {
+    Issuer = 0,
+    Soroswap = 1,
+    Aquarius = 2,
+    Sdex = 3,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeOperation {
+    pub asset_in: Address,
+    pub asset_out: Address,
+    pub amount_in: i128,
+    pub min_amount_out: i128,
+    pub route: TradeRoute,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebalanceProposal {
+    pub vault: Address,
+    pub policy_hash: BytesN<32>,
+    pub operations: Vec<TradeOperation>,
+    pub weights_after: Vec<(Symbol, u32)>,
+    pub deadline: u64,
+    pub proposer: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationResult {
+    pub is_valid: bool,
+    pub code: u32,
+    pub message: Symbol,
+}
+
+/// A router change waiting out the 48h delay.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRouter {
+    pub router: Address,
+    pub effective_at: u64,
+}
+
+/// Soroswap router (github.com/soroswap/core): the subset the vault calls.
+/// `swap_exact_tokens_for_tokens` requires `to.require_auth()` and moves
+/// `amount_in` FROM `to` into the pair with a token transfer it initiates.
+#[contractclient(name = "SoroswapRouterClient")]
+pub trait SoroswapRouterInterface {
+    fn swap_exact_tokens_for_tokens(env: Env, amount_in: i128, amount_out_min: i128, path: Vec<Address>, to: Address, deadline: u64) -> Vec<i128>;
+    fn router_pair_for(env: Env, token_a: Address, token_b: Address) -> Address;
 }
 
 // Cross-Contract Client Traits for Decoupled WASM Compilation
@@ -351,6 +452,10 @@ pub enum DataKey {
 pub trait NavOracleInterface {
     fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
     fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
+    /// Median of the asset's valid sources (audit O6/W1: per-asset pricing).
+    fn asset_price(env: Env, asset: Address) -> Option<PriceData>;
+    /// Minimum of the asset's valid sources (Rule 3 collateral price).
+    fn collateral_price(env: Env, asset: Address) -> Option<PriceData>;
     fn get_source(env: Env, source_id: Symbol) -> Option<OracleSource>;
     fn get_sleeve_sources(env: Env, sleeve_id: Symbol) -> Vec<Symbol>;
 }
@@ -409,6 +514,7 @@ pub struct PolicySleeveTargetRef {
 #[contractclient(name = "PolicyClient")]
 pub trait PolicyInterface {
     fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfigRef>;
+    fn validate_rebalance(env: Env, vault: Address, proposal: RebalanceProposal) -> ValidationResult;
     fn register_policy(
         env: Env,
         vault: Address,
@@ -583,10 +689,12 @@ fn sleeve_value(
     if held == 0 {
         return Ok((0, 0));
     }
-    let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
+    // Audit O6/W1: price the sleeve's own asset. Sleeve-type keys could make
+    // two assets of one type share a price; a multi-asset oracle sleeve has no
+    // sleeve-level price at all.
     let pd = match kind {
-        NavKind::Deposit => oracle.get_deposit_nav(&sym),
-        NavKind::Collateral => oracle.get_collateral_nav(&sym),
+        NavKind::Deposit => oracle.asset_price(&sleeve.contract_address),
+        NavKind::Collateral => oracle.collateral_price(&sleeve.contract_address),
     }
     .ok_or(VaultError::OracleUnavailable)?;
     if pd.price <= 0 {
@@ -918,6 +1026,48 @@ fn enforce_caps(env: &Env, config: &VaultConfig, receiver: &Address, assets: i12
     if assets > user_room {
         panic_with_error!(env, VaultError::UserCapExceeded);
     }
+}
+
+/// Delay before a router (which can move vault funds) takes effect: 48 h,
+/// the same window as upgrades, policy amendments and oracle source changes.
+pub const ROUTER_CHANGE_DELAY_SECONDS: u64 = 48 * 3600;
+
+fn sleeve_index(sleeves: &Vec<SleeveState>, asset: &Address) -> u32 {
+    for i in 0..sleeves.len() {
+        if sleeves.get_unchecked(i).contract_address == *asset {
+            return i;
+        }
+    }
+    panic!()
+}
+
+/// Execute one Soroswap swap of exactly `amount_in`, measuring the result on
+/// the vault's own balances. Returns (spent, received).
+fn swap_on_soroswap(env: &Env, router: &Address, op: &TradeOperation, deadline: u64) -> (i128, i128) {
+    let me = env.current_contract_address();
+    let token_in = token::Client::new(env, &op.asset_in);
+    let token_out = token::Client::new(env, &op.asset_out);
+    let (in_before, out_before) = (token_in.balance(&me), token_out.balance(&me));
+    let client = SoroswapRouterClient::new(env, router);
+    let pair = client.router_pair_for(&op.asset_in, &op.asset_out);
+    // The router moves `amount_in` from the vault into the pair; authorize
+    // exactly that one transfer (contract-to-contract auth), nothing else.
+    env.authorize_as_current_contract(vec![
+        env,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: op.asset_in.clone(),
+                fn_name: symbol_short!("transfer"),
+                args: (me.clone(), pair, op.amount_in).into_val(env),
+            },
+            sub_invocations: vec![env],
+        }),
+    ]);
+    let path = vec![env, op.asset_in.clone(), op.asset_out.clone()];
+    client.swap_exact_tokens_for_tokens(&op.amount_in, &op.min_amount_out, &path, &me, &deadline);
+    let spent = in_before - token_in.balance(&me);
+    let received = token_out.balance(&me) - out_before;
+    (spent, received)
 }
 
 #[contract]
@@ -1799,6 +1949,97 @@ impl StrategyVault {
     /// policy hash and every enforced term. The vault's own consent is given by
     /// it being the invoker. Registration is one-time in the policy contract;
     /// later amendments are signed by the owner directly on the policy contract.
+    /// Designate the hot keeper key allowed to SUBMIT rebalances (admin).
+    /// The keeper cannot move value beyond what the signed policy validates.
+    pub fn set_keeper(env: Env, keeper: Address) {
+        get_config(&env).admin.require_auth();
+        env.storage().instance().set(&DataKey::Keeper, &keeper);
+    }
+
+    pub fn get_keeper(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Keeper)
+    }
+
+    /// Propose the executor contract for a trade route (admin). A router can
+    /// move vault funds, so it takes effect only after 48 h (anyone activates).
+    pub fn propose_router(env: Env, route: TradeRoute, router: Address) {
+        get_config(&env).admin.require_auth();
+        let effective_at = env.ledger().timestamp().saturating_add(ROUTER_CHANGE_DELAY_SECONDS);
+        env.storage().instance().set(&DataKey::PendingRouter(route as u32), &PendingRouter { router: router.clone(), effective_at });
+        RouterProposed { route: route as u32, router, effective_at }.publish(&env);
+    }
+
+    pub fn activate_router(env: Env, route: TradeRoute) {
+        let pending: PendingRouter = env.storage().instance().get(&DataKey::PendingRouter(route as u32))
+            .unwrap_or_else(|| panic_with_error!(&env, VaultError::RouterNotReady));
+        if env.ledger().timestamp() < pending.effective_at {
+            panic_with_error!(&env, VaultError::RouterNotReady);
+        }
+        env.storage().instance().remove(&DataKey::PendingRouter(route as u32));
+        env.storage().instance().set(&DataKey::Router(route as u32), &pending.router);
+    }
+
+    pub fn get_router(env: Env, route: TradeRoute) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Router(route as u32))
+    }
+
+    /// Execute a rebalance proposal (audit W1). The keeper submits; the signed
+    /// policy must validate the proposal; every swap is measured on the
+    /// vault's own balances and must deliver at least `min_amount_out`;
+    /// sleeve holdings are booked from those measured deltas only.
+    /// Post-trade band verification on actual holdings follows in W1b.
+    pub fn rebalance(env: Env, proposal: RebalanceProposal) {
+        let keeper: Address = env.storage().instance().get(&DataKey::Keeper)
+            .unwrap_or_else(|| panic_with_error!(&env, VaultError::Unauthorized));
+        if proposal.proposer != keeper {
+            panic_with_error!(&env, VaultError::Unauthorized);
+        }
+        keeper.require_auth();
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        let config = get_config(&env);
+        if proposal.vault != env.current_contract_address() {
+            panic_with_error!(&env, VaultError::Unauthorized);
+        }
+        let verdict = PolicyClient::new(&env, &config.policy_contract)
+            .validate_rebalance(&env.current_contract_address(), &proposal);
+        if !verdict.is_valid {
+            panic_with_error!(&env, VaultError::RebalanceRejected);
+        }
+
+        let mut sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(&env));
+        for op in proposal.operations.iter() {
+            let router: Address = match op.route {
+                TradeRoute::Soroswap => env.storage().instance().get(&DataKey::Router(TradeRoute::Soroswap as u32))
+                    .unwrap_or_else(|| panic_with_error!(&env, VaultError::RouteUnavailable)),
+                _ => panic_with_error!(&env, VaultError::RouteUnavailable),
+            };
+            let has = |a: &Address| sleeves.iter().any(|s| s.contract_address == *a);
+            if !has(&op.asset_in) || !has(&op.asset_out) {
+                panic_with_error!(&env, VaultError::SleeveNotFound);
+            }
+            let i_in = sleeve_index(&sleeves, &op.asset_in);
+            let i_out = sleeve_index(&sleeves, &op.asset_out);
+            let mut s_in = sleeves.get_unchecked(i_in);
+            if op.amount_in > sleeve_holdings(&env, &s_in) {
+                panic_with_error!(&env, VaultError::InsufficientBalance);
+            }
+            let (spent, received) = swap_on_soroswap(&env, &router, &op, proposal.deadline);
+            if spent > op.amount_in || received < op.min_amount_out {
+                panic_with_error!(&env, VaultError::SlippageExceeded);
+            }
+            s_in.current_balance -= spent;
+            sleeves.set(i_in, s_in);
+            let mut s_out = sleeves.get_unchecked(i_out);
+            s_out.current_balance += received;
+            sleeves.set(i_out, s_out);
+            RebalanceStep { proposer: keeper.clone(), asset_in: op.asset_in.clone(), asset_out: op.asset_out.clone(), spent, received }.publish(&env);
+        }
+        env.storage().instance().set(&DataKey::Sleeves, &sleeves);
+        RebalanceComplete { proposer: keeper, steps: proposal.operations.len() }.publish(&env);
+    }
+
     pub fn bind_policy(
         env: Env,
         owner: Address,
