@@ -3,7 +3,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    token, Address, BytesN, Env, String, Symbol, Vec,
+    token, Address, BytesN, Env, FromVal, String, Symbol, SymbolStr, Vec,
 };
 
 #[contracterror]
@@ -381,6 +381,26 @@ fn sleeve_haircut_bps(sleeve_type: SleeveType) -> i128 {
     }
 }
 
+/// The registry's asset ID for `asset` as a display label (audit M4). The
+/// asset must be an active registry entry (closed universe), else
+/// `AssetNotRegistered`.
+fn registry_label(env: &Env, registry: &AssetRegistryClient, asset: &Address) -> (String, u32) {
+    let entry = match registry.get_asset_by_address(asset) {
+        Some(e) if e.is_active => e,
+        _ => panic_with_error!(env, VaultError::AssetNotRegistered),
+    };
+    let sym: SymbolStr = SymbolStr::from_val(env, &entry.asset_id.to_symbol_val());
+    let bytes: &[u8] = sym.as_ref();
+    let label = match core::str::from_utf8(bytes) {
+        Ok(text) => String::from_str(env, text),
+        Err(_) => panic_with_error!(env, VaultError::InvalidSleeveConfig),
+    };
+    (label, entry.sleeve_type)
+}
+
+/// Registry sleeve-type code for cash (constella_registry::SleeveType::Cash).
+const REGISTRY_SLEEVE_CASH: u32 = 0;
+
 fn share_scale(env: &Env) -> i128 {
     let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
     10i128.pow(decimals)
@@ -731,6 +751,15 @@ impl StrategyVault {
         let admin = config.admin.clone();
         let numeraire = config.numeraire.clone();
 
+        // Audit M4: the numéraire must be an active, registered CASH asset
+        // (closed universe; VAULT-DESIGN: USDC or EURC), and the cash sleeve is
+        // labelled with its registry ID instead of a hard-coded "USDC".
+        let registry = AssetRegistryClient::new(&env, &config.registry_contract);
+        let (cash_label, cash_type) = registry_label(&env, &registry, &numeraire);
+        if cash_type != REGISTRY_SLEEVE_CASH {
+            panic_with_error!(&env, VaultError::InvalidSleeveConfig);
+        }
+
         env.storage().instance().set(&DataKey::Config, &config);
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
@@ -743,7 +772,7 @@ impl StrategyVault {
 
         let mut sleeves = Vec::new(&env);
         sleeves.push_back(SleeveState {
-            asset_id: String::from_str(&env, "USDC"),
+            asset_id: cash_label,
             contract_address: numeraire,
             target_weight_bps: 10000,
             band_bps: 0,
@@ -1543,8 +1572,12 @@ impl StrategyVault {
                 if s.contract_address != config.numeraire {
                     panic_with_error!(&env, VaultError::InvalidSleeveConfig);
                 }
-            } else if !registry.is_registered(&s.contract_address) {
-                panic_with_error!(&env, VaultError::AssetNotRegistered);
+            }
+            // Audit M4: every sleeve (cash included) must be an active registry
+            // entry and carry exactly its registry ID as label.
+            let (label, _) = registry_label(&env, &registry, &s.contract_address);
+            if s.asset_id != label {
+                panic_with_error!(&env, VaultError::InvalidSleeveConfig);
             }
 
             let mut recorded = 0i128;

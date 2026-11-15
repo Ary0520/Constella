@@ -852,6 +852,23 @@ fn m3_fresh_deployments_cannot_be_taken_over() {
     let owner = Address::generate(&env);
     let registry = env.register(AssetRegistry, (owner.clone(),));
     assert!(!stranger_initializes(&env, &registry, (attacker.clone(),).into_val(&env)), "registry hijack");
+    // The numéraire is in the closed universe before any vault uses it (audit M4).
+    env.mock_all_auths();
+    AssetRegistryClient::new(&env, &registry).add_asset(&AssetEntry {
+        contract_address: usdc.clone(),
+        asset_id: Symbol::new(&env, "USDC"),
+        issuer: Symbol::new(&env, "CIRCLE"),
+        sleeve_type: RegSleeve::Cash,
+        liquidity_tier: 0,
+        permissionless: true,
+        oracle_sources: Vec::from_array(&env, [Symbol::new(&env, "USDC_A"), Symbol::new(&env, "USDC_B")]),
+        eligible_jurisdictions: Vec::new(&env),
+        blocked_jurisdictions: Vec::new(&env),
+        investor_classes_required: Vec::new(&env),
+        is_active: true,
+        added_at: T0,
+    });
+    env.set_auths(&[]);
 
     let oracle = env.register(NavOracle, (owner.clone(), usdc.clone(), 7u32, 300u32));
     assert!(!stranger_initializes(&env, &oracle, (attacker.clone(), usdc.clone(), 7u32, 300u32).into_val(&env)), "oracle hijack");
