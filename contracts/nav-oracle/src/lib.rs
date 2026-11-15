@@ -2,8 +2,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address, Env, Symbol,
-    Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
+    Env, Symbol, Vec,
 };
 
 #[contracterror]
@@ -32,6 +32,12 @@ pub enum OracleError {
     NoPendingSourceChange = 15,
     /// The 48-hour source-change delay has not elapsed.
     SourceChangeNotReady = 16,
+    /// A source id cannot switch between pushed and pull kinds (O7b).
+    SourceKindMismatch = 17,
+    /// Pull configuration rejected by validation against the live feed.
+    InvalidPullConfig = 18,
+    /// Prices of a pull source are read on-chain; nobody can push them.
+    NotAPushSource = 19,
 }
 
 /// SEP-40 asset identifier (identical to script3/sep-40-oracle and Reflector).
@@ -87,6 +93,63 @@ pub struct OracleSource {
 pub struct PendingSource {
     pub source: OracleSource,
     pub effective_at: u64,
+    /// Pushed or pull (Reflector) source (O7b).
+    pub kind: PendingKind,
+}
+
+/// Kind of a pending source change (audit O7b).
+// contracttype enums cannot box a variant; the value is a storage record,
+// not a hot stack value, so the size difference is harmless.
+#[allow(clippy::large_enum_variant)]
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PendingKind {
+    Pushed,
+    Pull(PullFeed),
+}
+
+/// How a Reflector feed's prices relate to this oracle's base (audit O7b).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PriceQuote {
+    /// The feed's base IS this oracle's base asset (e.g. Reflector pubnet, base USDC).
+    InBase,
+    /// USD-based feed: cross-rate through the feed's own key for USDC.
+    ViaUsdc(Asset),
+}
+
+/// Admin-supplied configuration of a Reflector pull source (audit O7b).
+/// `asset` is the feed's key for the priced asset. For a USD-based feed
+/// (e.g. Reflector's CEX/DEX feed) `quote` must be `ViaUsdc(feed's USDC key)`
+/// and prices are cross-rated through it: USD is never assumed to equal USDC.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReflectorConfig {
+    pub contract: Address,
+    pub asset: Asset,
+    pub quote: PriceQuote,
+    pub rounds: u32,
+}
+
+/// Stored pull configuration; `decimals` is read from the feed at
+/// registration (SEP-40: a live feed's decimals never change).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PullFeed {
+    pub contract: Address,
+    pub asset: Asset,
+    pub quote: PriceQuote,
+    pub rounds: u32,
+    pub decimals: u32,
+}
+
+/// The SEP-40 subset of a Reflector feed that Constella reads.
+#[contractclient(name = "ReflectorClient")]
+pub trait ReflectorFeedInterface {
+    fn base(env: Env) -> Asset;
+    fn assets(env: Env) -> Vec<Asset>;
+    fn decimals(env: Env) -> u32;
+    fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>>;
 }
 
 #[contracttype]
@@ -223,6 +286,8 @@ pub enum DataKey {
     History(Address),
     /// Source change waiting for its delay (audit O7a).
     PendingSource(Symbol),
+    /// Reflector pull configuration of a source (audit O7b).
+    PullFeed(Symbol),
     PauseAuthority,
 }
 
@@ -314,6 +379,14 @@ pub trait NavOracleTrait {
     fn deactivate_source(env: Env, source_id: Symbol);
     /// Pending change for a source id, if any.
     fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource>;
+
+    /// Register a source whose price is read on-chain from a Reflector feed
+    /// (admin; same immediate-or-48h rule as `register_source`).
+    fn register_reflector_source(env: Env, source: OracleSource, config: ReflectorConfig);
+    /// Live converted price of a pull source, or None when it is invalid.
+    fn pull_price(env: Env, source_id: Symbol) -> Option<SourcedPrice>;
+    /// Pull configuration of a source, if it is a pull source.
+    fn get_pull_feed(env: Env, source_id: Symbol) -> Option<PullFeed>;
 }
 
 /// A source is fresh only if its timestamp is not in the future and is within
@@ -381,11 +454,23 @@ fn evaluate_sources(
     let now = env.ledger().timestamp();
 
     for source_id in source_ids.iter() {
-        if let Some(source) = env
+        if let Some(mut source) = env
             .storage()
             .instance()
-            .get::<_, OracleSource>(&DataKey::Source(source_id))
+            .get::<_, OracleSource>(&DataKey::Source(source_id.clone()))
         {
+            // Audit O7b: a pull source's price is read live from its feed;
+            // an unreadable, gappy or stale feed makes the source invalid.
+            if let Some(feed) = env.storage().instance().get::<_, PullFeed>(&DataKey::PullFeed(source_id.clone())) {
+                match pull_live(env, &feed, source.staleness_limit_seconds) {
+                    Some((price, timestamp)) => {
+                        source.price = price;
+                        source.timestamp = timestamp;
+                        source.current_liquidity_depth_usd = 0;
+                    }
+                    None => continue,
+                }
+            }
             // Verify sleeve matches
             if source.sleeve != *sleeve_id {
                 continue;
@@ -604,6 +689,108 @@ fn record_snapshot(env: &Env, asset: &Address) {
     env.storage().persistent().extend_ttl(&key, HISTORY_TTL_THRESHOLD, HISTORY_EXTEND_AMOUNT);
 }
 
+/// Reflector pull sources use the median of at least this many rounds
+/// (YieldBlox lesson: one thin-market round must never set a price).
+pub const MIN_PULL_ROUNDS: u32 = 3;
+
+fn pow10(n: u32) -> Option<i128> {
+    10i128.checked_pow(n)
+}
+
+/// Median price and oldest timestamp of the newest `rounds` records of `asset`
+/// on a Reflector feed; None if the call fails or fewer records exist.
+fn median_rounds(env: &Env, feed: &ReflectorClient, asset: &Asset, rounds: u32) -> Option<(i128, u64)> {
+    let records = feed.try_prices(asset, &rounds).ok()?.ok()??;
+    if records.len() < rounds {
+        return None;
+    }
+    let mut prices: Vec<i128> = Vec::new(env);
+    let mut oldest = u64::MAX;
+    for r in records.iter().take(rounds as usize) {
+        if r.price <= 0 {
+            return None;
+        }
+        // insertion sort (rounds <= MAX_PRICE_RECORDS)
+        let mut i = prices.len();
+        while i > 0 && prices.get_unchecked(i - 1) > r.price {
+            i -= 1;
+        }
+        prices.insert(i, r.price);
+        oldest = oldest.min(r.timestamp);
+    }
+    let n = prices.len();
+    let median = if n % 2 == 1 {
+        prices.get_unchecked(n / 2)
+    } else {
+        let (a, b) = (prices.get_unchecked(n / 2 - 1), prices.get_unchecked(n / 2));
+        a + (b - a) / 2
+    };
+    Some((median, oldest))
+}
+
+/// Live price of a Reflector pull source in this oracle's base and decimals,
+/// stamped with the oldest round used. Conversion (all rounding down):
+/// * feed base == our base: `median * 10^ours / 10^feed`
+/// * USD-based feed: `median(asset) * 10^ours / median(USDC)` (feed decimals cancel)
+fn pull_live(env: &Env, feed: &PullFeed, staleness_limit_seconds: u64) -> Option<(i128, u64)> {
+    let client = ReflectorClient::new(env, &feed.contract);
+    let ours: u32 = env.storage().instance().get(&DataKey::Decimals)?;
+    let (asset_median, asset_oldest) = median_rounds(env, &client, &feed.asset, feed.rounds)?;
+    let (price, oldest) = match &feed.quote {
+        PriceQuote::ViaUsdc(usdc_key) => {
+            let (usdc_median, usdc_oldest) = median_rounds(env, &client, usdc_key, feed.rounds)?;
+            (asset_median.checked_mul(pow10(ours)?)? / usdc_median, asset_oldest.min(usdc_oldest))
+        }
+        PriceQuote::InBase if feed.decimals >= ours => (asset_median / pow10(feed.decimals - ours)?, asset_oldest),
+        PriceQuote::InBase => (asset_median.checked_mul(pow10(ours - feed.decimals)?)?, asset_oldest),
+    };
+    let now = env.ledger().timestamp();
+    if price <= 0 || oldest > now || now - oldest > staleness_limit_seconds {
+        return None;
+    }
+    Some((price, oldest))
+}
+
+/// Shared checks for every source registration (pushed or pull).
+fn validate_source(env: &Env, source: &OracleSource) {
+    if source.staleness_limit_seconds == 0 {
+        panic_with_error!(env, OracleError::PriceStale);
+    }
+    if source.min_liquidity_depth_usd < 0 {
+        panic_with_error!(env, OracleError::InsufficientLiquidityDepth);
+    }
+    if source.timestamp > env.ledger().timestamp() {
+        panic_with_error!(env, OracleError::FutureTimestamp);
+    }
+    // Audit O6: one sleeve per asset; a source id keeps its asset and sleeve.
+    if let Some(existing) = env.storage().instance().get::<_, OracleSource>(&DataKey::Source(source.source_id.clone())) {
+        if existing.asset != source.asset || existing.sleeve != source.sleeve {
+            panic_with_error!(env, OracleError::AssetSleeveMismatch);
+        }
+    }
+    if let Some(sleeve) = env.storage().instance().get::<_, Symbol>(&DataKey::AssetSleeve(source.asset.clone())) {
+        if sleeve != source.sleeve {
+            panic_with_error!(env, OracleError::AssetSleeveMismatch);
+        }
+    }
+}
+
+/// Apply now (bootstrap of an unpriced asset) or queue for 48 h (audit O7a).
+fn register_or_queue(env: &Env, source: OracleSource, kind: PendingKind) {
+    let exists = env.storage().instance().has(&DataKey::Source(source.source_id.clone()));
+    if exists || asset_is_priced(env, &source.asset) {
+        let effective_at = env.ledger().timestamp().saturating_add(SOURCE_CHANGE_DELAY_SECONDS);
+        let id = source.source_id.clone();
+        env.storage().instance().set(&DataKey::PendingSource(id.clone()), &PendingSource { source, effective_at, kind });
+        SourceChangeProposed { source_id: id, effective_at }.publish(env);
+        return;
+    }
+    if let PendingKind::Pull(feed) = kind {
+        env.storage().instance().set(&DataKey::PullFeed(source.source_id.clone()), &feed);
+    }
+    apply_source(env, &source);
+}
+
 /// Delay before a change to an already-priced asset's sources takes effect
 /// (audit O7a): 48 h, the same window as upgrades, policy amendments and
 /// account recovery, so watchers can react before prices can be affected.
@@ -759,45 +946,16 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn register_source(env: Env, source: OracleSource) {
-        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
-            Some(a) => a,
-            None => panic_with_error!(&env, OracleError::NotInitialized),
-        };
-        admin.require_auth();
-
-        if source.staleness_limit_seconds == 0 {
-            panic_with_error!(&env, OracleError::PriceStale);
-        }
-        if source.min_liquidity_depth_usd < 0 {
-            panic_with_error!(&env, OracleError::InsufficientLiquidityDepth);
-        }
-        if source.timestamp > env.ledger().timestamp() {
-            panic_with_error!(&env, OracleError::FutureTimestamp);
-        }
-        // Audit O6: one sleeve per asset; a source id keeps its asset and sleeve.
-        if let Some(existing) = env.storage().instance().get::<_, OracleSource>(&DataKey::Source(source.source_id.clone())) {
-            if existing.asset != source.asset || existing.sleeve != source.sleeve {
-                panic_with_error!(&env, OracleError::AssetSleeveMismatch);
-            }
-        }
-        if let Some(sleeve) = env.storage().instance().get::<_, Symbol>(&DataKey::AssetSleeve(source.asset.clone())) {
-            if sleeve != source.sleeve {
-                panic_with_error!(&env, OracleError::AssetSleeveMismatch);
-            }
+        admin_of(&env).require_auth();
+        validate_source(&env, &source);
+        if env.storage().instance().has(&DataKey::PullFeed(source.source_id.clone())) {
+            panic_with_error!(&env, OracleError::SourceKindMismatch);
         }
         // Audit O7a: changes to an asset that is already priced, and any change
         // to an existing source (feeder rotation, looser limits), wait 48 h.
         // Bootstrapping an unpriced asset takes effect at once: nothing can
         // consume a price that does not exist yet.
-        let exists = env.storage().instance().has(&DataKey::Source(source.source_id.clone()));
-        if exists || asset_is_priced(&env, &source.asset) {
-            let effective_at = env.ledger().timestamp().saturating_add(SOURCE_CHANGE_DELAY_SECONDS);
-            let id = source.source_id.clone();
-            env.storage().instance().set(&DataKey::PendingSource(id.clone()), &PendingSource { source, effective_at });
-            SourceChangeProposed { source_id: id, effective_at }.publish(&env);
-            return;
-        }
-        apply_source(&env, &source);
+        register_or_queue(&env, source, PendingKind::Pushed);
     }
 
     fn update_price(
@@ -816,6 +974,10 @@ impl NavOracleTrait for NavOracle {
             Some(s) => s,
             None => panic_with_error!(&env, OracleError::AssetNotFound),
         };
+        // Audit O7b: pull sources are read on-chain; nobody pushes them.
+        if env.storage().instance().has(&DataKey::PullFeed(source_id.clone())) {
+            panic_with_error!(&env, OracleError::NotAPushSource);
+        }
         // Audit O7a: only this source's own feeder may push its price.
         source.feeder.require_auth();
 
@@ -1186,6 +1348,9 @@ impl NavOracleTrait for NavOracle {
             source.current_liquidity_depth_usd = current.current_liquidity_depth_usd;
         }
         let feeder = source.feeder.clone();
+        if let PendingKind::Pull(feed) = pending.kind {
+            env.storage().instance().set(&DataKey::PullFeed(source_id.clone()), &feed);
+        }
         apply_source(&env, &source);
         SourceActivated { source_id, feeder }.publish(&env);
     }
@@ -1205,6 +1370,65 @@ impl NavOracleTrait for NavOracle {
         source.is_active = false;
         env.storage().instance().set(&DataKey::Source(source_id.clone()), &source);
         SourceDeactivated { source_id, timestamp: env.ledger().timestamp() }.publish(&env);
+    }
+
+    fn register_reflector_source(env: Env, source: OracleSource, config: ReflectorConfig) {
+        admin_of(&env).require_auth();
+        validate_source(&env, &source);
+        let id = source.source_id.clone();
+        if env.storage().instance().has(&DataKey::Source(id.clone()))
+            && !env.storage().instance().has(&DataKey::PullFeed(id.clone()))
+        {
+            panic_with_error!(&env, OracleError::SourceKindMismatch);
+        }
+        // A pull source carries no liquidity depth; the depth rule (Rule 2)
+        // cannot apply, so a depth floor would be a false assurance.
+        if source.min_liquidity_depth_usd != 0
+            || config.rounds < MIN_PULL_ROUNDS
+            || config.rounds > MAX_PRICE_RECORDS
+        {
+            panic_with_error!(&env, OracleError::InvalidPullConfig);
+        }
+        // Validate against the live feed.
+        let feed = ReflectorClient::new(&env, &config.contract);
+        let decimals = match feed.try_decimals() {
+            Ok(Ok(d)) => d,
+            _ => panic_with_error!(&env, OracleError::InvalidPullConfig),
+        };
+        let quoted = match feed.try_assets() {
+            Ok(Ok(a)) => a,
+            _ => panic_with_error!(&env, OracleError::InvalidPullConfig),
+        };
+        if !quoted.contains(&config.asset) {
+            panic_with_error!(&env, OracleError::InvalidPullConfig);
+        }
+        match &config.quote {
+            PriceQuote::ViaUsdc(usdc_key) => {
+                if !quoted.contains(usdc_key) {
+                    panic_with_error!(&env, OracleError::InvalidPullConfig);
+                }
+            }
+            PriceQuote::InBase => {
+                let our_base = Asset::Stellar(base_asset(&env).unwrap_or_else(|| panic_with_error!(&env, OracleError::NotInitialized)));
+                match feed.try_base() {
+                    Ok(Ok(b)) if b == our_base => {}
+                    _ => panic_with_error!(&env, OracleError::InvalidPullConfig),
+                }
+            }
+        }
+        let pull = PullFeed { contract: config.contract, asset: config.asset, quote: config.quote, rounds: config.rounds, decimals };
+        register_or_queue(&env, source, PendingKind::Pull(pull));
+    }
+
+    fn pull_price(env: Env, source_id: Symbol) -> Option<SourcedPrice> {
+        let feed: PullFeed = env.storage().instance().get(&DataKey::PullFeed(source_id.clone()))?;
+        let source: OracleSource = env.storage().instance().get(&DataKey::Source(source_id.clone()))?;
+        let (price, timestamp) = pull_live(&env, &feed, source.staleness_limit_seconds)?;
+        Some(SourcedPrice { price, timestamp, source: source_id })
+    }
+
+    fn get_pull_feed(env: Env, source_id: Symbol) -> Option<PullFeed> {
+        env.storage().instance().get(&DataKey::PullFeed(source_id))
     }
 
     fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource> {

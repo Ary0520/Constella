@@ -1614,7 +1614,6 @@ mod o7b {
 
     const RES: u64 = 300; // seconds (Reflector resolution, configured in ms)
     const T: u64 = 1_000_200; // a round boundary: 300 * 3334
-    const E14: i128 = 100_000_000_000_000; // 1.0 at 14 decimals
 
     /// A real Reflector Pulse feed: base `base`, quoting `assets`, `decimals`.
     fn reflector(env: &Env, base: rw::Asset, assets: std::vec::Vec<rw::Asset>, decimals: u32) -> rw::Client<'static> {
@@ -1660,8 +1659,9 @@ mod o7b {
     fn pull(s: &S, id: &str, feed: &rw::Client, key: Asset, usd_quote: Option<Asset>, rounds: u32) -> Result<(), ()> {
         let mut src = create_source(s.env, id, &s.eurc, "CASH", 0, 0, T);
         src.min_liquidity_depth_usd = 0; // pull sources carry no depth
-        src.staleness_limit_seconds = 900;
-        let cfg = ReflectorConfig { contract: feed.address.clone(), asset: key, usd_quote, rounds };
+        src.staleness_limit_seconds = 1_200;
+        let quote = match usd_quote { Some(k) => PriceQuote::ViaUsdc(k), None => PriceQuote::InBase };
+        let cfg = ReflectorConfig { contract: feed.address.clone(), asset: key, quote, rounds };
         s.oracle.try_register_reflector_source(&src, &cfg).map(|_| ()).map_err(|_| ())
     }
 
@@ -1716,6 +1716,51 @@ mod o7b {
         assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL_5")).unwrap().price, 10_860_400);
     }
 
+    #[test]
+    fn even_round_count_premium_usdc_and_the_older_leg_sets_the_timestamp() {
+        let env = Env::default();
+        let s = setup(&env);
+        let feed = reflector(&env, rw::Asset::Other(Symbol::new(&env, "USD")),
+            std::vec![rw::Asset::Other(Symbol::new(&env, "EURC")), rw::Asset::Other(Symbol::new(&env, "USDC"))], 14);
+        // EURC/USD: 1.0850 1.0880 1.0860 1.0870 ; USDC/USD at a premium: 1.0015 1.0010 1.0013 1.0012
+        round(&env, &feed, T - 3 * RES, &[108_500_000_000_000, 100_150_000_000_000]);
+        round(&env, &feed, T - 2 * RES, &[108_800_000_000_000, 100_100_000_000_000]);
+        round(&env, &feed, T - RES, &[108_600_000_000_000, 100_130_000_000_000]);
+        round(&env, &feed, T, &[108_700_000_000_000, 100_120_000_000_000]);
+        pull(&s, "RFL4", &feed, other(&env, "EURC"), Some(other(&env, "USDC")), 4).unwrap();
+        let id = Symbol::new(&env, "RFL4");
+        // Even count: median = midpoint (rounded down). EURC (1.0860+1.0870)/2 = 1.0865,
+        // USDC (1.0012+1.0013)/2 = 1.00125 -> floor(1.0865e14 * 1e7 / 1.00125e14) = 10_851_435
+        assert_eq!(s.oracle.pull_price(&id).unwrap(), SourcedPrice { price: 10_851_435, timestamp: T - 3 * RES, source: id.clone() });
+
+        // A newer EURC-only round: EURC's 4 newest now start at T-600 (fresh, 910 s),
+        // but the USDC leg's oldest round is T-900 (1_210 s > 1_200 s): the cross
+        // rate is as stale as its stalest leg -> invalid.
+        env.ledger().set_timestamp(T + RES + 10);
+        let mut only_eurc = soroban_sdk::Vec::new(&env);
+        only_eurc.push_back(108_650_000_000_000i128);
+        feed.set_price(&rw::PriceUpdate { mask: Bytes::from_array(&env, &[0b01]), prices: only_eurc }, &((T + RES) * 1000));
+        assert_eq!(s.oracle.pull_price(&id), None);
+    }
+
+    #[test]
+    fn conversion_overflow_fails_closed() {
+        let env = Env::default();
+        let s = setup(&env);
+        // 5-decimal feed scaled up by 10^2. This price times 100 exceeds i128 and
+        // would WRAP to exactly 44 - a plausible positive price - so only checked
+        // arithmetic can reject it (a negative wrap would be caught by price > 0).
+        const P: i128 = 3_402_823_669_209_384_634_633_746_074_317_682_115;
+        assert_eq!(P.wrapping_mul(100), 44);
+        let feed = reflector(&env, rw::Asset::Stellar(s.base.clone()), std::vec![rw::Asset::Stellar(s.eurc.clone())], 5);
+        for i in 0..3u64 {
+            round(&env, &feed, T - (2 - i) * RES, &[P]);
+        }
+        pull(&s, "HUGE", &feed, Asset::Stellar(s.eurc.clone()), None, 3).unwrap();
+        assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "HUGE")), None, "overflow must not wrap or panic");
+        assert_eq!(s.oracle.asset_price(&s.eurc), None);
+    }
+
     // --- safety ------------------------------------------------------------
 
     #[test]
@@ -1756,10 +1801,11 @@ mod o7b {
         round(&env, &feed, T, &[108_600_000_000_000]);
         pull(&s, "RFL", &feed, Asset::Stellar(s.eurc.clone()), None, 3).unwrap();
         assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL")), None, "a gap is not 3 observations");
-        round(&env, &feed, T + RES, &[108_600_000_000_000]);
+        // Reflector itself refuses future-dated rounds: advance the ledger first.
         env.ledger().set_timestamp(T + RES + 10);
+        round(&env, &feed, T + RES, &[108_600_000_000_000]);
         assert!(s.oracle.pull_price(&Symbol::new(&env, "RFL")).is_some());
-        // Oldest round used (T - 2*RES... now T) older than the 900 s limit.
+        // Oldest round used (T - 2*RES) is now 1_600 s old: beyond the 1_200 s limit.
         env.ledger().set_timestamp(T + 1_000);
         assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL")), None, "stale");
     }
@@ -1782,7 +1828,7 @@ mod o7b {
         // A depth floor on a source that carries no depth: refused.
         let mut src = create_source(&env, "F", &s.eurc, "CASH", 0, 0, T);
         src.min_liquidity_depth_usd = 100_000;
-        let cfg = ReflectorConfig { contract: ours.address.clone(), asset: Asset::Stellar(s.eurc.clone()), usd_quote: None, rounds: 3 };
+        let cfg = ReflectorConfig { contract: ours.address.clone(), asset: Asset::Stellar(s.eurc.clone()), quote: PriceQuote::InBase, rounds: 3 };
         assert!(s.oracle.try_register_reflector_source(&src, &cfg).is_err());
         // A valid configuration is accepted.
         assert!(pull(&s, "OK", &ours, Asset::Stellar(s.eurc.clone()), None, 3).is_ok());
