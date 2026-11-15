@@ -640,3 +640,145 @@ fn test_property_collateral_nav_le_deposit_nav() {
     assert!(c.price <= d.price);
 }
 
+// -------------------------------------------------------------------------
+// Audit O1 (2026-11-15): only the pause authority or admin may pause a
+// sleeve; only the admin may clear it or rotate the pause authority.
+// Every call under test uses an explicit auth tree (AGENT-RULES Rule 13).
+// -------------------------------------------------------------------------
+mod o1 {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    fn setup_with_sleeve(env: &Env) -> (NavOracleClient<'_>, Address, Symbol) {
+        let (client, admin, _base) = setup_oracle(env);
+        let sleeve = Symbol::new(env, "USD_GOV_FUNDS");
+        client.configure_sleeve(&sleeve, &200, &2);
+        (client, admin, sleeve)
+    }
+
+    fn try_trip(env: &Env, client: &NavOracleClient, caller: &Address, sleeve: &Symbol) -> bool {
+        let reason = Symbol::new(env, "MANUAL");
+        env.mock_auths(&[MockAuth {
+            address: caller,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "trigger_circuit_breaker",
+                args: (caller.clone(), sleeve.clone(), reason.clone()).into_val(env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.try_trigger_circuit_breaker(caller, sleeve, &reason).is_ok()
+    }
+
+    #[test]
+    fn unsigned_call_is_rejected() {
+        let env = Env::default();
+        let (client, admin, sleeve) = setup_with_sleeve(&env);
+        env.set_auths(&[]);
+        // Even naming the admin as caller fails without the admin's signature.
+        assert!(client.try_trigger_circuit_breaker(&admin, &sleeve, &Symbol::new(&env, "X")).is_err());
+        assert!(!client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn signed_stranger_is_rejected_with_unauthorized() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = setup_with_sleeve(&env);
+        let stranger = Address::generate(&env);
+        assert!(!try_trip(&env, &client, &stranger, &sleeve));
+        let reason = Symbol::new(&env, "MANUAL");
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "trigger_circuit_breaker",
+                args: (stranger.clone(), sleeve.clone(), reason.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert_eq!(
+            client.try_trigger_circuit_breaker(&stranger, &sleeve, &reason),
+            Err(Ok(soroban_sdk::Error::from_contract_error(OracleError::Unauthorized as u32)))
+        );
+        assert!(!client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn admin_and_pause_authority_can_pause() {
+        let env = Env::default();
+        let (client, admin, sleeve) = setup_with_sleeve(&env);
+        assert_eq!(client.get_pause_authority(), admin);
+        assert!(try_trip(&env, &client, &admin, &sleeve));
+        assert_eq!(env.auths()[0].0, admin);
+        assert!(client.is_sleeve_paused(&sleeve));
+
+        env.mock_all_auths();
+        client.clear_circuit_breaker(&sleeve);
+        let guardian = Address::generate(&env);
+        client.set_pause_authority(&guardian);
+        assert!(try_trip(&env, &client, &guardian, &sleeve));
+        assert_eq!(env.auths()[0].0, guardian);
+        assert!(client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn rotated_out_authority_loses_power() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = setup_with_sleeve(&env);
+        let g1 = Address::generate(&env);
+        let g2 = Address::generate(&env);
+        env.mock_all_auths();
+        client.set_pause_authority(&g1);
+        client.set_pause_authority(&g2);
+        assert!(!try_trip(&env, &client, &g1, &sleeve));
+        assert!(try_trip(&env, &client, &g2, &sleeve));
+    }
+
+    #[test]
+    fn only_admin_can_rotate_authority_or_clear() {
+        let env = Env::default();
+        let (client, admin, sleeve) = setup_with_sleeve(&env);
+        let guardian = Address::generate(&env);
+        env.mock_all_auths();
+        client.set_pause_authority(&guardian);
+        assert!(try_trip(&env, &client, &guardian, &sleeve));
+
+        // The pause authority can neither clear a pause nor rotate itself.
+        env.mock_auths(&[MockAuth {
+            address: &guardian,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "clear_circuit_breaker",
+                args: (sleeve.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_clear_circuit_breaker(&sleeve).is_err());
+        let other = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &guardian,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_pause_authority",
+                args: (other.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_set_pause_authority(&other).is_err());
+        assert!(client.is_sleeve_paused(&sleeve));
+        assert_eq!(client.get_pause_authority(), guardian);
+
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "clear_circuit_breaker",
+                args: (sleeve.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.clear_circuit_breaker(&sleeve);
+        assert!(!client.is_sleeve_paused(&sleeve));
+    }
+}
