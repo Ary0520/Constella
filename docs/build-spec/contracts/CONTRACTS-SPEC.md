@@ -302,12 +302,15 @@ fn decimals(env: Env) -> u32
 fn resolution(env: Env) -> u32                                     // seconds
 fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData>
 fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>>
-fn lastprice(env: Env, asset: Asset) -> Option<PriceData>          // conservative NAV; None while sleeve paused/halted
+fn lastprice(env: Env, asset: Asset) -> Option<PriceData>          // live conservative price; None if stale/<2 sources/paused (W5)
+// price/prices: history on the resolution grid, newest first, <= 20 records; base = 10^decimals; Other -> None
 
 // Constella extensions (non-SEP-40)
-fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>  // minimum of valid sources
-fn asset_price(env: Env, asset: Address) -> Option<PriceData>            // median of the asset's own valid sources; base = 1.0
-fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>     // median of valid sources
+// SourcedPrice { price, timestamp, source }
+fn collateral_price(env: Env, asset: Address) -> Option<SourcedPrice>       // minimum of the asset's valid sources
+fn asset_price(env: Env, asset: Address) -> Option<SourcedPrice>            // median of the asset's own valid sources; base = 1.0
+fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice>  // single-asset sleeves only (O6)
+fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice>     // single-asset sleeves only (O6)
 
 // Oracle management
 fn get_sources(env: Env) -> Vec<OracleSource>

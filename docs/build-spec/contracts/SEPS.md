@@ -116,10 +116,15 @@ pub trait SEP40Oracle {
 
 > Blend v2 consumes oracles through the `sep-40-oracle` crate and calls only `lastprice(&Asset::Stellar(addr))`, rejecting prices ≤ 0 or older than 24h.
 
-### Implementation in Constella
-- Constella's NAV Oracle contract implements SEP-40.
-- When Blend, Liqvid, or another lending market integrates a Constella basket token, they query our SEP-40 interface.
-- Returns the **Conservative NAV** (minimum of valid sources) to safeguard lenders from collateral inflation.
+### Implementation in Constella (audit W5, `7ad049c`; verified 15 Nov 2026)
+Checked against the SEP-40 v0.1.0 text, `script3/sep-40-oracle` v1.4.0 (the client Blend v2 compiles against), the Blend v2 pool's `load_price`, and Reflector's contract.
+- **Exact types:** the built WASM spec matches `sep-40-oracle`. `PriceData` has exactly `{price, timestamp}`; adding a field could break strict decoders in deployed consumers.
+- **`lastprice`:** the **conservative** price (minimum of valid sources), evaluated live and stamped with the oldest data used, on the resolution grid. It returns **`None`** whenever Constella's rules give no valid price: stale under the source's own limit (e.g. 4 h), fewer than 2 valid sources, or a paused sleeve. Blend accepts prices up to 24 h old, so returning a stored price would let it lend against data we consider invalid. A `None` makes Blend halt that asset.
+- **`price(asset, ts)` / `prices(asset, n)`:** history snapshots, recorded on each valid write and bucketed by computation time on the resolution grid (no look-ahead). Newest first; `n` is 1–20 (Reflector's cap).
+- **Return conventions:** timestamps are in seconds; the base asset is `10^decimals`; `Other` and unknown assets return `None`.
+- **Constella extras:** `collateral_price` / `asset_price` / sleeve NAV return `SourcedPrice` (with the source ID). They are not part of SEP-40.
+- **Not yet:** quoting **vault share tokens** (audit **L1**). Today the feed quotes the underlying assets only. For Blend to accept Constella shares as collateral, the feed must also quote each vault's share token at its conservative NAV per share.
+- **Still to verify end to end:** a real Blend pool WASM against our oracle on the local network (tests currently use a line-for-line mirror of Blend's `load_price`).
 
 ---
 

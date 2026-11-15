@@ -106,18 +106,20 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 
 ## SEP-40 Compatible Interface
 
-The vault publishes its NAV through a SEP-40 compatible interface so lenders can integrate using the standard Stellar oracle pattern:
+The oracle implements the exact SEP-40 interface (audit W5). It is verified against `sep-40-oracle` 1.4.0, which Blend v2 uses, and against Reflector's conventions:
 
 ```rust
-// SEP-40 compatible
-fn price(asset: Address) -> Option<PriceData>
-fn prices(assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>
-fn lastprice(asset: Address) -> Option<PriceData>
-fn resolution() -> u32  // in seconds
-fn base() -> Address    // numéraire asset
-fn decimals() -> u32
-fn assets() -> Vec<Address>
+enum Asset { Stellar(Address), Other(Symbol) }
+struct PriceData { price: i128, timestamp: u64 }   // exactly these two fields
+fn base() -> Asset; fn assets() -> Vec<Asset>; fn decimals() -> u32; fn resolution() -> u32 /* seconds */
+fn lastprice(asset: Asset) -> Option<PriceData>    // live conservative price; None if no valid price
+fn price(asset: Asset, timestamp: u64) -> Option<PriceData>       // history, floored to the grid
+fn prices(asset: Asset, records: u32) -> Option<Vec<PriceData>>   // newest first, 1..=20
 ```
+
+**Blend v2** calls only `lastprice(Asset::Stellar(token))` and `decimals()`. It rejects `None`, prices ≤ 0, and prices older than 24 h. Constella returns `None` earlier, as soon as a source passes its own staleness limit, so Blend halts instead of lending against stale data.
+
+**Vault share tokens are not quoted yet** (audit L1); see `SEPS.md`.
 
 **Lender recommended config (in listing_kit):**
 - Use `collateral_nav()` for position sizing — not `price()`
@@ -172,7 +174,7 @@ Before any NAV oracle code ships to testnet:
 - [ ] Staleness limit configurable per-source (not hardcoded)
 - [ ] Circuit breaker emits on-chain events
 - [ ] Hard stop (< 2 valid sources) tested end-to-end
-- [ ] SEP-40 interface implemented and tested
+- [x] SEP-40 interface implemented and tested (W5; Blend v2 `load_price` mirrored in tests; real Blend WASM on the local network still to do)
 - [ ] Collateral Passport view functions return valid data
 - [ ] Lender listing kit documents our oracle configuration
 - [ ] Independent review of oracle design before mainnet
