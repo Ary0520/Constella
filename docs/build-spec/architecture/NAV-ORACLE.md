@@ -59,6 +59,13 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 - **Thin markets:** Reflector's pubnet feed is an SDEX/AMM VWAP. Use it only alongside an independent source; the cross-source deviation breaker then fails closed on manipulation (YieldBlox lesson, `references/ORACLE-SOURCES.md` §5).
 - **Operations:** Reflector assets expire unless renewed with XRF, and an expired asset reads as invalid. Monitor and fund every key used.
 
+### RedStone pull sources (audit O7c, `d8ed508`)
+- `register_redstone_source(source, RedStoneConfig { adapter, feed_id, usdc_feed_id })`: the price is read live through `read_price_data_for_feed`.
+- **Conversion:** `price(asset) × 10^ours / price(USDC)` using the same adapter's USDC feed (8 decimals cancel), rounding down. There is no in-base mode, because RedStone is USD-based.
+- **Timestamp:** the **older signing time** (`package_timestamp` ms → s). The source is invalid if a leg is future-dated or older than the source's own staleness limit; RedStone itself keeps serving data for 30 h.
+- **Registration:** both feeds must be readable now. RedStone's EURC/USD id is `"EUROC"`.
+- **Observed adapter behaviour:** signatures are verified **per feed**. A feed without 3 valid signer signatures is silently not stored while the rest of the write succeeds, so a successful `write_prices` does not mean every feed updated. The stale feed then reads as invalid here.
+
 ### Per-asset evaluation (audit O6, 15 Nov 2026)
 - Every rule below is evaluated **per asset**, among that asset's own sources. A sleeve may hold several assets at different prices (USDC and EURC in cash; BENJI and USDY in USD gov funds), and comparing them would be meaningless.
 - The **sleeve** is the configuration and pause domain: deviation threshold, minimum valid sources, and the pause flag / `NAV_PAUSE` event.

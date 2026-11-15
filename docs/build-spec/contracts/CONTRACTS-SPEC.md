@@ -326,6 +326,9 @@ fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource>
 fn register_reflector_source(env: Env, source: OracleSource, config: ReflectorConfig) // admin; validated against the live feed
 fn pull_price(env: Env, source_id: Symbol) -> Option<SourcedPrice>  // live converted price; None if gappy/stale/unreadable/overflow
 fn get_pull_feed(env: Env, source_id: Symbol) -> Option<PullFeed>
+// RedStone pull sources (O7c)
+fn register_redstone_source(env: Env, source: OracleSource, config: RedStoneConfig) // admin; both feeds must be readable
+fn get_redstone_feed(env: Env, source_id: Symbol) -> Option<RedStoneConfig>
 // caller must sign AND be the pause authority or the admin (audit O1)
 fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol)
 fn clear_circuit_breaker(env: Env, sleeve_id: Symbol)  // admin (multisig) only

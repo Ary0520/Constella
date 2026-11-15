@@ -49,6 +49,7 @@ Read from `redstone-finance/redstone-oracles-monorepo` (main `39cce17`, 13 Nov 2
 - **Adapter reads fail only after 30 h** (`DATA_STALENESS`) — far looser than the heartbeats; consumers must apply their own limit to `package_timestamp`.
 - SEP-40 wrapper `CBMGLKUQZVSAIL5CPDDAWSUY7MAKXISHMOZEVLMBUWBMFGHRJSR4WYRF`: base `Other("USD")`, `decimals()` **may change** when feeds are added, `resolution()` owner-changeable (86 400), `prices()` **oldest first**. Use the native interface instead.
 - All RedStone contracts are owner-upgradeable; license BUSL-1.1; audits Veridise and Zenith (Oct 2025) predate the SEP-40 wrapper.
+- **Verified by replay (15 Nov 2026):** two real mainnet payloads (USDC tx `4bed8f74…`, EUROC tx `089303b5…`) were replayed into the real adapter WASM (sha256 `f0ccdffc…`). Each feed carried 3 signer packages (USDC 0.99975479 / 0.99975978 / 0.99975978 → median 0.99975978). Corrupting one package (signature or signed value) made the adapter **silently skip that feed** while storing the others, so a write's success is per feed, not per transaction. Live mainnet EUROC at check time: 1.09853605 USD.
 
 ## 4. Blend v2 (lending positions)
 
