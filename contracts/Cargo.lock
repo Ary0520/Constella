@@ -359,6 +359,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "constella-webauthn-verifier"
+version = "0.1.0"
+dependencies = [
+ "p256",
+ "rand_core",
+ "soroban-sdk",
+ "stellar-accounts",
+]
+
+[[package]]
 name = "core-foundation-sys"
 version = "0.8.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

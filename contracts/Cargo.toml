@@ -9,6 +9,7 @@ members = [
     "vault-strategy",
     "smart-account",
     "fee-sponsor",
+    "webauthn-verifier",
 ]
 
 [workspace.package]
