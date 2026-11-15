@@ -1595,3 +1595,205 @@ mod o7a {
         assert!(f.client.try_deactivate_source(&nav).is_err());
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit O7b (2026-11-15): Reflector as an on-chain pull source. These tests
+// run the REAL Reflector Pulse contract: testdata/reflector_pulse_mainnet.wasm
+// was fetched read-only from Stellar mainnet on 15 Nov 2026 (contracts
+// CAFJZQ... and CALI2B... both run it; sha256 25fc3060...1439; built with
+// soroban-sdk 28.0.0 from github:reflector-network/reflector-contract).
+// -------------------------------------------------------------------------
+mod reflector_wasm {
+    soroban_sdk::contractimport!(file = "testdata/reflector_pulse_mainnet.wasm");
+}
+
+mod o7b {
+    use super::reflector_wasm as rw;
+    use super::*;
+    use soroban_sdk::Bytes;
+
+    const RES: u64 = 300; // seconds (Reflector resolution, configured in ms)
+    const T: u64 = 1_000_200; // a round boundary: 300 * 3334
+    const E14: i128 = 100_000_000_000_000; // 1.0 at 14 decimals
+
+    /// A real Reflector Pulse feed: base `base`, quoting `assets`, `decimals`.
+    fn reflector(env: &Env, base: rw::Asset, assets: std::vec::Vec<rw::Asset>, decimals: u32) -> rw::Client<'static> {
+        let id = env.register(rw::WASM, ());
+        let c = rw::Client::new(env, &id);
+        let mut list = soroban_sdk::Vec::new(env);
+        for a in assets { list.push_back(a); }
+        c.config(&rw::ConfigData {
+            admin: Address::generate(env),
+            assets: list,
+            base_asset: base,
+            cache_size: 0,
+            decimals,
+            fee_config: rw::FeeConfig::None,
+            history_retention_period: 86_400_000, // ms
+            resolution: (RES * 1000) as u32,      // ms
+        });
+        c
+    }
+
+    /// Publish one Reflector round at `t` seconds: one price per asset, in order.
+    fn round(env: &Env, c: &rw::Client, t: u64, prices: &[i128]) {
+        let mask_byte: u8 = (1u16 << prices.len()).wrapping_sub(1) as u8;
+        let mut p = soroban_sdk::Vec::new(env);
+        for x in prices { p.push_back(*x); }
+        c.set_price(&rw::PriceUpdate { mask: Bytes::from_array(env, &[mask_byte]), prices: p }, &(t * 1000));
+    }
+
+    struct S<'a> {
+        env: &'a Env,
+        oracle: NavOracleClient<'a>,
+        base: Address,
+        eurc: Address,
+    }
+
+    fn setup(env: &Env) -> S<'_> {
+        let (oracle, _admin, base) = setup_oracle(env); // mock_all_auths (setup only)
+        env.ledger().set_timestamp(T + 10);
+        oracle.configure_sleeve(&Symbol::new(env, "CASH"), &200, &2);
+        S { env, oracle, base, eurc: Address::generate(env) }
+    }
+
+    fn pull(s: &S, id: &str, feed: &rw::Client, key: Asset, usd_quote: Option<Asset>, rounds: u32) -> Result<(), ()> {
+        let mut src = create_source(s.env, id, &s.eurc, "CASH", 0, 0, T);
+        src.min_liquidity_depth_usd = 0; // pull sources carry no depth
+        src.staleness_limit_seconds = 900;
+        let cfg = ReflectorConfig { contract: feed.address.clone(), asset: key, usd_quote, rounds };
+        s.oracle.try_register_reflector_source(&src, &cfg).map(|_| ()).map_err(|_| ())
+    }
+
+    fn other(env: &Env, sym: &str) -> Asset {
+        Asset::Other(Symbol::new(env, sym))
+    }
+
+    // --- conversion ------------------------------------------------------
+
+    #[test]
+    fn usd_feed_is_cross_rated_through_its_own_usdc_price() {
+        let env = Env::default();
+        let s = setup(&env);
+        // Reflector CEX/DEX-style feed: base USD, keys Other("EURC"), Other("USDC").
+        let feed = reflector(&env, rw::Asset::Other(Symbol::new(&env, "USD")),
+            std::vec![rw::Asset::Other(Symbol::new(&env, "EURC")), rw::Asset::Other(Symbol::new(&env, "USDC"))], 14);
+        // EURC/USD 1.0850, 1.0870, 1.0860 ; USDC/USD 1.0001, 0.9990, 0.9995
+        round(&env, &feed, T - 2 * RES, &[108_500_000_000_000, 100_010_000_000_000]);
+        round(&env, &feed, T - RES, &[108_700_000_000_000, 99_900_000_000_000]);
+        round(&env, &feed, T, &[108_600_000_000_000, 99_950_000_000_000]);
+        pull(&s, "RFL_EURC", &feed, other(&env, "EURC"), Some(other(&env, "USDC")), 3).unwrap();
+        // median EURC 1.0860 / median USDC 0.9995 = 1.08654327... USDC
+        // floor(1.0860e14 * 1e7 / 0.9995e14) = floor(10_865_432.716...) = 10_865_432
+        let p = s.oracle.pull_price(&Symbol::new(&env, "RFL_EURC")).unwrap();
+        assert_eq!(p.price, 10_865_432);
+        assert_eq!(p.timestamp, T - 2 * RES, "stamped with the oldest round used");
+    }
+
+    #[test]
+    fn feed_in_our_base_is_rescaled_from_14_decimals_rounding_down() {
+        let env = Env::default();
+        let s = setup(&env);
+        // Reflector pubnet-style feed whose base IS our numéraire.
+        let feed = reflector(&env, rw::Asset::Stellar(s.base.clone()), std::vec![rw::Asset::Stellar(s.eurc.clone())], 14);
+        for (i, px) in [108_604_567_891_234i128, 108_604_567_891_299, 108_604_567_891_201].iter().enumerate() {
+            round(&env, &feed, T - (2 - i as u64) * RES, &[*px]);
+        }
+        pull(&s, "RFL_PUB", &feed, Asset::Stellar(s.eurc.clone()), None, 3).unwrap();
+        // median 1.08604567891234 -> 7 decimals, floor: 10_860_456
+        assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL_PUB")).unwrap().price, 10_860_456);
+    }
+
+    #[test]
+    fn feed_with_fewer_decimals_is_scaled_up_exactly() {
+        let env = Env::default();
+        let s = setup(&env);
+        let feed = reflector(&env, rw::Asset::Stellar(s.base.clone()), std::vec![rw::Asset::Stellar(s.eurc.clone())], 5);
+        for i in 0..3u64 {
+            round(&env, &feed, T - (2 - i) * RES, &[108_604]); // 1.08604 at 5 decimals
+        }
+        pull(&s, "RFL_5", &feed, Asset::Stellar(s.eurc.clone()), None, 3).unwrap();
+        assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL_5")).unwrap().price, 10_860_400);
+    }
+
+    // --- safety ------------------------------------------------------------
+
+    #[test]
+    fn one_manipulated_round_cannot_move_the_price() {
+        // YieldBlox: a single thin-market round printed ~100x the real price.
+        let env = Env::default();
+        let s = setup(&env);
+        let feed = reflector(&env, rw::Asset::Stellar(s.base.clone()), std::vec![rw::Asset::Stellar(s.eurc.clone())], 14);
+        round(&env, &feed, T - 2 * RES, &[108_600_000_000_000]);
+        round(&env, &feed, T - RES, &[10_670_000_000_000_000]); // $106.70
+        round(&env, &feed, T, &[108_610_000_000_000]);
+        pull(&s, "RFL", &feed, Asset::Stellar(s.eurc.clone()), None, 3).unwrap();
+        assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL")).unwrap().price, 10_861_000);
+    }
+
+    #[test]
+    fn a_manipulated_majority_is_caught_by_the_independent_source() {
+        let env = Env::default();
+        let s = setup(&env);
+        let feed = reflector(&env, rw::Asset::Stellar(s.base.clone()), std::vec![rw::Asset::Stellar(s.eurc.clone())], 14);
+        round(&env, &feed, T - 2 * RES, &[108_600_000_000_000]);
+        round(&env, &feed, T - RES, &[10_670_000_000_000_000]);
+        round(&env, &feed, T, &[10_670_000_000_000_000]);
+        // Independent pushed source (e.g. an FX-derived feeder) at the real price.
+        s.oracle.register_source(&create_source(&env, "FX_EURC", &s.eurc, "CASH", 10_860_000, 200_000, T));
+        pull(&s, "RFL", &feed, Asset::Stellar(s.eurc.clone()), None, 3).unwrap();
+        assert_eq!(s.oracle.asset_price(&s.eurc), None, "sources disagree ~100x: fail closed");
+        assert!(s.oracle.is_sleeve_paused(&Symbol::new(&env, "CASH")));
+    }
+
+    #[test]
+    fn stale_or_missing_rounds_make_the_source_invalid() {
+        let env = Env::default();
+        let s = setup(&env);
+        let feed = reflector(&env, rw::Asset::Stellar(s.base.clone()), std::vec![rw::Asset::Stellar(s.eurc.clone())], 14);
+        // Only 2 rounds published (a gap): fewer than the 3 required.
+        round(&env, &feed, T - 2 * RES, &[108_600_000_000_000]);
+        round(&env, &feed, T, &[108_600_000_000_000]);
+        pull(&s, "RFL", &feed, Asset::Stellar(s.eurc.clone()), None, 3).unwrap();
+        assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL")), None, "a gap is not 3 observations");
+        round(&env, &feed, T + RES, &[108_600_000_000_000]);
+        env.ledger().set_timestamp(T + RES + 10);
+        assert!(s.oracle.pull_price(&Symbol::new(&env, "RFL")).is_some());
+        // Oldest round used (T - 2*RES... now T) older than the 900 s limit.
+        env.ledger().set_timestamp(T + 1_000);
+        assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL")), None, "stale");
+    }
+
+    #[test]
+    fn registration_validates_against_the_live_feed() {
+        let env = Env::default();
+        let s = setup(&env);
+        let usd_feed = reflector(&env, rw::Asset::Other(Symbol::new(&env, "USD")), std::vec![rw::Asset::Other(Symbol::new(&env, "EURC"))], 14);
+        // USD-based feed without a USDC cross-rate key: refused (never assume USD = USDC).
+        assert!(pull(&s, "A", &usd_feed, other(&env, "EURC"), None, 3).is_err());
+        // Cross-rate key the feed does not quote: refused.
+        assert!(pull(&s, "B", &usd_feed, other(&env, "EURC"), Some(other(&env, "USDC")), 3).is_err());
+        // Asset the feed does not quote: refused.
+        assert!(pull(&s, "C", &usd_feed, other(&env, "GBP"), None, 3).is_err());
+        let ours = reflector(&env, rw::Asset::Stellar(s.base.clone()), std::vec![rw::Asset::Stellar(s.eurc.clone())], 14);
+        // Fewer than 3 or more than 20 rounds: refused.
+        assert!(pull(&s, "D", &ours, Asset::Stellar(s.eurc.clone()), None, 2).is_err());
+        assert!(pull(&s, "E", &ours, Asset::Stellar(s.eurc.clone()), None, 21).is_err());
+        // A depth floor on a source that carries no depth: refused.
+        let mut src = create_source(&env, "F", &s.eurc, "CASH", 0, 0, T);
+        src.min_liquidity_depth_usd = 100_000;
+        let cfg = ReflectorConfig { contract: ours.address.clone(), asset: Asset::Stellar(s.eurc.clone()), usd_quote: None, rounds: 3 };
+        assert!(s.oracle.try_register_reflector_source(&src, &cfg).is_err());
+        // A valid configuration is accepted.
+        assert!(pull(&s, "OK", &ours, Asset::Stellar(s.eurc.clone()), None, 3).is_ok());
+    }
+
+    #[test]
+    fn nobody_can_push_a_price_into_a_pull_source() {
+        let env = Env::default();
+        let s = setup(&env);
+        let feed = reflector(&env, rw::Asset::Stellar(s.base.clone()), std::vec![rw::Asset::Stellar(s.eurc.clone())], 14);
+        pull(&s, "RFL", &feed, Asset::Stellar(s.eurc.clone()), None, 3).unwrap();
+        assert!(s.oracle.try_update_price(&Symbol::new(&env, "RFL"), &99_000_000, &0, &T).is_err());
+    }
+}
