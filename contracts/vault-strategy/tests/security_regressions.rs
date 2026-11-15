@@ -51,9 +51,10 @@ fn oracle_source(env: &Env, id: &str, asset: &Address, price: i128) -> OracleSou
 }
 
 /// Full contract stack: registry (USDC registered), policy, oracle and a
-/// 0-fee strategy vault. With `vault_nav_feeds`, the oracle carries two
-/// independent $1.00 feeds for the vault NAV; without, share price is derived
-/// from sleeve composition.
+/// 0-fee strategy vault. With `vault_nav_feeds`, the oracle also carries two
+/// $1.00 feeds under the key "VAULT", used by the oracle-focused tests. Since
+/// audit V5 the vault never reads that key: share prices always come from
+/// holdings.
 fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
     let env = Env::default();
     env.mock_all_auths(); // setup only

@@ -130,51 +130,6 @@ fn setup_test_context() -> TestContext<'static> {
     }
 }
 
-fn configure_vault_oracle_feeds(ctx: &TestContext) {
-    let sleeve_sym = Symbol::new(&ctx.env, "VAULT");
-    ctx.oracle_client.configure_sleeve(&sleeve_sym, &300, &2);
-
-    let dummy_asset = Address::generate(&ctx.env);
-
-    // 3 feeds: Median = $1.00 (10_000_000), Min = $0.99 (9_900_000), Max = $1.01 (10_100_000)
-    let s1 = ExtOracleSource {
-        source_id: Symbol::new(&ctx.env, "MEDIAN_SRC"),
-        asset: dummy_asset.clone(),
-        sleeve: sleeve_sym.clone(),
-        price: 10_000_000,
-        timestamp: 1_000_000,
-        staleness_limit_seconds: 14400,
-        min_liquidity_depth_usd: 100_000,
-        current_liquidity_depth_usd: 200_000,
-        is_active: true,
-    };
-    let s2 = ExtOracleSource {
-        source_id: Symbol::new(&ctx.env, "CONSERVATIVE_SRC"),
-        asset: dummy_asset.clone(),
-        sleeve: sleeve_sym.clone(),
-        price: 9_900_000,
-        timestamp: 1_000_000,
-        staleness_limit_seconds: 14400,
-        min_liquidity_depth_usd: 100_000,
-        current_liquidity_depth_usd: 200_000,
-        is_active: true,
-    };
-    let s3 = ExtOracleSource {
-        source_id: Symbol::new(&ctx.env, "HIGH_SRC"),
-        asset: dummy_asset,
-        sleeve: sleeve_sym,
-        price: 10_100_000,
-        timestamp: 1_000_000,
-        staleness_limit_seconds: 14400,
-        min_liquidity_depth_usd: 100_000,
-        current_liquidity_depth_usd: 200_000,
-        is_active: true,
-    };
-
-    ctx.oracle_client.register_source(&s1);
-    ctx.oracle_client.register_source(&s2);
-    ctx.oracle_client.register_source(&s3);
-}
 
 // -------------------------------------------------------------------------
 // T40: SEP-56 Deposit & Mint with Median NAV Valuation
@@ -182,13 +137,14 @@ fn configure_vault_oracle_feeds(ctx: &TestContext) {
 #[test]
 fn test_t40_deposit_and_mint_median_nav() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
 
     // Verify Oracle Dual NAV
     let dep_nav = ctx.vault_client.get_nav_deposit().unwrap();
     let cons_nav = ctx.vault_client.get_nav_conservative().unwrap();
-    assert_eq!(dep_nav.price, 10_000_000); // $1.00 median
-    assert_eq!(cons_nav.price, 9_900_000);  // $0.99 conservative
+    // Audit V5: share prices come from holdings. An empty vault prices shares at
+    // exactly $1.00 for both NAVs (no oracle override).
+    assert_eq!(dep_nav.price, 10_000_000);
+    assert_eq!(cons_nav.price, 10_000_000);
 
     // Mint 1000 USDC to Alice
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
@@ -227,7 +183,6 @@ fn test_t40_deposit_and_mint_median_nav() {
 #[test]
 fn test_t41_instant_redemption_conservative_nav() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
 
     // Deposit 1000 USDC by Alice at $1.00 NAV
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
@@ -238,22 +193,22 @@ fn test_t41_instant_redemption_conservative_nav() {
     let cons_nav = ctx.vault_client.get_nav_conservative().unwrap();
     let dep_nav = ctx.vault_client.get_nav_deposit().unwrap();
     assert!(cons_nav.price <= dep_nav.price);
-    assert_eq!(cons_nav.price, 9_900_000); // 0.99 conservative
+    // Audit V5: the vault holds only USDC, so a share is worth exactly $1.00.
+    // (Previously an oracle override of $0.99 short-changed redeemers.)
+    assert_eq!(cons_nav.price, 10_000_000);
 
-    // Alice redeems 100 shares for Bob
-    // Assets = 100 shares * 0.99 = 99 USDC
+    // Alice redeems 100 shares for Bob: 100 shares * $1.00 = 100 USDC
     let assets_out = ctx.vault_client.redeem(&100_0000000, &ctx.bob, &ctx.alice);
-    assert_eq!(assets_out, 99_0000000);
-    assert_eq!(ctx.numeraire_client.balance(&ctx.bob), 99_0000000);
+    assert_eq!(assets_out, 100_0000000);
+    assert_eq!(ctx.numeraire_client.balance(&ctx.bob), 100_0000000);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 900_0000000);
     assert_eq!(ctx.vault_client.total_supply(), 900_0000000);
 
-    // Alice withdraws 99 USDC directly
-    // Shares needed = (99 * 10^7 * 10^7 + 9_899_999) / 9_900_000 = 100 shares
+    // Alice withdraws 99 USDC directly: burns exactly 99 shares at $1.00
     let shares_burned = ctx.vault_client.withdraw(&99_0000000, &ctx.alice, &ctx.alice);
-    assert_eq!(shares_burned, 100_0000000);
-    assert_eq!(ctx.vault_client.balance(&ctx.alice), 800_0000000);
-    assert_eq!(ctx.vault_client.total_supply(), 800_0000000);
+    assert_eq!(shares_burned, 99_0000000);
+    assert_eq!(ctx.vault_client.balance(&ctx.alice), 801_0000000);
+    assert_eq!(ctx.vault_client.total_supply(), 801_0000000);
     assert_eq!(ctx.numeraire_client.balance(&ctx.alice), 99_0000000);
 }
 
@@ -263,7 +218,6 @@ fn test_t41_instant_redemption_conservative_nav() {
 #[test]
 fn test_t42_fee_dilution_calculation() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
 
     // Management fee = 100 bps = 1% / year
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
@@ -298,7 +252,6 @@ fn test_t42_fee_dilution_calculation() {
 #[test]
 fn test_t43_collateral_passport_views() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
 
     // Deposit initial capital
     ctx.numeraire_admin.mint(&ctx.alice, &500_0000000);
@@ -307,7 +260,8 @@ fn test_t43_collateral_passport_views() {
     // 1. Dual NAV
     let cons_nav = ctx.vault_client.get_nav_conservative().unwrap();
     let dep_nav = ctx.vault_client.get_nav_deposit().unwrap();
-    assert_eq!(cons_nav.price, 9_900_000);
+    // Audit V5: cash-only holdings -> both NAVs are exactly $1.00.
+    assert_eq!(cons_nav.price, 10_000_000);
     assert_eq!(dep_nav.price, 10_000_000);
     assert!(cons_nav.price <= dep_nav.price);
 
@@ -339,17 +293,21 @@ fn test_t43_collateral_passport_views() {
     assert_eq!(kit.recommended_haircut_bps, 1000);
     assert_eq!(kit.liquidation_threshold_bps, 9000); // = LTV (Blend single collateral factor)
 
-    // 6. Oracle Status
+    // 6. Oracle Status: reports the sources behind the vault's real sleeves
+    // (a cash-only vault needs none: the numeraire is the unit of account).
+    assert!(ctx.vault_client.get_oracle_status().is_empty());
+    let gov = register_gov_fund(&ctx);
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 500_0000000));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+    ctx.vault_client.set_sleeves(&sleeves);
     let oracle_status = ctx.vault_client.get_oracle_status();
-    assert!(!oracle_status.is_empty());
-    let mut found_median = false;
+    let ids: std::vec::Vec<Symbol> = oracle_status.iter().map(|s| s.source_id).collect();
+    assert!(ids.contains(&Symbol::new(&ctx.env, "GOV_NAV")));
+    assert!(ids.contains(&Symbol::new(&ctx.env, "GOV_REFLECTOR")));
     for src in oracle_status.iter() {
-        if src.source_id == Symbol::new(&ctx.env, "MEDIAN_SRC") {
-            found_median = true;
-            assert_eq!(src.price, 10_000_000);
-        }
+        assert_eq!(src.price, 10_000_000);
     }
-    assert!(found_median);
 }
 
 // -------------------------------------------------------------------------
@@ -358,7 +316,6 @@ fn test_t43_collateral_passport_views() {
 #[test]
 fn test_t44_emergency_pause_and_unpause() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
 
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
 
@@ -414,7 +371,6 @@ fn test_t44_emergency_pause_and_unpause() {
 #[test]
 fn test_t45_sep41_token_standard() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
 
     ctx.numeraire_admin.mint(&ctx.alice, &500_0000000);
     ctx.vault_client.deposit(&500_0000000, &ctx.alice);
@@ -934,7 +890,6 @@ fn test_dual_nav_asymmetric_max_redeem() {
 #[test]
 fn test_mint_ceiling_rounding() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
 
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
 
@@ -947,7 +902,6 @@ fn test_mint_ceiling_rounding() {
 #[test]
 fn test_storage_cleanup_zero_balance_and_allowance() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
 
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
     ctx.vault_client.deposit(&100_0000000, &ctx.alice);
@@ -1014,7 +968,6 @@ fn test_self_transfer_does_not_mint_shares() {
     use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
     ctx.vault_client.deposit(&100_0000000, &ctx.alice);
     let before = ctx.vault_client.balance(&ctx.alice);
@@ -1046,7 +999,6 @@ fn test_self_transfer_more_than_balance_rejected() {
     use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
     ctx.vault_client.deposit(&100_0000000, &ctx.alice);
     let bal = ctx.vault_client.balance(&ctx.alice);
@@ -1068,7 +1020,6 @@ fn test_self_transfer_from_does_not_mint_shares() {
     use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
     ctx.vault_client.deposit(&100_0000000, &ctx.alice);
     let bal = ctx.vault_client.balance(&ctx.alice);
@@ -1096,7 +1047,6 @@ fn test_self_transfer_from_does_not_mint_shares() {
 #[test]
 fn test_transfer_conserves_total_supply() {
     let ctx = setup_test_context();
-    configure_vault_oracle_feeds(&ctx);
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
     ctx.vault_client.deposit(&100_0000000, &ctx.alice);
     let supply = ctx.vault_client.total_supply();
@@ -1517,7 +1467,6 @@ mod w3 {
     #[test]
     fn per_user_cap_enforced_per_receiver() {
         let ctx = setup_test_context();
-        configure_vault_oracle_feeds(&ctx);
         ctx.numeraire_admin.mint(&ctx.alice, &(200_000 * ONE));
         ctx.numeraire_admin.mint(&ctx.bob, &(10 * ONE));
         // Feeds price the vault at $1.00 deposit NAV: 100k USDC = the cap.
@@ -1532,7 +1481,6 @@ mod w3 {
     #[test]
     fn tvl_cap_enforced_across_users_and_max_views_are_exact() {
         let ctx = setup_test_context();
-        configure_vault_oracle_feeds(&ctx);
         ctx.vault_client.lower_caps(&(150 * ONE), &(100 * ONE));
         ctx.numeraire_admin.mint(&ctx.alice, &(1000 * ONE));
         ctx.numeraire_admin.mint(&ctx.bob, &(1000 * ONE));

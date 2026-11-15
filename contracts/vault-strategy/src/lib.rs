@@ -454,17 +454,9 @@ fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> Option<PriceDa
         .map(|s| !s.is_empty())
         .unwrap_or(false);
 
-    // Whole-vault oracle shortcut (tracked as audit V5; behaviour unchanged here).
-    let oracle = NavOracleClient::new(env, &config.oracle_contract);
-    let vault_sym = Symbol::new(env, "VAULT");
-    let shortcut = match kind {
-        NavKind::Deposit => oracle.get_deposit_nav(&vault_sym),
-        NavKind::Collateral => oracle.get_collateral_nav(&vault_sym),
-    };
-    if let Some(pd) = shortcut {
-        return Some(pd);
-    }
-
+    // Audit V5: the share price is ALWAYS derived from what the vault holds.
+    // There is no oracle override (the former "VAULT" pseudo-sleeve let the
+    // oracle admin set NAV per share directly).
     let (total_value, latest_ts) = holdings_value(env, config, kind).ok()?;
     let source = match kind {
         NavKind::Deposit => Symbol::new(env, "MEDIAN_NAV"),
@@ -1503,35 +1495,6 @@ impl StrategyVault {
                         }
                     }
                 }
-            }
-        }
-
-        let vault_sym = Symbol::new(&env, "VAULT");
-        let vault_src_ids = oracle.get_sleeve_sources(&vault_sym);
-        for src_id in vault_src_ids.iter() {
-            if let Some(src) = oracle.get_source(&src_id) {
-                let mut exists = false;
-                for s in sources.iter() {
-                    if s.source_id == src.source_id {
-                        exists = true;
-                        break;
-                    }
-                }
-                if !exists {
-                    sources.push_back(src);
-                }
-            }
-        }
-        if let Some(src) = oracle.get_source(&vault_sym) {
-            let mut exists = false;
-            for s in sources.iter() {
-                if s.source_id == src.source_id {
-                    exists = true;
-                    break;
-                }
-            }
-            if !exists {
-                sources.push_back(src);
             }
         }
 
