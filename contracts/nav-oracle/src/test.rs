@@ -1131,3 +1131,96 @@ fn golden_events_oracle() {
     g.capture(&env, "set_pause_authority");
     g.finish(&["PRICE_UPDATED", "NAV_PAUSE", "NAV_RESUME", "PAUSE_AUTHORITY_SET"]);
 }
+
+// -------------------------------------------------------------------------
+// Audit O6 (2026-11-15): prices are evaluated per ASSET. A sleeve may hold
+// several assets with different prices (USDC and EURC in cash; BENJI and USDY
+// in USD gov funds). Deviation, the 2-source minimum and median/minimum are
+// computed among the same asset's sources only (NAV-ORACLE Rules 3-5); the
+// sleeve remains the configuration and pause domain.
+// -------------------------------------------------------------------------
+mod o6 {
+    use super::*;
+
+    fn err(e: OracleError) -> Result<(), Result<soroban_sdk::Error, soroban_sdk::InvokeError>> {
+        Err(Ok(e.into()))
+    }
+
+    /// Sleeve "CASH" (2% threshold, >= 2 sources) holding X at $1.00 and Y at $1.08.
+    fn two_asset_sleeve(env: &Env) -> (NavOracleClient<'_>, Symbol, Address, Address) {
+        let (client, _admin, _base) = setup_oracle(env);
+        env.ledger().set_timestamp(1000);
+        let sleeve = Symbol::new(env, "CASH");
+        client.configure_sleeve(&sleeve, &200, &2);
+        let (x, y) = (Address::generate(env), Address::generate(env));
+        client.register_source(&create_source(env, "X_A", &x, "CASH", 1_000_000, 200_000, 1000));
+        client.register_source(&create_source(env, "X_B", &x, "CASH", 1_001_000, 200_000, 1000));
+        client.register_source(&create_source(env, "Y_A", &y, "CASH", 1_080_000, 200_000, 1000));
+        client.register_source(&create_source(env, "Y_B", &y, "CASH", 1_082_000, 200_000, 1000));
+        (client, sleeve, x, y)
+    }
+
+    #[test]
+    fn different_assets_in_one_sleeve_do_not_trip_the_breaker() {
+        let env = Env::default();
+        let (client, sleeve, x, y) = two_asset_sleeve(&env);
+        assert!(!client.is_sleeve_paused(&sleeve), "8% between two healthy assets is not a deviation");
+        assert_eq!(client.asset_price(&x).unwrap().price, 1_000_500); // median of X only
+        assert_eq!(client.asset_price(&y).unwrap().price, 1_081_000); // median of Y only
+        assert_eq!(client.price(&x).unwrap().price, 1_000_000); // conservative = min of X
+        assert_eq!(client.price(&y).unwrap().price, 1_080_000);
+        // A price update within one asset's own band keeps the sleeve live.
+        client.update_price(&Symbol::new(&env, "Y_B"), &1_085_000, &200_000, &1000);
+        assert!(!client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn a_deviating_asset_still_pauses_its_sleeve() {
+        let env = Env::default();
+        let (client, sleeve, x, y) = two_asset_sleeve(&env);
+        assert!(!client.is_sleeve_paused(&sleeve), "precondition: healthy sleeve is live");
+        client.update_price(&Symbol::new(&env, "Y_B"), &1_200_000, &200_000, &1000); // Y sources now 11% apart
+        assert!(client.is_sleeve_paused(&sleeve), "Rule 4: deviation pauses the affected sleeve");
+        assert_eq!(client.asset_price(&y), None);
+        assert_eq!(client.asset_price(&x), None, "the whole affected sleeve halts");
+    }
+
+    #[test]
+    fn the_two_source_minimum_is_per_asset() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        env.ledger().set_timestamp(1000);
+        let sleeve = Symbol::new(&env, "GOV");
+        client.configure_sleeve(&sleeve, &200, &2);
+        let (x, y) = (Address::generate(&env), Address::generate(&env));
+        client.register_source(&create_source(&env, "X_A", &x, "GOV", 1_000_000, 200_000, 1000));
+        client.register_source(&create_source(&env, "X_B", &x, "GOV", 1_000_000, 200_000, 1000));
+        client.register_source(&create_source(&env, "Y_ONLY", &y, "GOV", 1_000_000, 200_000, 1000));
+        assert!(client.asset_price(&x).is_some());
+        assert_eq!(client.asset_price(&y), None, "one source for Y must never price Y");
+        assert_eq!(client.price(&y), None);
+    }
+
+    #[test]
+    fn sleeve_level_nav_refuses_a_multi_asset_sleeve() {
+        let env = Env::default();
+        let (client, sleeve, x, _y) = two_asset_sleeve(&env);
+        assert!(!client.is_sleeve_paused(&sleeve), "precondition: refused for being multi-asset, not paused");
+        assert!(client.asset_price(&x).is_some());
+        assert_eq!(client.get_deposit_nav(&sleeve), None, "a blended price across assets is meaningless");
+        assert_eq!(client.get_collateral_nav(&sleeve), None);
+    }
+
+    #[test]
+    fn an_asset_lives_in_exactly_one_sleeve_and_sources_cannot_be_repointed() {
+        let env = Env::default();
+        let (client, _sleeve, x, y) = two_asset_sleeve(&env);
+        client.configure_sleeve(&Symbol::new(&env, "OTHER"), &200, &2);
+        let moved = create_source(&env, "X_C", &x, "OTHER", 1_000_000, 200_000, 1000);
+        assert_eq!(client.try_register_source(&moved), err(OracleError::AssetSleeveMismatch));
+        // Re-registering an existing source id for another asset is refused.
+        let hijack = create_source(&env, "X_A", &y, "CASH", 1_080_000, 200_000, 1000);
+        assert_eq!(client.try_register_source(&hijack), err(OracleError::AssetSleeveMismatch));
+        assert_eq!(client.get_source(&Symbol::new(&env, "X_A")).unwrap().asset, x);
+    }
+}
