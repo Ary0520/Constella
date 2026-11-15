@@ -105,9 +105,6 @@ pub enum DataKey {
 }
 
 pub trait NavOracleTrait {
-    /// Initialize oracle with admin, base asset (numéraire), decimals, and resolution
-    fn initialize(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32);
-
     /// Configure sleeve deviation threshold (bps) and min valid sources
     fn configure_sleeve(
         env: Env,
@@ -363,11 +360,10 @@ fn latch_deviation_on_write(env: &Env, sleeve_id: &Symbol) {
 pub struct NavOracle;
 
 #[contractimpl]
-impl NavOracleTrait for NavOracle {
-    fn initialize(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, OracleError::AlreadyInitialized);
-        }
+impl NavOracle {
+    /// Runs atomically as part of deployment, so no one can claim an
+    /// uninitialized oracle (audit M3). There is no `initialize` entrypoint.
+    pub fn __constructor(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::PauseAuthority, &admin);
         env.storage().instance().set(&DataKey::BaseAsset, &base_asset);
@@ -376,6 +372,10 @@ impl NavOracleTrait for NavOracle {
         let empty_assets: Vec<Address> = Vec::new(&env);
         env.storage().instance().set(&DataKey::AllAssets, &empty_assets);
     }
+}
+
+#[contractimpl]
+impl NavOracleTrait for NavOracle {
 
     fn configure_sleeve(
         env: Env,

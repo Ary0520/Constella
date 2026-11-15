@@ -95,9 +95,8 @@ fn setup_test_context() -> TestContext {
     // NAV oracle with USDC as numéraire. FIXTURE: every other asset is priced
     // at exactly 1.0 by two independent feeds (each under its own key), so the
     // legacy tests keep their meaning. P1 tests use a realistic EUR/USD rate.
-    let oracle_id = env.register(NavOracle, ());
+    let oracle_id = env.register(NavOracle, (admin.clone(), usdc_addr.clone(), 7u32, 300u32));
     let oracle = NavOracleClient::new(&env, &oracle_id);
-    oracle.initialize(&admin, &usdc_addr, &7, &300);
     for (addr, key) in [
         (&eurc_addr, "P_EURC"),
         (&benji_addr, "P_BENJI"),

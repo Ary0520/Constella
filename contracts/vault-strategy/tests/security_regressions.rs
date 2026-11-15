@@ -86,9 +86,8 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
     let policy_id = env.register(PolicyContract, ());
     let policy = PolicyContractClient::new(&env, &policy_id);
 
-    let oracle_id = env.register(NavOracle, ());
+    let oracle_id = env.register(NavOracle, (admin.clone(), usdc_addr.clone(), 7u32, 300u32));
     let oracle = NavOracleClient::new(&env, &oracle_id);
-    oracle.initialize(&admin, &usdc_addr, &7, &300);
     policy.initialize(&admin, &oracle_id);
     if vault_nav_feeds {
         oracle.configure_sleeve(&Symbol::new(&env, "VAULT"), &200, &2);
@@ -853,7 +852,7 @@ fn m3_fresh_deployments_cannot_be_taken_over() {
     let registry = env.register(AssetRegistry, (owner.clone(),));
     assert!(!stranger_initializes(&env, &registry, (attacker.clone(),).into_val(&env)), "registry hijack");
 
-    let oracle = env.register(NavOracle, ());
+    let oracle = env.register(NavOracle, (owner.clone(), usdc.clone(), 7u32, 300u32));
     assert!(!stranger_initializes(&env, &oracle, (attacker.clone(), usdc.clone(), 7u32, 300u32).into_val(&env)), "oracle hijack");
 
     let policy = env.register(PolicyContract, ());

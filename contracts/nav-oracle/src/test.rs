@@ -10,11 +10,10 @@ use soroban_sdk::{
 
 fn setup_oracle(env: &Env) -> (NavOracleClient<'_>, Address, Address) {
     env.mock_all_auths();
-    let contract_id = env.register(NavOracle, ());
-    let client = NavOracleClient::new(env, &contract_id);
     let admin = Address::generate(env);
     let base_asset = Address::generate(env);
-    client.initialize(&admin, &base_asset, &7, &300);
+    let contract_id = env.register(NavOracle, (admin.clone(), base_asset.clone(), 7u32, 300u32));
+    let client = NavOracleClient::new(env, &contract_id);
     (client, admin, base_asset)
 }
 
@@ -412,48 +411,34 @@ fn test_update_price_and_events() {
 #[test]
 fn test_uninitialized_and_authorization_checks() {
     let env = Env::default();
-    let contract_id = env.register(NavOracle, ());
-    let client = NavOracleClient::new(&env, &contract_id);
-
-    // Calling before initialization fails
-    assert_eq!(
-        client.try_get_admin(),
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            OracleError::NotInitialized as u32
-        )))
-    );
-    assert_eq!(
-        client.try_base(),
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            OracleError::NotInitialized as u32
-        )))
-    );
-    assert_eq!(
-        client.try_trigger_circuit_breaker(&Address::generate(&env), &Symbol::new(&env, "SLEEVE"), &Symbol::new(&env, "TEST")),
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            OracleError::NotInitialized as u32
-        )))
-    );
-
-    // Initialize
+    // Audit M3: configuration happens in the constructor, atomically with
+    // deployment; there is no uninitialized window and no `initialize`.
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let base = Address::generate(&env);
-    client.initialize(&admin, &base, &7, &300);
+    let contract_id = env.register(NavOracle, (admin.clone(), base.clone(), 7u32, 300u32));
+    let client = NavOracleClient::new(&env, &contract_id);
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.base(), base);
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "initialize"),
+        soroban_sdk::vec![
+            &env,
+            soroban_sdk::IntoVal::into_val(&Address::generate(&env), &env),
+            soroban_sdk::IntoVal::into_val(&base, &env),
+            soroban_sdk::IntoVal::into_val(&7u32, &env),
+            soroban_sdk::IntoVal::into_val(&300u32, &env),
+        ],
+    );
+    assert!(!matches!(r, Ok(Ok(()))));
+    assert_eq!(client.get_admin(), admin);
 
     // Trigger circuit breaker on non-existent sleeve fails
     assert_eq!(
         client.try_trigger_circuit_breaker(&admin, &Symbol::new(&env, "NON_EXISTENT"), &Symbol::new(&env, "TEST")),
         Err(Ok(soroban_sdk::Error::from_contract_error(
             OracleError::SleeveNotFound as u32
-        )))
-    );
-
-    // Duplicate initialization fails
-    assert_eq!(
-        client.try_initialize(&admin, &base, &7, &300),
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            OracleError::AlreadyInitialized as u32
         )))
     );
 

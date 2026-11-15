@@ -81,9 +81,8 @@ fn setup_test_context() -> TestContext<'static> {
     let policy_client = PolicyContractClient::new(&env, &policy_id);
 
     // Deploy Oracle
-    let oracle_id = env.register(NavOracle, ());
+    let oracle_id = env.register(NavOracle, (admin.clone(), numeraire_address.clone(), 7u32, 300u32));
     let oracle_client = NavOracleClient::new(&env, &oracle_id);
-    oracle_client.initialize(&admin, &numeraire_address, &7, &300);
     policy_client.initialize(&admin, &oracle_id);
 
     // Deploy Vault
