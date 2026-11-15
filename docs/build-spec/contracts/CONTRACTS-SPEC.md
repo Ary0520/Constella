@@ -251,6 +251,10 @@ pub struct RiskSheet {
 fn __constructor(env: Env, verifier: Address, owner_key: Bytes, name: String) // installs the owner rule
 fn __check_auth(env, payload: Hash<32>, sig: AuthPayload, contexts: Vec<Context>) // OZ do_check_auth
 fn get_owner_rule(env: Env) -> u32
+fn propose_recovery(env: Env, new_owner: Signer)   // guardians (recovery rule); executable after 48h
+fn cancel_recovery(env: Env)                       // owner rule only
+fn execute_recovery(env: Env)                      // anyone, once 48h have passed
+fn get_pending_recovery(env: Env) -> Option<PendingRecovery>
 // OZ SmartAccount: add_context_rule, get_context_rule(s_count), add/remove_signer,
 // add/remove_policy, update_context_rule_name / _valid_until, remove_context_rule,
 // get_signer_id, get_policy_id, auth_digest. No `execute`, no `initialize`.
@@ -267,14 +271,14 @@ fn set_threshold(env, threshold: u32, context_rule: ContextRule, smart_account: 
 
 **Rules:**
 - **Owner rule:** installed by the constructor. `Default` scope (any operation), owner passkey, no policies.
-- **Recovery rule:** added by the owner. `CallContract(self)` scope, so it can manage the account only. Guardian passkeys sit under an M-of-N threshold policy, so recovery can rotate the owner key but cannot move funds.
+- **Recovery rule:** added by the owner. `CallContract(self)` scope, with guardian passkeys under an M-of-N threshold policy. Guardians may only call `propose_recovery`; `__check_auth` refuses any other self-call made under a non-owner rule (`ManagementRequiresOwner`). The new key replaces the owner's after a 48 h delay, which the owner can cancel (D-F).
 - **Signed rule choice:** each operation is matched to the rule the signer chose, and that choice is signed. A passkey signs a WebAuthn assertion over `SHA-256(XDR(account, signature_payload, context_rule_ids))`.
 
 **Anti-bricking (Constella overrides of OZ defaults):**
 - The owner rule cannot be removed, cannot be given an expiry, and must keep at least one signer.
 - No signer removal may leave a threshold-governed rule with fewer signers than its threshold.
 
-**Errors:** `AccError` 1 `InvalidPublicKey`, 2 `OwnerRuleProtected`, 3 `OwnerRuleNeedsSigner`, 4 `ThresholdUnreachable`; OZ `SmartAccountError` 3000-3018, `WebAuthnError` 3110-3119, simple threshold 32xx.
+**Errors:** `AccError` 1 `InvalidPublicKey`, 2 `OwnerRuleProtected`, 3 `OwnerRuleNeedsSigner`, 4 `ThresholdUnreachable`, 5 `ManagementRequiresOwner`, 6 `NoPendingRecovery`, 7 `RecoveryNotReady`, 8 `AlreadyOwner`; OZ `SmartAccountError` 3000-3018, `WebAuthnError` 3110-3119, simple threshold 32xx.
 
 **Client requirements:**
 - Submit low-S P-256 signatures.
