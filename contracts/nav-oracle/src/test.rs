@@ -57,6 +57,9 @@ fn create_source(
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: depth,
         is_active: true,
+        // Each source has its own feeder key (audit O7a); tests that push
+        // prices under mock_all_auths do not depend on which address it is.
+        feeder: Address::generate(env),
     }
 }
 
@@ -1417,5 +1420,134 @@ mod w5 {
         let h = feed_client.prices(&Asset::Stellar(benji), &20).unwrap();
         assert_eq!(h.len(), 1, "the deviating write must not be recorded as a price");
         assert_eq!(h.get(0).unwrap().timestamp, 900);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit O7a (2026-11-15): the admin can no longer set prices. Each pushed
+// source has its own feeder key, and any change to the sources of an asset
+// that is already priced waits 48 hours (public, cancellable), so a single
+// key can neither write prices nor quietly swap in sources it controls.
+// -------------------------------------------------------------------------
+mod o7a {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    const T0: u64 = 10_000;
+    const DELAY: u64 = 48 * 3600;
+
+    struct Feed<'a> {
+        env: &'a Env,
+        client: NavOracleClient<'a>,
+        admin: Address,
+        asset: Address,
+        nav: OracleSource,
+        rfl: OracleSource,
+    }
+
+    /// Asset priced by two sources with distinct feeders (bootstrap: immediate).
+    fn feed(env: &Env) -> Feed<'_> {
+        let (client, admin, _base) = setup_oracle(env);
+        env.ledger().set_timestamp(T0);
+        client.configure_sleeve(&Symbol::new(env, "GOV"), &300, &2);
+        let asset = Address::generate(env);
+        let nav = create_source(env, "NAV", &asset, "GOV", 1_000_000, 200_000, T0);
+        let rfl = create_source(env, "RFL", &asset, "GOV", 1_002_000, 200_000, T0);
+        client.register_source(&nav);
+        client.register_source(&rfl);
+        assert_eq!(client.asset_price(&asset).unwrap().price, 1_001_000, "bootstrap takes effect immediately");
+        Feed { env, client, admin, asset, nav, rfl }
+    }
+
+    fn only(f: &Feed, who: &Address, fn_name: &'static str, args: soroban_sdk::Vec<soroban_sdk::Val>) {
+        f.env.mock_auths(&[MockAuth {
+            address: who,
+            invoke: &MockAuthInvoke { contract: &f.client.address, fn_name, args, sub_invokes: &[] },
+        }]);
+    }
+
+    fn push(f: &Feed, signer: &Address, id: &str, price: i128) -> bool {
+        let sym = Symbol::new(f.env, id);
+        let ts = f.env.ledger().timestamp();
+        only(f, signer, "update_price", (sym.clone(), price, 200_000i128, ts).into_val(f.env));
+        f.client.try_update_price(&sym, &price, &200_000, &ts).is_ok()
+    }
+
+    #[test]
+    fn only_the_sources_own_feeder_can_push_its_price() {
+        let env = Env::default();
+        let f = feed(&env);
+        assert!(!push(&f, &f.admin, "NAV", 1_001_000), "the admin must not be able to write prices");
+        assert!(!push(&f, &Address::generate(&env), "NAV", 1_001_000), "nor a stranger");
+        assert!(!push(&f, &f.rfl.feeder, "NAV", 1_001_000), "nor another source's feeder");
+        assert!(push(&f, &f.nav.feeder, "NAV", 1_001_000));
+        assert_eq!(env.auths()[0].0, f.nav.feeder);
+        assert_eq!(f.client.get_source(&Symbol::new(&env, "NAV")).unwrap().price, 1_001_000);
+    }
+
+    #[test]
+    fn a_new_source_for_a_priced_asset_waits_48_hours() {
+        let env = Env::default();
+        let f = feed(&env);
+        env.mock_all_auths();
+        let rogue = create_source(&env, "ROGUE", &f.asset, "GOV", 1_004_000, 200_000, T0);
+        f.client.register_source(&rogue);
+        let id = Symbol::new(&env, "ROGUE");
+        assert_eq!(f.client.get_source(&id), None, "not active yet");
+        assert_eq!(f.client.get_pending_source(&id).unwrap().effective_at, T0 + DELAY);
+        assert_eq!(f.client.asset_price(&f.asset).unwrap().price, 1_001_000, "price unchanged during the delay");
+
+        env.ledger().set_timestamp(T0 + DELAY - 1);
+        assert!(f.client.try_activate_source(&id).is_err());
+        env.ledger().set_timestamp(T0 + DELAY);
+        // Anyone may activate once the delay has passed.
+        env.mock_auths(&[]);
+        f.client.activate_source(&id);
+        assert!(f.client.get_source(&id).is_some());
+        assert_eq!(f.client.get_pending_source(&id), None);
+    }
+
+    #[test]
+    fn rotating_a_feeder_waits_48_hours_and_the_old_feeder_works_until_then() {
+        let env = Env::default();
+        let f = feed(&env);
+        let mut rotated = f.nav.clone();
+        rotated.feeder = Address::generate(&env);
+        only(&f, &f.admin, "register_source", (rotated.clone(),).into_val(&env));
+        f.client.register_source(&rotated);
+        assert!(push(&f, &f.nav.feeder, "NAV", 1_001_000), "old feeder still valid during the delay");
+        assert!(!push(&f, &rotated.feeder, "NAV", 1_001_000), "new feeder not yet");
+        env.ledger().set_timestamp(T0 + DELAY);
+        f.client.activate_source(&Symbol::new(&env, "NAV"));
+        assert!(push(&f, &rotated.feeder, "NAV", 1_001_000));
+        assert!(!push(&f, &f.nav.feeder, "NAV", 1_001_000), "old feeder revoked");
+    }
+
+    #[test]
+    fn the_admin_can_cancel_a_pending_change_and_deactivate_at_once() {
+        let env = Env::default();
+        let f = feed(&env);
+        env.mock_all_auths();
+        let rogue = create_source(&env, "ROGUE", &f.asset, "GOV", 1_004_000, 200_000, T0);
+        f.client.register_source(&rogue);
+        let id = Symbol::new(&env, "ROGUE");
+        only(&f, &f.admin, "cancel_source_change", (id.clone(),).into_val(&env));
+        f.client.cancel_source_change(&id);
+        assert_eq!(f.client.get_pending_source(&id), None);
+        env.ledger().set_timestamp(T0 + DELAY);
+        assert!(f.client.try_activate_source(&id).is_err());
+
+        // Removing a source is immediate: it can only halt pricing, never move it.
+        let rfl = Symbol::new(&env, "RFL");
+        only(&f, &f.admin, "deactivate_source", (rfl.clone(),).into_val(&env));
+        f.client.deactivate_source(&rfl);
+        assert_eq!(env.auths()[0].0, f.admin);
+        assert_eq!(f.client.asset_price(&f.asset), None, "one valid source left: hard stop (Rule 5)");
+        // Only the admin may cancel or deactivate.
+        let stranger = Address::generate(&env);
+        let nav = Symbol::new(&env, "NAV");
+        only(&f, &stranger, "deactivate_source", (nav.clone(),).into_val(&env));
+        assert!(f.client.try_deactivate_source(&nav).is_err());
     }
 }
