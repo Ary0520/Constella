@@ -1,4 +1,9 @@
 #![no_std]
+// TEMPORARY (audit W4.1, 15 Nov 2026): `Events::publish` is deprecated since
+// soroban-sdk 23 in favour of `#[contractevent]`. Publishing behaves exactly as
+// before; the migration to `#[contractevent]` (with byte-for-byte event
+// encoding tests) is sub-step W4.1b, which removes this allowance.
+#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
@@ -819,7 +824,7 @@ impl StrategyVault {
 
         token::Client::new(&env, &config.numeraire).transfer(
             &receiver,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &assets,
         );
 
@@ -866,7 +871,7 @@ impl StrategyVault {
 
         token::Client::new(&env, &config.numeraire).transfer(
             &receiver,
-            &env.current_contract_address(),
+            env.current_contract_address(),
             &assets,
         );
 
@@ -1707,7 +1712,8 @@ impl StrategyVault {
             (Symbol::new(&env, "UPGRADE"), config.admin),
             pending.wasm_hash.clone(),
         );
-        env.deployer().update_current_contract_wasm(pending.wasm_hash);
+        env.deployer()
+            .update_current_contract(soroban_sdk::ContractExecutable::Wasm(pending.wasm_hash));
     }
 
     /// Drop a proposed upgrade (admin).

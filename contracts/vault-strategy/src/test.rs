@@ -15,6 +15,27 @@ use soroban_sdk::{
     Address, Env, String, Symbol, Vec as SdkVec,
 };
 
+/// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
+/// `(contract, topics, data)` tuples these assertions use - the same mapping
+/// the SDK applies in its own `PartialEq` for `ContractEvents` (W4.1).
+fn all_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, TryFromVal};
+    let mut out = soroban_sdk::Vec::new(env);
+    for e in env.events().all().events() {
+        let Some(id) = e.contract_id.clone() else { continue };
+        let addr = soroban_sdk::Address::try_from_val(env, &xdr::ScAddress::Contract(id)).unwrap();
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let mut topics = soroban_sdk::Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(soroban_sdk::Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((addr, topics, soroban_sdk::Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
+
 #[allow(dead_code)]
 struct TestContext<'a> {
     env: Env,
@@ -1729,7 +1750,6 @@ mod m4 {
 // -------------------------------------------------------------------------
 mod m2 {
     use super::*;
-    use soroban_sdk::testutils::Events;
     use soroban_sdk::{FromVal, SymbolStr, TryFromVal, Val};
 
     const STANDARD: [&str; 6] = ["transfer", "approve", "mint", "burn", "deposit", "withdraw"];
@@ -1744,7 +1764,7 @@ mod m2 {
     /// Every event the vault emitted in the last call follows Rule 8.
     fn check_names(ctx: &TestContext) -> usize {
         let mut seen = 0;
-        for (contract, topics, _) in ctx.env.events().all().iter() {
+        for (contract, topics, _) in all_events(&ctx.env).iter() {
             if contract != ctx.vault_id {
                 continue;
             }
@@ -1792,7 +1812,7 @@ mod m2 {
         let ctx = setup_test_context();
         ctx.numeraire_admin.mint(&ctx.alice, &(100 * 10_000_000));
         ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice);
-        let dep = ctx.env.events().all().iter()
+        let dep = all_events(&ctx.env).iter()
             .find(|(c, t, _)| *c == ctx.vault_id && name_of(&ctx.env, &t.get(0).unwrap()) == "deposit")
             .expect("deposit event");
         assert_eq!(dep.1.len(), 4, "deposit topics: [deposit, operator, from, receiver]");
@@ -1803,7 +1823,7 @@ mod m2 {
         assert_eq!((assets, shares), (100 * 10_000_000, 100 * 10_000_000));
 
         ctx.vault_client.redeem(&(40 * 10_000_000), &ctx.bob, &ctx.alice);
-        let wd = ctx.env.events().all().iter()
+        let wd = all_events(&ctx.env).iter()
             .find(|(c, t, _)| *c == ctx.vault_id && name_of(&ctx.env, &t.get(0).unwrap()) == "withdraw")
             .expect("withdraw event");
         assert_eq!(wd.1.len(), 4, "withdraw topics: [withdraw, operator, receiver, owner]");

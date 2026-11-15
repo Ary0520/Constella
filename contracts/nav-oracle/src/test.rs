@@ -4,9 +4,30 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events, Ledger},
+    testutils::{Address as _, Ledger},
     Address, Env, Symbol, TryFromVal,
 };
+
+/// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
+/// `(contract, topics, data)` tuples these assertions use - the same mapping
+/// the SDK applies in its own `PartialEq` for `ContractEvents` (W4.1).
+fn all_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, TryFromVal};
+    let mut out = soroban_sdk::Vec::new(env);
+    for e in env.events().all().events() {
+        let Some(id) = e.contract_id.clone() else { continue };
+        let addr = soroban_sdk::Address::try_from_val(env, &xdr::ScAddress::Contract(id)).unwrap();
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let mut topics = soroban_sdk::Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(soroban_sdk::Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((addr, topics, soroban_sdk::Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
 
 fn setup_oracle(env: &Env) -> (NavOracleClient<'_>, Address, Address) {
     env.mock_all_auths();
@@ -197,7 +218,7 @@ fn test_t37_deviation_circuit_breaker() {
     client.register_source(&s2);
     // Audit O4: deviation latches and NAV_PAUSE is emitted in the call that
     // adds the deviating feed (persisted even if a later caller reverts).
-    let events = env.events().all();
+    let events = all_events(&env);
 
     // Query triggers circuit breaker and returns None
     assert!(client.get_collateral_nav(&sleeve).is_none());
@@ -276,7 +297,7 @@ fn test_t38_per_sleeve_isolation() {
     client.clear_circuit_breaker(&sleeve_gov);
 
     // Verify NAV_RESUME event IMMEDIATELY after clear_circuit_breaker
-    let events = env.events().all();
+    let events = all_events(&env);
     let resume_sym = Symbol::new(&env, "NAV_RESUME");
     let mut found_resume = false;
     for event in events.iter() {
@@ -382,7 +403,7 @@ fn test_update_price_and_events() {
     client.update_price(&Symbol::new(&env, "BENJI_NAV"), &1_050_000, &250_000, &1500);
 
     // Verify PRICE_UPDATED event IMMEDIATELY after update_price
-    let events = env.events().all();
+    let events = all_events(&env);
     let price_updated_sym = Symbol::new(&env, "PRICE_UPDATED");
     let mut found_update_event = false;
     for event in events.iter() {
@@ -534,7 +555,7 @@ fn test_extreme_price_difference_no_overflow() {
     client.register_source(&s2);
     // Audit O4: deviation latches and NAV_PAUSE is emitted in the call that
     // adds the deviating feed (persisted even if a later caller reverts).
-    let events = env.events().all();
+    let events = all_events(&env);
 
     // Calling get_collateral_nav must trip deviation circuit breaker WITHOUT PANICKING from integer overflow
     assert!(client.get_collateral_nav(&sleeve).is_none());
@@ -782,7 +803,7 @@ mod o4 {
 
     fn deviation_event_bps(env: &Env, sleeve: &Symbol) -> Option<u32> {
         let nav_pause = Symbol::new(env, "NAV_PAUSE");
-        for (_cid, topics, data) in env.events().all().iter() {
+        for (_cid, topics, data) in all_events(env).iter() {
             if topics.len() >= 2
                 && Symbol::try_from_val(env, &topics.get(0).unwrap()) == Ok(nav_pause.clone())
                 && Symbol::try_from_val(env, &topics.get(1).unwrap()) == Ok(sleeve.clone())

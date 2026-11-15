@@ -4,9 +4,30 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events},
+    testutils::Address as _,
     vec, Address, Env, Symbol,
 };
+
+/// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
+/// `(contract, topics, data)` tuples these assertions use - the same mapping
+/// the SDK applies in its own `PartialEq` for `ContractEvents` (W4.1).
+fn all_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, TryFromVal};
+    let mut out = soroban_sdk::Vec::new(env);
+    for e in env.events().all().events() {
+        let Some(id) = e.contract_id.clone() else { continue };
+        let addr = soroban_sdk::Address::try_from_val(env, &xdr::ScAddress::Contract(id)).unwrap();
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let mut topics = soroban_sdk::Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(soroban_sdk::Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((addr, topics, soroban_sdk::Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
 
 /// Issuer per REGISTRY.md (USDC and EURC are both Circle).
 fn issuer_of(asset_id: &str) -> &'static str {
@@ -344,7 +365,7 @@ fn test_t25_event_emissions_verification() {
 
     use soroban_sdk::TryFromVal;
 
-    let events = env.events().all();
+    let events = all_events(&env);
     assert!(!events.is_empty());
 
     let asset_added_sym = Symbol::new(&env, "ASSET_ADDED");
@@ -369,7 +390,7 @@ fn test_t25_event_emissions_verification() {
     // Deactivate asset emits ASSET_DEACTIVATED
     client.deactivate_asset(&Symbol::new(&env, "USDC"));
 
-    let events = env.events().all();
+    let events = all_events(&env);
     let asset_deactivated_sym = Symbol::new(&env, "ASSET_DEACTIVATED");
 
     let mut found_deactivated = false;

@@ -10,6 +10,27 @@ use soroban_sdk::{
     vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
+/// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
+/// `(contract, topics, data)` tuples these assertions use - the same mapping
+/// the SDK applies in its own `PartialEq` for `ContractEvents` (W4.1).
+fn all_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, TryFromVal};
+    let mut out = soroban_sdk::Vec::new(env);
+    for e in env.events().all().events() {
+        let Some(id) = e.contract_id.clone() else { continue };
+        let addr = soroban_sdk::Address::try_from_val(env, &xdr::ScAddress::Contract(id)).unwrap();
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let mut topics = soroban_sdk::Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(soroban_sdk::Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((addr, topics, soroban_sdk::Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
+
 struct KeyPair {
     signing_key: SigningKey,
     public_key_bytes: BytesN<65>,
@@ -747,7 +768,6 @@ fn m3_fresh_account_cannot_be_claimed_by_a_stranger() {
 // -------------------------------------------------------------------------
 #[test]
 fn m2_every_account_event_follows_rule_8() {
-    use soroban_sdk::testutils::Events;
     use soroban_sdk::{FromVal, SymbolStr, TryFromVal};
     let env = Env::default();
     env.mock_all_auths();
@@ -756,7 +776,7 @@ fn m2_every_account_event_follows_rule_8() {
     let client = SmartAccountContractClient::new(&env, &id);
     let check = |env: &Env| -> usize {
         let mut n = 0;
-        for (c, topics, _) in env.events().all().iter() {
+        for (c, topics, _) in all_events(env).iter() {
             if c != id { continue; }
             let sym = Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap();
             let s = SymbolStr::from_val(env, &sym.to_symbol_val());

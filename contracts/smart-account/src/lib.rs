@@ -1,4 +1,9 @@
 #![no_std]
+// TEMPORARY (audit W4.1, 15 Nov 2026): `Events::publish` is deprecated since
+// soroban-sdk 23 in favour of `#[contractevent]`. Publishing behaves exactly as
+// before; the migration to `#[contractevent]` (with byte-for-byte event
+// encoding tests) is sub-step W4.1b, which removes this allowance.
+#![allow(deprecated)]
 
 use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
