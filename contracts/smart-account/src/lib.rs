@@ -394,3 +394,7 @@ impl SmartAccountContract {
         signers
     }
 }
+
+#[cfg(test)]
+mod test;
+
