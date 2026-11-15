@@ -114,7 +114,7 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 | **Worst-case exit time** | Slowest plausible full exit scenario |
 
 **UI requirements (non-negotiable):**
-> Every simulation screen MUST display: *"This is a risk and liquidity simulation, not a performance forecast. Historical data does not predict future returns."*
+> Every simulation screen MUST display the canonical disclaimer from `AGENT-RULES.md` Rule 10: *"This simulation uses historical data. Past performance does not predict future returns. This is not financial advice."*
 
 - Label clearly: "Simulation" not "Backtest"
 - Simulation is free and unlimited; no money moves until user explicitly initiates
@@ -143,9 +143,10 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 1. Engine generates the final Policy object (not a draft — final)
 2. Policy is serialized to canonical JSON (deterministic field ordering)
 3. Policy hash = SHA-256(canonical JSON)
-4. User (or multisig) signs the policy hash via Stellar smart account
-5. Policy contract on-chain stores the hash
-6. Vault is instantiated against this policy hash
+4. User (or multisig) — the policy *owner* — signs the policy hash together with every enforced term
+   (Soroban authorization of `register_policy`, invoked by the vault through `vault.bind_policy`)
+5. Policy contract on-chain stores the hash, the terms, and terms_hash = SHA-256(XDR(terms))
+6. Vault is bound to this policy; only the owner can amend it later (re-sign `update_policy`), and an amendment takes effect only after a notice period of at least 48h so holders can exit first
 7. The on-chain vault enforces only operations consistent with the signed policy
 ```
 

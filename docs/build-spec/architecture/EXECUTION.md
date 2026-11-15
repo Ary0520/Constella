@@ -50,7 +50,8 @@ Policy contract checks the proposal against:
 - [ ] Weight bands (post-trade weights within min/max for all sleeves)
 - [ ] Issuer caps (no issuer exceeds its cap post-trade)
 - [ ] Liquidity floor (liquidity sleeve stays ≥ minimum)
-- [ ] Asset exclusions (no excluded asset is bought)
+- [x] Asset exclusions (no excluded asset is bought) — enforced as an allow-list: only assets declared in the signed sleeves (non-zero band) may be bought (audit M1)
+- [x] Proposal names the current policy hash; proposals built for an amended policy are void (audit M1)
 - [ ] Slippage cap (estimated slippage ≤ cap per route)
 - [ ] Eligible assets only (all assets in registry and eligible)
 
@@ -119,6 +120,7 @@ trait IssuerAdapter {
 | SDEX | 3 | 0.3% | Classic DEX; thin for most assets |
 
 **Rules:**
+- Slippage is measured in value against the oracle's fair price for each asset (audit P1), so cross-currency legs (e.g. USDC ↔ EURC) are judged on real loss, not token counts
 - If a route would exceed the slippage cap: skip that route, try next
 - If all routes exceed cap: **abort that trade leg**, leave sleeve slightly out-of-band, alert operators
 - Never force a trade into a thin market

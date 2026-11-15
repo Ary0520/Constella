@@ -53,6 +53,7 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 - If an issuer freezes an asset: the **sleeve** is frozen, not the entire basket
   - Remaining sleeves continue to operate
   - Redemptions from frozen sleeve are queued
+  - **Implementation status (15 Nov 2026):** a frozen or unpriced sleeve that holds nothing is skipped when pricing shares, so it never blocks the vault (audit V3). A *funded* frozen sleeve currently hard-stops pricing; queued in-kind claims are tracked as audit V6 and ship with rebalance execution (W1).
 
 ---
 
@@ -64,6 +65,8 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 | Choices | USDC or EURC |
 | Why one? | Keeps SEP-56 compatible; simplifies NAV calculation |
 | Currency matching | A euro-currency basket uses EURC as numéraire |
+| Must be registered | The numéraire must be an active **Cash** entry in the registry, or the vault cannot be deployed (audit M4) |
+| Labels | Every sleeve's label is its registry asset ID (e.g. the cash sleeve of a EURC vault is `EURC`); free-text labels are rejected (audit M4) |
 
 ---
 
@@ -79,6 +82,10 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 | Large exits | Queued redemption; where issuer allows, redemption in kind |
 | Collateral liquidations | Liquidator draws from liquidity sleeve; policy contract validates |
 
+**Share price source (audit V5, 15 Nov 2026):** the share price is always computed from the vault's own holdings; no oracle feed can override it. The vault *publishes* its NAV for lenders; it never reads its NAV from an oracle.
+
+**Valuation rule (audit V4, 15 Nov 2026):** every valuation — deposit NAV, conservative NAV, `total_assets`, redemption capacity, risk sheet — uses one function. Cash counts at face value; an empty sleeve counts as 0; a funded non-cash sleeve must have a valid oracle price or the call fails with `OracleUnavailable`. There is never a par (1.0) fallback.
+
 **Rule:** The policy contract MUST enforce the liquidity floor at all times. Any rebalance that would bring the liquidity sleeve below the floor is rejected.
 
 ---
@@ -91,7 +98,7 @@ A vault logically partitions its holdings into named sleeves:
 Vault (USDC numéraire)
 ├── Sleeve: CASH_STABLE        → USDC, EURC          (5–15% by default)
 ├── Sleeve: USD_GOV_FUNDS      → BENJI, USDY, Spiko  (up to 70%)
-├── Sleeve: EURO_SOVEREIGN     → Spiko EUR, GOVY      (up to 20%)
+├── Sleeve: EUR_SOVEREIGN      → Spiko EUR, GOVY      (up to 20%)
 ├── Sleeve: YIELD_DOLLAR       → YLDS, wYLDS           (up to 20%)
 ├── Sleeve: LENDING            → Blend/DeFindex        (up to 15%)
 ├── Sleeve: EQUITY             → JQQQ, DTC stocks     (future, gated)
@@ -173,6 +180,8 @@ Can liquidity sleeve cover it?
 ---
 
 ## Upgrade Strategy
+
+**Timelock (audit W3, 15 Nov 2026):** upgrades are two-step on-chain — `propose_upgrade(hash)` then, no earlier than 48h later, `execute_upgrade()` — so the public notice below is enforced by the contract, not just process. `cancel_upgrade()` drops a proposal.
 
 Using Adapter (Protocol 28, CAP-85):
 - All vault instances share one WASM binary

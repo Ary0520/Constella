@@ -1,7 +1,7 @@
 # Slice 5 Micro-Spec: Policy Storage & Rebalance Guardrails Contract (Soroban Rust)
 
 > **Module:** `contracts/policy`  
-> **Status:** Specification & Plan Phase (Pre-Implementation)  
+> **Status:** Implemented (code + tests on main). Open findings tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/contracts/CONTRACTS-SPEC.md`](../build-spec/contracts/CONTRACTS-SPEC.md#L71-L112), [`docs/build-spec/architecture/EXECUTION.md`](../build-spec/architecture/EXECUTION.md#L33-L85), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 5, 6, 8, 11, 12)
 
 ---
@@ -29,13 +29,16 @@ Implement and verify the on-chain Policy Storage & Validation contract in Soroba
 ```rust
 #[contractclient(name = "PolicyContractClient")]
 pub trait PolicyContractTrait {
-    /// Initialize the policy contract with a governance admin
-    fn initialize(env: Env, admin: Address);
+    /// Initialize with a governance admin and the (immutable) NAV oracle used
+    /// to value trade legs for slippage (audit P1).
+    fn __constructor(env: Env, admin: Address, oracle: Address); // audit M3: atomic at deployment
 
-    /// Register a signed policy hash and configuration for a vault
+    /// Register a signed policy (requires vault + owner auth; one-time).
+    /// Updated 15 Nov 2026 for audit P3 — see CONTRACTS-SPEC.md "Signing model".
     fn register_policy(
         env: Env,
         vault: Address,
+        owner: Address,
         policy_hash: BytesN<32>,
         registry_address: Address,
         min_liquidity_sleeve_bps: u32,
@@ -46,11 +49,17 @@ pub trait PolicyContractTrait {
         sleeves: Vec<SleeveTarget>,
     );
 
-    /// Update a vault's policy hash upon user re-signing
+    /// Propose an amendment (owner signature). Takes effect only via
+    /// activate_policy_update after the notice period (>= 48h, audit P4).
     fn update_policy(
         env: Env,
         vault: Address,
         new_hash: BytesN<32>,
+        min_liquidity_sleeve_bps: u32,
+        max_single_asset_bps: u32,
+        max_issuer_bps: u32,
+        max_slippage_bps: u32,
+        rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     );
 

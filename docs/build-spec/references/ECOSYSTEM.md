@@ -25,7 +25,7 @@
 
 | Protocol | Category | TVL (Nov 2026) | Significance to Constella |
 |---|---|---|---|
-| **Blend Protocol** | Decentralized Money Market | ~$140M–$145M | Dominant lending venue; primary target for basket collateral listing |
+| **Blend Protocol** | Decentralized Money Market | ~$105M (Blend Pools V2, 15 Nov 2026) | Dominant lending venue; primary target for basket collateral listing |
 | **Liqvid** | RWA Collateral Lending | Seed / SCF #45 | Purpose-built for RWA collateral; launch co-design partner |
 | **Lucent Finance** | Institutional Lending Pool | Emerging | Secondary institutional money market |
 | **DeFindex** | Yield Strategy Aggregator | ~$18.5M | Candidate yield sleeve for liquid cash USDC |

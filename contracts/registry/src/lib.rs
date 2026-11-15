@@ -15,6 +15,8 @@ pub enum RegistryError {
     AddressAlreadyRegistered = 4,
     InvalidLiquidityTier = 5,
     EmptyOracleSources = 6,
+    /// Every asset must name its issuer (used for issuer concentration caps).
+    EmptyIssuer = 7,
 }
 
 #[contracttype]
@@ -35,6 +37,8 @@ pub enum SleeveType {
 pub struct AssetEntry {
     pub contract_address: Address,
     pub asset_id: Symbol,
+    /// Legal issuer, e.g. CIRCLE for both USDC and EURC (audit P2).
+    pub issuer: Symbol,
     pub sleeve_type: SleeveType,
     pub liquidity_tier: u32, // 0=instant, 1=24h, 2=1week, 3=illiquid
     pub permissionless: bool,
@@ -56,9 +60,6 @@ pub enum DataKey {
 }
 
 pub trait AssetRegistryTrait {
-    /// Initialize the registry with an authorized admin address (multisig)
-    fn initialize(env: Env, admin: Address);
-
     /// Add an approved asset to the closed universe (admin only)
     fn add_asset(env: Env, entry: AssetEntry);
 
@@ -85,13 +86,16 @@ pub trait AssetRegistryTrait {
 pub struct AssetRegistry;
 
 #[contractimpl]
-impl AssetRegistryTrait for AssetRegistry {
-    fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, RegistryError::AlreadyInitialized);
-        }
+impl AssetRegistry {
+    /// Runs atomically as part of deployment, so no one can claim an
+    /// uninitialized registry (audit M3). There is no `initialize` entrypoint.
+    pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
+}
+
+#[contractimpl]
+impl AssetRegistryTrait for AssetRegistry {
 
     fn add_asset(env: Env, entry: AssetEntry) {
         let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
@@ -106,6 +110,9 @@ impl AssetRegistryTrait for AssetRegistry {
         }
         if entry.oracle_sources.is_empty() {
             panic_with_error!(&env, RegistryError::EmptyOracleSources);
+        }
+        if entry.issuer == Symbol::new(&env, "") {
+            panic_with_error!(&env, RegistryError::EmptyIssuer);
         }
 
         // Validate contract address uniqueness:

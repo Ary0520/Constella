@@ -62,23 +62,20 @@ pub struct FeeSponsorContract;
 
 #[contractimpl]
 impl FeeSponsorContract {
-    /// Initialize fee sponsorship guardrails with rate limits and daily budget
-    pub fn initialize(
+    /// Configure guardrails at deployment (atomic, so no one can claim an
+    /// uninitialized sponsor - audit M3). There is no `initialize` entrypoint.
+    pub fn __constructor(
         env: Env,
         admin: Address,
         max_ops_per_hour: u32,
         max_ops_per_day: u32,
         daily_budget_stroops: u64,
-    ) -> Result<(), SponsorError> {
-        if env.storage().instance().has(&DataKey::Config) {
-            return Err(SponsorError::AlreadyInitialized);
-        }
-
+    ) {
         if max_ops_per_hour == 0
             || max_ops_per_day < max_ops_per_hour
             || daily_budget_stroops == 0
         {
-            return Err(SponsorError::InvalidConfig);
+            soroban_sdk::panic_with_error!(&env, SponsorError::InvalidConfig);
         }
 
         let config = SponsorConfig {
@@ -106,11 +103,10 @@ impl FeeSponsorContract {
             .set(&DataKey::WhitelistList, &empty_list);
 
         env.events().publish(
-            (Symbol::new(&env, "sponsor_initialized"), admin),
+            (Symbol::new(&env, "SPONSOR_INITIALIZED"), admin),
             daily_budget_stroops,
         );
 
-        Ok(())
     }
 
     /// Whitelist an approved Constella contract (e.g. strategy vault, policy) for sponsored gas
@@ -138,7 +134,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::WhitelistList, &list);
 
         env.events().publish(
-            (Symbol::new(&env, "contract_whitelisted"), config.admin),
+            (Symbol::new(&env, "CONTRACT_WHITELISTED"), config.admin),
             target,
         );
 
@@ -179,7 +175,7 @@ impl FeeSponsorContract {
             .set(&DataKey::WhitelistList, &new_list);
 
         env.events().publish(
-            (Symbol::new(&env, "contract_unwhitelisted"), config.admin),
+            (Symbol::new(&env, "CONTRACT_UNWHITELISTED"), config.admin),
             target,
         );
 
@@ -285,7 +281,7 @@ impl FeeSponsorContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "sponsored_op"),
+                Symbol::new(&env, "SPONSORED_OP"),
                 user,
                 target_contract,
             ),
@@ -318,7 +314,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events().publish(
-            (Symbol::new(&env, "limits_updated"), config.admin),
+            (Symbol::new(&env, "LIMITS_UPDATED"), config.admin),
             daily_budget_stroops,
         );
 
@@ -333,7 +329,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events().publish(
-            (Symbol::new(&env, "sponsor_admin_transferred"), old_admin),
+            (Symbol::new(&env, "SPONSOR_ADMIN_TRANSFERRED"), old_admin),
             new_admin,
         );
 
@@ -347,7 +343,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events()
-            .publish((Symbol::new(&env, "sponsor_paused"), config.admin), ());
+            .publish((Symbol::new(&env, "SPONSOR_PAUSED"), config.admin), ());
 
         Ok(())
     }
@@ -359,7 +355,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events()
-            .publish((Symbol::new(&env, "sponsor_unpaused"), config.admin), ());
+            .publish((Symbol::new(&env, "SPONSOR_UNPAUSED"), config.admin), ());
 
         Ok(())
     }

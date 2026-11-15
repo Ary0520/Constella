@@ -4,6 +4,7 @@
 extern crate std;
 
 use super::*;
+use constella_nav_oracle::{NavOracle, NavOracleClient, OracleSource};
 use constella_registry::{AssetEntry, AssetRegistry, AssetRegistryClient, SleeveType};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
@@ -14,6 +15,7 @@ use soroban_sdk::{
 struct TestContext {
     env: Env,
     admin: Address,
+    owner: Address,
     vault: Address,
     proposer: Address,
     registry_address: Address,
@@ -26,6 +28,7 @@ struct TestContext {
     usdf_addr: Address,
     deactivated_addr: Address,
     unregistered_addr: Address,
+    oracle_address: Address,
 }
 
 fn register_registry_asset(
@@ -33,11 +36,13 @@ fn register_registry_asset(
     registry_client: &AssetRegistryClient,
     contract_addr: &Address,
     asset_id: &str,
+    issuer: &str,
     sleeve: SleeveType,
 ) {
     let entry = AssetEntry {
         contract_address: contract_addr.clone(),
         asset_id: Symbol::new(env, asset_id),
+        issuer: Symbol::new(env, issuer),
         sleeve_type: sleeve,
         liquidity_tier: 0,
         permissionless: true,
@@ -57,42 +62,58 @@ fn setup_test_context() -> TestContext {
     env.ledger().set_timestamp(1731600000);
 
     let admin = Address::generate(&env);
+    let owner = Address::generate(&env);
     let vault = Address::generate(&env);
     let proposer = Address::generate(&env);
 
     // Register closed universe asset registry
-    let reg_id = env.register(AssetRegistry, ());
+    let reg_id = env.register(AssetRegistry, (admin.clone(),));
     let reg_client = AssetRegistryClient::new(&env, &reg_id);
-    reg_client.initialize(&admin);
 
-    let usdc_addr = Address::generate(&env);
-    let eurc_addr = Address::generate(&env);
-    let benji_addr = Address::generate(&env);
-    let eustbl_addr = Address::generate(&env);
-    let blend_addr = Address::generate(&env);
-    let usdf_addr = Address::generate(&env);
-    let deactivated_addr = Address::generate(&env);
-    let unregistered_addr = Address::generate(&env);
+    // Real token contracts (SACs, 7 decimals): slippage valuation reads decimals.
+    let token = |env: &Env| env.register_stellar_asset_contract_v2(Address::generate(env)).address();
+    let usdc_addr = token(&env);
+    let eurc_addr = token(&env);
+    let benji_addr = token(&env);
+    let eustbl_addr = token(&env);
+    let blend_addr = token(&env);
+    let usdf_addr = token(&env);
+    let deactivated_addr = token(&env);
+    let unregistered_addr = token(&env);
 
-    register_registry_asset(&env, &reg_client, &usdc_addr, "CIRCLE_USDC", SleeveType::Cash);
-    register_registry_asset(&env, &reg_client, &eurc_addr, "CIRCLE_EURC", SleeveType::Cash);
-    register_registry_asset(&env, &reg_client, &benji_addr, "FRANKLIN_BENJI", SleeveType::UsdGovFund);
-    register_registry_asset(&env, &reg_client, &eustbl_addr, "SPIKO_EUSTBL", SleeveType::EurSovereign);
-    register_registry_asset(&env, &reg_client, &blend_addr, "BLEND_BLND", SleeveType::UsdGovFund);
-    register_registry_asset(&env, &reg_client, &usdf_addr, "FRANKLIN_USDF", SleeveType::UsdGovFund);
-    register_registry_asset(&env, &reg_client, &deactivated_addr, "RISKY_TOKEN", SleeveType::YieldUsd);
+    register_registry_asset(&env, &reg_client, &usdc_addr, "CIRCLE_USDC", "CIRCLE", SleeveType::Cash);
+    register_registry_asset(&env, &reg_client, &eurc_addr, "CIRCLE_EURC", "CIRCLE", SleeveType::Cash);
+    register_registry_asset(&env, &reg_client, &benji_addr, "FRANKLIN_BENJI", "FRANKLIN_TEMPLETON", SleeveType::UsdGovFund);
+    register_registry_asset(&env, &reg_client, &eustbl_addr, "SPIKO_EUSTBL", "SPIKO", SleeveType::EurSovereign);
+    register_registry_asset(&env, &reg_client, &blend_addr, "BLEND_BLND", "BLEND", SleeveType::UsdGovFund);
+    register_registry_asset(&env, &reg_client, &usdf_addr, "FRANKLIN_USDF", "FRANKLIN_TEMPLETON", SleeveType::UsdGovFund);
+    register_registry_asset(&env, &reg_client, &deactivated_addr, "RISKY_TOKEN", "RISKY_ISSUER", SleeveType::YieldUsd);
 
     // Deactivate the deactivated asset
     reg_client.deactivate_asset(&Symbol::new(&env, "RISKY_TOKEN"));
 
+    // NAV oracle with USDC as numéraire. FIXTURE: every other asset is priced
+    // at exactly 1.0 by two independent feeds (each under its own key), so the
+    // legacy tests keep their meaning. P1 tests use a realistic EUR/USD rate.
+    let oracle_id = env.register(NavOracle, (admin.clone(), usdc_addr.clone(), 7u32, 300u32));
+    let oracle = NavOracleClient::new(&env, &oracle_id);
+    for (addr, key) in [
+        (&eurc_addr, "P_EURC"),
+        (&benji_addr, "P_BENJI"),
+        (&eustbl_addr, "P_EUSTBL"),
+        (&blend_addr, "P_BLEND"),
+        (&usdf_addr, "P_USDF"),
+    ] {
+        price_asset(&env, &oracle, addr, key, 10_000_000);
+    }
+
     // Register policy contract
-    let policy_id = env.register(PolicyContract, ());
-    let policy_client = PolicyContractClient::new(&env, &policy_id);
-    policy_client.initialize(&admin);
+    let policy_id = env.register(PolicyContract, (admin.clone(), oracle_id.clone()));
 
     TestContext {
         env,
         admin,
+        owner,
         vault,
         proposer,
         registry_address: reg_id,
@@ -105,7 +126,38 @@ fn setup_test_context() -> TestContext {
         usdf_addr,
         deactivated_addr,
         unregistered_addr,
+        oracle_address: oracle_id,
     }
+}
+
+/// Two independent, deep, fresh feeds for `asset` at `price` (7 decimals).
+fn price_asset(env: &Env, oracle: &NavOracleClient, asset: &Address, key: &str, price: i128) {
+    let sleeve = Symbol::new(env, key);
+    oracle.configure_sleeve(&sleeve, &200, &2);
+    for suffix in ["_A", "_B"] {
+        let mut id = std::string::String::from(key);
+        id.push_str(suffix);
+        oracle.register_source(&OracleSource {
+            source_id: Symbol::new(env, &id),
+            asset: asset.clone(),
+            sleeve: sleeve.clone(),
+            price,
+            timestamp: env.ledger().timestamp(),
+            staleness_limit_seconds: 14_400,
+            min_liquidity_depth_usd: 100_000,
+            current_liquidity_depth_usd: 200_000,
+            is_active: true,
+        });
+    }
+}
+
+/// The vault's currently registered policy hash - what an honest keeper builds
+/// its proposal against - or all zeros if no policy is registered.
+fn current_policy_hash(env: &Env, policy: &Address, vault: &Address) -> BytesN<32> {
+    PolicyContractClient::new(env, policy)
+        .get_policy_config(vault)
+        .map(|c| c.policy_hash)
+        .unwrap_or(BytesN::from_array(env, &[0u8; 32]))
 }
 
 fn sample_sleeves(env: &Env) -> Vec<SleeveTarget> {
@@ -167,6 +219,7 @@ fn test_t26_policy_registration_and_hash_storage() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000, // min_liquidity_sleeve_bps
@@ -202,16 +255,23 @@ fn test_t26_policy_registration_and_hash_storage() {
     assert_eq!(config.max_slippage_bps, 50);
     assert_eq!(config.rebalance_band_bps, 500);
     assert_eq!(config.is_active, true);
-    assert_eq!(config.admin, ctx.admin);
+    assert_eq!(config.owner, ctx.owner);
+    assert_eq!(
+        config.terms_hash,
+        compute_terms_hash(&ctx.env, &ctx.registry_address, 1000, 2500, 3000, 50, 500, &sleeves)
+    );
 
     let stored_sleeves = policy.get_sleeve_targets(&ctx.vault);
     assert_eq!(stored_sleeves.len(), 5);
 
     // 5. Update policy
     let new_hash = sample_hash(&ctx.env, 0xBB);
-    policy.update_policy(&ctx.vault, &new_hash, &sleeves);
+    policy.update_policy(&ctx.vault, &new_hash, &1000, &2500, &3000, &50, &500, &sleeves);
+    // Audit P4: amendments apply only after the notice period.
+    ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+    PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
 
-    // Verify update event IMMEDIATELY after update_policy
+    // Verify POLICY_UPDATED event IMMEDIATELY after activation
     let events_after_upd = ctx.env.events().all();
     let upd_event_found = events_after_upd.iter().any(|e| {
         e.1.len() >= 2
@@ -241,59 +301,36 @@ fn test_t26_policy_registration_and_hash_storage() {
 #[test]
 fn test_t26_uninitialized_and_unauthorized_checks() {
     let env = Env::default();
-    let policy_id = env.register(PolicyContract, ());
+    // Audit M3: admin and oracle are set by the constructor, atomically with
+    // deployment; there is no uninitialized window and no `initialize`.
+    let admin = Address::generate(&env);
+    let oracle_addr = Address::generate(&env); // never called in this test
+    let policy_id = env.register(PolicyContract, (admin.clone(), oracle_addr.clone()));
     let policy = PolicyContractClient::new(&env, &policy_id);
-
-    // Calling get_admin on uninitialized contract fails
-    let admin_res = policy.try_get_admin();
-    assert_eq!(
-        admin_res,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            PolicyError::NotInitialized as u32
-        )))
+    assert_eq!(policy.get_admin(), admin);
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &policy_id,
+        &Symbol::new(&env, "initialize"),
+        soroban_sdk::vec![
+            &env,
+            soroban_sdk::IntoVal::into_val(&Address::generate(&env), &env),
+            soroban_sdk::IntoVal::into_val(&Address::generate(&env), &env),
+        ],
     );
+    assert!(!matches!(r, Ok(Ok(()))));
+    assert_eq!(policy.get_oracle(), oracle_addr);
 
-    // Calling register_policy on uninitialized contract fails
     let vault = Address::generate(&env);
+    let owner = Address::generate(&env);
     let reg_addr = Address::generate(&env);
     let p_hash = sample_hash(&env, 0x01);
     let sleeves = sample_sleeves(&env);
 
-    let reg_res = policy.try_register_policy(
-        &vault,
-        &p_hash,
-        &reg_addr,
-        &1000,
-        &2500,
-        &3000,
-        &50,
-        &500,
-        &sleeves,
-    );
-    assert_eq!(
-        reg_res,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            PolicyError::NotInitialized as u32
-        )))
-    );
-
-    // Initialize with admin
-    let admin = Address::generate(&env);
-    policy.initialize(&admin);
-
-    // Double initialization must fail
-    let double_init = policy.try_initialize(&admin);
-    assert_eq!(
-        double_init,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            PolicyError::AlreadyInitialized as u32
-        )))
-    );
-
-    // Non-admin caller attempting register_policy without admin auth fails
+    // Registration without owner + vault authorization fails
     env.mock_auths(&[]);
     let unauth_reg = policy.try_register_policy(
         &vault,
+        &owner,
         &p_hash,
         &reg_addr,
         &1000,
@@ -306,7 +343,7 @@ fn test_t26_uninitialized_and_unauthorized_checks() {
     assert!(unauth_reg.is_err(), "Unauthorized registration should fail");
 
     let new_hash = sample_hash(&env, 0x02);
-    let unauth_upd = policy.try_update_policy(&vault, &new_hash, &sleeves);
+    let unauth_upd = policy.try_update_policy(&vault, &new_hash, &1000, &2500, &3000, &50, &500, &sleeves);
     assert!(unauth_upd.is_err(), "Unauthorized update should fail");
 }
 
@@ -320,6 +357,7 @@ fn test_t27_compliant_rebalance_acceptance() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -363,6 +401,7 @@ fn test_t27_compliant_rebalance_acceptance() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops,
         weights_after,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -395,6 +434,7 @@ fn test_t28_weight_band_breach_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -416,6 +456,7 @@ fn test_t28_weight_band_breach_rejected() {
     ];
     let proposal1 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_sum_fail,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -437,6 +478,7 @@ fn test_t28_weight_band_breach_rejected() {
     ];
     let proposal2 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_band_max_fail,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -458,6 +500,7 @@ fn test_t28_weight_band_breach_rejected() {
     ];
     let proposal3 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_band_min_fail,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -478,6 +521,7 @@ fn test_t28_weight_band_breach_rejected() {
     ];
     let proposal4 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_undeclared,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -537,6 +581,7 @@ fn test_t29_liquidity_floor_breach_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000, // min cash liquidity sleeve = 1000 bps
@@ -559,6 +604,7 @@ fn test_t29_liquidity_floor_breach_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -620,6 +666,7 @@ fn test_t30_single_asset_cap_and_issuer_cap_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000, // min_liquidity
@@ -642,6 +689,7 @@ fn test_t30_single_asset_cap_and_issuer_cap_rejected() {
     ];
     let proposal1 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_single_asset_breach,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -669,6 +717,7 @@ fn test_t30_single_asset_cap_and_issuer_cap_rejected() {
     // Issuer FRANKLIN: 2500 + 2500 = 5000 > 3000. Fails with IssuerCapExceeded!
     let proposal2 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights_franklin_issuer_breach,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -690,6 +739,7 @@ fn test_t31_slippage_and_deadline_rejections() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -713,6 +763,7 @@ fn test_t31_slippage_and_deadline_rejections() {
     let past_deadline = ctx.env.ledger().timestamp() - 1;
     let proposal1 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: valid_weights.clone(),
         deadline: past_deadline,
@@ -738,6 +789,7 @@ fn test_t31_slippage_and_deadline_rejections() {
     ];
     let proposal2 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_excessive_slippage,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -761,6 +813,7 @@ fn test_t31_slippage_and_deadline_rejections() {
     ];
     let proposal3 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_invalid_amount,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -781,6 +834,7 @@ fn test_t32_closed_universe_registry_cross_check() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -813,6 +867,7 @@ fn test_t32_closed_universe_registry_cross_check() {
     ];
     let proposal1 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_unregistered_in,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -836,6 +891,7 @@ fn test_t32_closed_universe_registry_cross_check() {
     ];
     let proposal2 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_unregistered_out,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -858,6 +914,7 @@ fn test_t32_closed_universe_registry_cross_check() {
     ];
     let proposal3 = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_deactivated,
         weights_after: valid_weights.clone(),
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -878,6 +935,7 @@ fn test_exact_boundaries_acceptance() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000, // min liquidity = 1000 bps
@@ -921,6 +979,7 @@ fn test_exact_boundaries_acceptance() {
     // Exact boundary deadline: proposal.deadline == current ledger timestamp
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops,
         weights_after: weights,
         deadline: ctx.env.ledger().timestamp(), // exactly current timestamp!
@@ -943,6 +1002,7 @@ fn test_rebalance_without_operations_passes() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -965,6 +1025,7 @@ fn test_rebalance_without_operations_passes() {
     // Proposal with empty operations
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -984,6 +1045,7 @@ fn test_unregistered_vault_rebalance_rejected() {
     let random_vault = Address::generate(&ctx.env);
     let proposal = RebalanceProposal {
         vault: random_vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: vec![&ctx.env],
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1006,6 +1068,7 @@ fn test_duplicate_asset_in_weights_after_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1029,6 +1092,7 @@ fn test_duplicate_asset_in_weights_after_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: duplicate_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1051,6 +1115,7 @@ fn test_slippage_overflow_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1085,6 +1150,7 @@ fn test_slippage_overflow_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_overflow,
         weights_after: valid_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1107,6 +1173,7 @@ fn test_vault_mismatch_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1129,6 +1196,7 @@ fn test_vault_mismatch_rejected() {
     let other_vault = Address::generate(&ctx.env);
     let proposal = RebalanceProposal {
         vault: other_vault, // Vault mismatch!
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: valid_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1190,6 +1258,7 @@ fn test_weights_after_with_deactivated_asset_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1204,6 +1273,7 @@ fn test_weights_after_with_deactivated_asset_rejected() {
     // Previously passed because check 8 only inspected operations!
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: vec![&ctx.env],
         weights_after: vec![
             &ctx.env,
@@ -1233,6 +1303,7 @@ fn test_identical_trade_assets_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1265,6 +1336,7 @@ fn test_identical_trade_assets_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_identical,
         weights_after: valid_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1287,6 +1359,7 @@ fn test_negative_or_zero_min_amount_out_rejected() {
 
     policy.register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1319,6 +1392,7 @@ fn test_negative_or_zero_min_amount_out_rejected() {
 
     let proposal = RebalanceProposal {
         vault: ctx.vault.clone(),
+        policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
         operations: ops_zero_out,
         weights_after: valid_weights,
         deadline: ctx.env.ledger().timestamp() + 3600,
@@ -1339,6 +1413,7 @@ fn test_policy_registration_invalid_parameters_rejected() {
     // 1. max_slippage_bps > 10000
     let res_slippage = policy.try_register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1358,6 +1433,7 @@ fn test_policy_registration_invalid_parameters_rejected() {
     // 2. min_liquidity_sleeve_bps > 10000
     let res_liq = policy.try_register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &10001, // > 10000
@@ -1387,6 +1463,7 @@ fn test_policy_registration_invalid_parameters_rejected() {
     ];
     let res_band = policy.try_register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1423,6 +1500,7 @@ fn test_policy_registration_invalid_parameters_rejected() {
     ];
     let res_dup = policy.try_register_policy(
         &ctx.vault,
+        &ctx.owner,
         &p_hash,
         &ctx.registry_address,
         &1000,
@@ -1438,4 +1516,550 @@ fn test_policy_registration_invalid_parameters_rejected() {
             PolicyError::WeightBandExceeded as u32
         )))
     );
+}
+
+// -------------------------------------------------------------------------
+// Audit P3 (2026-11-15): only the policy owner (with the vault's consent)
+// may register; only the owner may amend; the admin can do neither.
+// Every call under test uses an explicit auth tree (AGENT-RULES Rule 13).
+// -------------------------------------------------------------------------
+mod p3 {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::{IntoVal, Val};
+
+    fn reg_args(ctx: &TestContext, hash: &BytesN<32>) -> Vec<Val> {
+        (
+            ctx.vault.clone(),
+            ctx.owner.clone(),
+            hash.clone(),
+            ctx.registry_address.clone(),
+            1000u32,
+            2500u32,
+            3000u32,
+            50u32,
+            500u32,
+            sample_sleeves(&ctx.env),
+        )
+            .into_val(&ctx.env)
+    }
+
+    fn try_register(ctx: &TestContext, signers: &[&Address], hash: &BytesN<32>) -> bool {
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        let args = reg_args(ctx, hash);
+        let invoke = MockAuthInvoke {
+            contract: &ctx.policy_address,
+            fn_name: "register_policy",
+            args,
+            sub_invokes: &[],
+        };
+        let auths: std::vec::Vec<MockAuth> =
+            signers.iter().map(|a| MockAuth { address: a, invoke: &invoke }).collect();
+        ctx.env.mock_auths(&auths);
+        policy
+            .try_register_policy(
+                &ctx.vault, &ctx.owner, hash, &ctx.registry_address,
+                &1000, &2500, &3000, &50, &500, &sample_sleeves(&ctx.env),
+            )
+            .is_ok()
+    }
+
+    fn try_amend(ctx: &TestContext, signer: &Address, hash: &BytesN<32>, floor: u32) -> bool {
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        let sleeves = sample_sleeves(&ctx.env);
+        ctx.env.mock_auths(&[MockAuth {
+            address: signer,
+            invoke: &MockAuthInvoke {
+                contract: &ctx.policy_address,
+                fn_name: "update_policy",
+                args: (ctx.vault.clone(), hash.clone(), floor, 2500u32, 3000u32, 50u32, 500u32, sleeves.clone())
+                    .into_val(&ctx.env),
+                sub_invokes: &[],
+            },
+        }]);
+        policy
+            .try_update_policy(&ctx.vault, hash, &floor, &2500, &3000, &50, &500, &sleeves)
+            .is_ok()
+    }
+
+    #[test]
+    fn register_requires_owner_and_vault() {
+        let ctx = setup_test_context();
+        let h = sample_hash(&ctx.env, 0x11);
+        assert!(!try_register(&ctx, &[&ctx.admin], &h), "admin alone");
+        assert!(!try_register(&ctx, &[&ctx.owner], &h), "owner without vault consent");
+        assert!(!try_register(&ctx, &[&ctx.vault], &h), "vault without owner signature");
+        assert!(!try_register(&ctx, &[&ctx.admin, &ctx.vault], &h), "admin + vault, no owner");
+
+        assert!(try_register(&ctx, &[&ctx.owner, &ctx.vault], &h));
+        let signers: std::vec::Vec<Address> = ctx.env.auths().iter().map(|a| a.0.clone()).collect();
+        assert!(signers.contains(&ctx.owner) && signers.contains(&ctx.vault));
+        assert!(!signers.contains(&ctx.admin));
+
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().owner, ctx.owner);
+    }
+
+    #[test]
+    fn policy_cannot_be_registered_twice() {
+        let ctx = setup_test_context();
+        assert!(try_register(&ctx, &[&ctx.owner, &ctx.vault], &sample_hash(&ctx.env, 0x11)));
+        assert!(!try_register(&ctx, &[&ctx.owner, &ctx.vault], &sample_hash(&ctx.env, 0x22)));
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert_eq!(policy.get_policy_hash(&ctx.vault), sample_hash(&ctx.env, 0x11));
+        assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().version, 1);
+    }
+
+    #[test]
+    fn only_owner_can_amend() {
+        let ctx = setup_test_context();
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert!(try_register(&ctx, &[&ctx.owner, &ctx.vault], &sample_hash(&ctx.env, 0x11)));
+
+        let intruder = Address::generate(&ctx.env);
+        for who in [&ctx.admin, &ctx.vault, &ctx.proposer, &intruder] {
+            assert!(!try_amend(&ctx, who, &sample_hash(&ctx.env, 0xEE), 0));
+        }
+        assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().min_liquidity_sleeve_bps, 1000);
+
+        assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1500));
+        assert_eq!(ctx.env.auths()[0].0, ctx.owner);
+        // Audit P4: amendments apply only after the notice period.
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
+        let cfg = policy.get_policy_config(&ctx.vault).unwrap();
+        assert_eq!((cfg.version, cfg.min_liquidity_sleeve_bps), (2, 1500));
+        assert_eq!(cfg.policy_hash, sample_hash(&ctx.env, 0x33));
+    }
+
+    #[test]
+    fn terms_hash_tracks_exactly_the_stored_terms() {
+        let ctx = setup_test_context();
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert!(try_register(&ctx, &[&ctx.owner, &ctx.vault], &sample_hash(&ctx.env, 0x11)));
+        let sleeves = sample_sleeves(&ctx.env);
+        let expected = compute_terms_hash(&ctx.env, &ctx.registry_address, 1000, 2500, 3000, 50, 500, &sleeves);
+        let before = policy.get_policy_config(&ctx.vault).unwrap().terms_hash;
+        assert_eq!(before, expected);
+
+        assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1500));
+        // Audit P4: amendments apply only after the notice period.
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
+        let after = policy.get_policy_config(&ctx.vault).unwrap().terms_hash;
+        assert_ne!(after, before);
+        assert_eq!(after, compute_terms_hash(&ctx.env, &ctx.registry_address, 1500, 2500, 3000, 50, 500, &sleeves));
+    }
+
+    #[test]
+    fn amending_unknown_vault_fails() {
+        let ctx = setup_test_context();
+        assert!(!try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1000));
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit P1 (2026-11-15): slippage is measured in value using oracle prices,
+// not raw token units. EUR/USD = 1.08, cap = 50 bps.
+// -------------------------------------------------------------------------
+mod p1 {
+    use super::*;
+
+    const ONE: i128 = 10_000_000;
+
+    /// Registers FX_EURC (priced 1.08 by two feeds) and a USDC/FX_EURC policy.
+    fn fx_setup(ctx: &TestContext) -> Address {
+        let eur = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
+        register_registry_asset(&ctx.env, &AssetRegistryClient::new(&ctx.env, &ctx.registry_address), &eur, "FX_EURC", "CIRCLE", SleeveType::Cash);
+        price_asset(&ctx.env, &NavOracleClient::new(&ctx.env, &ctx.oracle_address), &eur, "P_FX", ONE * 108 / 100);
+        let sleeves = vec![
+            &ctx.env,
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"), target_weight_bps: 5000, min_band_bps: 0, max_band_bps: 10000, sleeve_type: Symbol::new(&ctx.env, "cash") },
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "FX_EURC"), target_weight_bps: 5000, min_band_bps: 0, max_band_bps: 10000, sleeve_type: Symbol::new(&ctx.env, "cash") },
+        ];
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(
+            &ctx.vault, &ctx.owner, &sample_hash(&ctx.env, 0x01), &ctx.registry_address,
+            &1000, &10000, &10000, &50, &500, &sleeves,
+        );
+        eur
+    }
+
+    fn check(ctx: &TestContext, a_in: &Address, a_out: &Address, amount_in: i128, min_out: i128) -> ValidationResult {
+        let proposal = RebalanceProposal {
+            vault: ctx.vault.clone(),
+            policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
+            operations: vec![&ctx.env, TradeOperation { asset_in: a_in.clone(), asset_out: a_out.clone(), amount_in, min_amount_out: min_out, route: TradeRoute::Soroswap }],
+            weights_after: vec![&ctx.env, (Symbol::new(&ctx.env, "CIRCLE_USDC"), 5000u32), (Symbol::new(&ctx.env, "FX_EURC"), 5000u32)],
+            deadline: ctx.env.ledger().timestamp() + 600,
+            proposer: ctx.proposer.clone(),
+        };
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).validate_rebalance(&ctx.vault, &proposal)
+    }
+
+    #[test]
+    fn fair_trades_accepted_in_both_directions() {
+        let ctx = setup_test_context();
+        let eur = fx_setup(&ctx);
+        // 1000 USDC = 925.93 EUR; 925 EUR is ~0.1% slippage.
+        assert!(check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 925 * ONE).is_valid);
+        // 1000 EUR = 1080 USDC; 1076 USDC is ~0.37% slippage.
+        assert!(check(&ctx, &eur, &ctx.usdc_addr, 1000 * ONE, 1076 * ONE).is_valid);
+    }
+
+    #[test]
+    fn losses_beyond_cap_rejected_in_both_directions() {
+        let ctx = setup_test_context();
+        let eur = fx_setup(&ctx);
+        let r = check(&ctx, &eur, &ctx.usdc_addr, 1000 * ONE, 1070 * ONE); // 0.93% loss
+        assert_eq!((r.is_valid, r.code), (false, PolicyError::SlippageLimitExceeded as u32));
+        assert_eq!(r.message, Symbol::new(&ctx.env, "SLIPPAGE_EXCEEDED"));
+        let r = check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 915 * ONE); // 1.2% loss
+        assert!(!r.is_valid);
+        // The old raw-unit check accepted this 7.4% loss:
+        assert!(!check(&ctx, &eur, &ctx.usdc_addr, 1000 * ONE, 1000 * ONE).is_valid);
+    }
+
+    #[test]
+    fn exact_cap_boundary() {
+        let ctx = setup_test_context();
+        let eur = fx_setup(&ctx);
+        // value_in = 1000 USDC; at 50 bps the minimum value out is 995 USDC,
+        // i.e. 995 / 1.08 = 921.2962962... EUR -> 9_212_962_963 units.
+        assert!(check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 9_212_962_963).is_valid);
+        assert!(!check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 9_212_962_962).is_valid);
+    }
+
+    #[test]
+    fn unpriced_asset_makes_proposal_invalid() {
+        let ctx = setup_test_context();
+        let eur = fx_setup(&ctx);
+        let oracle = NavOracleClient::new(&ctx.env, &ctx.oracle_address);
+        oracle.trigger_circuit_breaker(&ctx.admin, &Symbol::new(&ctx.env, "P_FX"), &Symbol::new(&ctx.env, "MANUAL"));
+        let r = check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 925 * ONE);
+        assert_eq!((r.is_valid, r.code), (false, PolicyError::PriceUnavailable as u32));
+        assert_eq!(r.message, Symbol::new(&ctx.env, "PRICE_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn oracle_is_fixed_at_initialization() {
+        let ctx = setup_test_context();
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert_eq!(policy.get_oracle(), ctx.oracle_address);
+        // There is no setter and no `initialize` entrypoint (audit M3).
+        let r = ctx.env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &ctx.policy_address,
+            &Symbol::new(&ctx.env, "initialize"),
+            soroban_sdk::vec![
+                &ctx.env,
+                soroban_sdk::IntoVal::into_val(&ctx.admin, &ctx.env),
+                soroban_sdk::IntoVal::into_val(&Address::generate(&ctx.env), &ctx.env),
+            ],
+        );
+        assert!(!matches!(r, Ok(Ok(()))));
+        assert_eq!(policy.get_oracle(), ctx.oracle_address);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit P2 (2026-11-15): issuer caps use the registry's issuer field.
+// -------------------------------------------------------------------------
+mod p2 {
+    use super::*;
+
+    fn policy_for(ctx: &TestContext, ids: &[(&str, &str)], max_issuer: u32) {
+        let mut sleeves = Vec::new(&ctx.env);
+        for (id, st) in ids {
+            sleeves.push_back(SleeveTarget {
+                asset_id: Symbol::new(&ctx.env, id),
+                target_weight_bps: 0,
+                min_band_bps: 0,
+                max_band_bps: 10000,
+                sleeve_type: Symbol::new(&ctx.env, st),
+            });
+        }
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(
+            &ctx.vault, &ctx.owner, &sample_hash(&ctx.env, 0x02), &ctx.registry_address,
+            &1000, &10000, &max_issuer, &50, &500, &sleeves,
+        );
+    }
+
+    fn validate(ctx: &TestContext, weights: &[(&str, u32)]) -> ValidationResult {
+        let mut w = Vec::new(&ctx.env);
+        for (id, bps) in weights {
+            w.push_back((Symbol::new(&ctx.env, id), *bps));
+        }
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).validate_rebalance(
+            &ctx.vault,
+            &RebalanceProposal {
+                vault: ctx.vault.clone(),
+                policy_hash: current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault),
+                operations: Vec::new(&ctx.env),
+                weights_after: w,
+                deadline: ctx.env.ledger().timestamp() + 600,
+                proposer: ctx.proposer.clone(),
+            },
+        )
+    }
+
+    #[test]
+    fn assets_of_one_issuer_share_its_cap() {
+        let ctx = setup_test_context();
+        policy_for(&ctx, &[("CIRCLE_USDC", "cash"), ("CIRCLE_EURC", "cash"), ("FRANKLIN_BENJI", "usd_gov_fund"), ("SPIKO_EUSTBL", "eur_sovereign")], 4000);
+        // CIRCLE_USDC and CIRCLE_EURC are both issuer CIRCLE in the registry.
+        let r = validate(&ctx, &[("CIRCLE_USDC", 3000), ("CIRCLE_EURC", 3000), ("FRANKLIN_BENJI", 4000)]);
+        assert_eq!((r.is_valid, r.code), (false, PolicyError::IssuerCapExceeded as u32));
+        assert!(validate(&ctx, &[("CIRCLE_USDC", 2000), ("CIRCLE_EURC", 2000), ("FRANKLIN_BENJI", 6000)]).code
+            == PolicyError::IssuerCapExceeded as u32, "Franklin at 60% also breaches");
+        let ok = validate(&ctx, &[("CIRCLE_USDC", 2000), ("CIRCLE_EURC", 2000), ("FRANKLIN_BENJI", 4000), ("SPIKO_EUSTBL", 2000)]);
+        assert!(ok.is_valid, "40/40/20 respects a 40% cap (code {})", ok.code);
+    }
+
+    #[test]
+    fn shared_prefix_with_different_issuers_is_not_merged() {
+        let ctx = setup_test_context();
+        let reg = AssetRegistryClient::new(&ctx.env, &ctx.registry_address);
+        let one = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
+        let two = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
+        register_registry_asset(&ctx.env, &reg, &one, "ACME_ONE", "ACME_INC", SleeveType::UsdGovFund);
+        register_registry_asset(&ctx.env, &reg, &two, "ACME_TWO", "OTHER_CO", SleeveType::UsdGovFund);
+        policy_for(&ctx, &[("CIRCLE_USDC", "cash"), ("ACME_ONE", "usd_gov_fund"), ("ACME_TWO", "usd_gov_fund")], 4000);
+        // A prefix guess would merge ACME_ONE + ACME_TWO into 70% and reject.
+        let r = validate(&ctx, &[("CIRCLE_USDC", 3000), ("ACME_ONE", 3500), ("ACME_TWO", 3500)]);
+        assert!(r.is_valid, "different registered issuers must not be merged (code {})", r.code);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit M1 (2026-11-15): proposals must target the CURRENT policy hash, and
+// may only BUY assets declared (with a non-zero band) in the signed policy.
+// -------------------------------------------------------------------------
+mod m1 {
+    use super::*;
+
+    const ONE: i128 = 10_000_000;
+
+    fn signed_policy(ctx: &TestContext, hash: u8) {
+        let sleeves = vec![
+            &ctx.env,
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"), target_weight_bps: 5000, min_band_bps: 0, max_band_bps: 10000, sleeve_type: Symbol::new(&ctx.env, "cash") },
+            // Declared but capped at zero: holding/buying it is not allowed.
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "CIRCLE_EURC"), target_weight_bps: 0, min_band_bps: 0, max_band_bps: 0, sleeve_type: Symbol::new(&ctx.env, "cash") },
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "FRANKLIN_BENJI"), target_weight_bps: 5000, min_band_bps: 0, max_band_bps: 10000, sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund") },
+        ];
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(
+            &ctx.vault, &ctx.owner, &sample_hash(&ctx.env, hash), &ctx.registry_address,
+            &1000, &10000, &10000, &50, &500, &sleeves,
+        );
+    }
+
+    fn proposal(ctx: &TestContext, hash: BytesN<32>, ops: Vec<TradeOperation>) -> RebalanceProposal {
+        RebalanceProposal {
+            vault: ctx.vault.clone(),
+            policy_hash: hash,
+            operations: ops,
+            weights_after: vec![
+                &ctx.env,
+                (Symbol::new(&ctx.env, "CIRCLE_USDC"), 5000u32),
+                (Symbol::new(&ctx.env, "CIRCLE_EURC"), 0u32),
+                (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 5000u32),
+            ],
+            deadline: ctx.env.ledger().timestamp() + 600,
+            proposer: ctx.proposer.clone(),
+        }
+    }
+
+    fn buy(ctx: &TestContext, a_in: &Address, a_out: &Address) -> ValidationResult {
+        let ops = vec![&ctx.env, TradeOperation { asset_in: a_in.clone(), asset_out: a_out.clone(), amount_in: 1000 * ONE, min_amount_out: 999 * ONE, route: TradeRoute::Issuer }];
+        let p = proposal(ctx, current_policy_hash(&ctx.env, &ctx.policy_address, &ctx.vault), ops);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).validate_rebalance(&ctx.vault, &p)
+    }
+
+    #[test]
+    fn proposal_for_an_amended_policy_is_void() {
+        let ctx = setup_test_context();
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        signed_policy(&ctx, 0x01);
+        let old = sample_hash(&ctx.env, 0x01);
+        assert!(policy.validate_rebalance(&ctx.vault, &proposal(&ctx, old.clone(), vec![&ctx.env])).is_valid);
+
+        // Owner amends (re-signs) the policy.
+        let new = sample_hash(&ctx.env, 0x02);
+        let cfg = policy.get_policy_config(&ctx.vault).unwrap();
+        policy.update_policy(&ctx.vault, &new, &cfg.min_liquidity_sleeve_bps, &cfg.max_single_asset_bps,
+            &cfg.max_issuer_bps, &cfg.max_slippage_bps, &cfg.rebalance_band_bps, &policy.get_sleeve_targets(&ctx.vault));
+        // Audit P4: amendments apply only after the notice period.
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
+
+        let stale = policy.validate_rebalance(&ctx.vault, &proposal(&ctx, old, vec![&ctx.env]));
+        assert_eq!((stale.is_valid, stale.code), (false, PolicyError::PolicyHashMismatch as u32));
+        assert_eq!(stale.message, Symbol::new(&ctx.env, "POLICY_HASH_MISMATCH"));
+        assert!(policy.validate_rebalance(&ctx.vault, &proposal(&ctx, new, vec![&ctx.env])).is_valid);
+    }
+
+    #[test]
+    fn may_buy_only_declared_assets_with_nonzero_band() {
+        let ctx = setup_test_context();
+        signed_policy(&ctx, 0x01);
+        assert!(buy(&ctx, &ctx.usdc_addr, &ctx.benji_addr).is_valid, "declared asset");
+
+        let zero_band = buy(&ctx, &ctx.usdc_addr, &ctx.eurc_addr);
+        assert_eq!((zero_band.is_valid, zero_band.code), (false, PolicyError::AssetNotInPolicy as u32));
+
+        let undeclared = buy(&ctx, &ctx.usdc_addr, &ctx.eustbl_addr); // registered, not signed
+        assert_eq!((undeclared.is_valid, undeclared.code), (false, PolicyError::AssetNotInPolicy as u32));
+        assert_eq!(undeclared.message, Symbol::new(&ctx.env, "ASSET_NOT_IN_POLICY"));
+    }
+
+    #[test]
+    fn selling_an_undeclared_asset_is_allowed() {
+        let ctx = setup_test_context();
+        signed_policy(&ctx, 0x01);
+        // e.g. tokens sent to the vault unsolicited can be sold into the policy.
+        let r = buy(&ctx, &ctx.eustbl_addr, &ctx.benji_addr);
+        assert!(r.is_valid, "selling into a declared asset must be allowed (code {})", r.code);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit P4 (2026-11-15, owner decision D-E): amendments wait a notice period
+// (protocol minimum 48h, owner may lengthen, never shorten); anyone may
+// activate after it elapses; the owner may cancel; old terms rule meanwhile.
+// -------------------------------------------------------------------------
+mod p4 {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    const H: u64 = 3600;
+
+    fn registered(ctx: &TestContext) -> PolicyContractClient<'_> {
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        policy.register_policy(
+            &ctx.vault, &ctx.owner, &sample_hash(&ctx.env, 0x01), &ctx.registry_address,
+            &1000, &2500, &3000, &50, &500, &sample_sleeves(&ctx.env),
+        );
+        policy
+    }
+
+    fn propose(ctx: &TestContext, policy: &PolicyContractClient, hash: u8, floor: u32) {
+        policy.update_policy(&ctx.vault, &sample_hash(&ctx.env, hash), &floor, &2500, &3000, &50, &500, &sample_sleeves(&ctx.env));
+    }
+
+    fn warp(ctx: &TestContext, secs: u64) {
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + secs);
+    }
+
+    fn code(e: PolicyError) -> Result<(), Result<soroban_sdk::Error, soroban_sdk::InvokeError>> {
+        Err(Ok(soroban_sdk::Error::from_contract_error(e as u32)))
+    }
+
+    #[test]
+    fn amendment_waits_full_notice_then_anyone_activates() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        assert_eq!(policy.get_notice_period(&ctx.vault), PROTOCOL_MIN_NOTICE_SECONDS);
+        assert_eq!(PROTOCOL_MIN_NOTICE_SECONDS, 48 * H);
+
+        propose(&ctx, &policy, 0x02, 0);
+        let pending = policy.get_pending_policy_update(&ctx.vault).unwrap();
+        assert_eq!(pending.effective_at, pending.proposed_at + 48 * H);
+        assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().min_liquidity_sleeve_bps, 1000);
+
+        warp(&ctx, 48 * H - 1);
+        assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoticeNotElapsed));
+
+        warp(&ctx, 1);
+        ctx.env.set_auths(&[]); // permissionless
+        policy.activate_policy_update(&ctx.vault);
+        let cfg = policy.get_policy_config(&ctx.vault).unwrap();
+        assert_eq!((cfg.policy_hash, cfg.version, cfg.min_liquidity_sleeve_bps), (sample_hash(&ctx.env, 0x02), 2, 0));
+        assert!(policy.get_pending_policy_update(&ctx.vault).is_none());
+        assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoPendingUpdate));
+    }
+
+    #[test]
+    fn old_terms_govern_rebalances_during_notice() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        propose(&ctx, &policy, 0x02, 0);
+        let weights = vec![
+            &ctx.env,
+            (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000u32),
+            (Symbol::new(&ctx.env, "CIRCLE_EURC"), 1000u32),
+            (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 2500u32),
+            (Symbol::new(&ctx.env, "SPIKO_EUSTBL"), 2500u32),
+            (Symbol::new(&ctx.env, "BLEND_BLND"), 2000u32),
+        ];
+        let mk = |hash: u8| RebalanceProposal {
+            vault: ctx.vault.clone(),
+            policy_hash: sample_hash(&ctx.env, hash),
+            operations: vec![&ctx.env],
+            weights_after: weights.clone(),
+            deadline: ctx.env.ledger().timestamp() + 600,
+            proposer: ctx.proposer.clone(),
+        };
+        let old = policy.validate_rebalance(&ctx.vault, &mk(0x01));
+        let new = policy.validate_rebalance(&ctx.vault, &mk(0x02));
+        assert_eq!(new.code, PolicyError::PolicyHashMismatch as u32, "pending terms are not yet in force");
+        assert_ne!(old.code, PolicyError::PolicyHashMismatch as u32, "current terms still govern");
+    }
+
+    #[test]
+    fn owner_cancels_admin_cannot() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        propose(&ctx, &policy, 0x02, 0);
+        ctx.env.mock_auths(&[MockAuth {
+            address: &ctx.admin,
+            invoke: &MockAuthInvoke { contract: &ctx.policy_address, fn_name: "cancel_policy_update", args: (ctx.vault.clone(),).into_val(&ctx.env), sub_invokes: &[] },
+        }]);
+        assert!(policy.try_cancel_policy_update(&ctx.vault).is_err());
+        assert!(policy.get_pending_policy_update(&ctx.vault).is_some());
+
+        ctx.env.mock_auths(&[MockAuth {
+            address: &ctx.owner,
+            invoke: &MockAuthInvoke { contract: &ctx.policy_address, fn_name: "cancel_policy_update", args: (ctx.vault.clone(),).into_val(&ctx.env), sub_invokes: &[] },
+        }]);
+        policy.cancel_policy_update(&ctx.vault);
+        assert!(policy.get_pending_policy_update(&ctx.vault).is_none());
+        warp(&ctx, 48 * H);
+        assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoPendingUpdate));
+        assert_eq!(policy.get_policy_hash(&ctx.vault), sample_hash(&ctx.env, 0x01));
+    }
+
+    #[test]
+    fn new_proposal_replaces_pending_and_restarts_clock() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        propose(&ctx, &policy, 0x02, 1500);
+        warp(&ctx, 24 * H);
+        propose(&ctx, &policy, 0x03, 2000);
+        warp(&ctx, 24 * H); // 48h after the FIRST proposal
+        assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoticeNotElapsed));
+        warp(&ctx, 24 * H); // 48h after the replacement
+        policy.activate_policy_update(&ctx.vault);
+        assert_eq!(policy.get_policy_hash(&ctx.vault), sample_hash(&ctx.env, 0x03));
+    }
+
+    #[test]
+    fn notice_can_only_be_lengthened_by_the_owner() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        assert_eq!(policy.try_set_notice_period(&ctx.vault, &(24 * H)).map(|_| ()), code(PolicyError::NoticeTooShort));
+        policy.set_notice_period(&ctx.vault, &(7 * 24 * H));
+        assert_eq!(policy.get_notice_period(&ctx.vault), 7 * 24 * H);
+        assert_eq!(policy.try_set_notice_period(&ctx.vault, &(72 * H)).map(|_| ()), code(PolicyError::NoticeTooShort));
+
+        ctx.env.mock_auths(&[MockAuth {
+            address: &ctx.admin,
+            invoke: &MockAuthInvoke { contract: &ctx.policy_address, fn_name: "set_notice_period", args: (ctx.vault.clone(), 30 * 24 * H).into_val(&ctx.env), sub_invokes: &[] },
+        }]);
+        assert!(policy.try_set_notice_period(&ctx.vault, &(30 * 24 * H)).is_err(), "admin cannot change notice");
+
+        ctx.env.mock_all_auths();
+        propose(&ctx, &policy, 0x02, 0);
+        let p = policy.get_pending_policy_update(&ctx.vault).unwrap();
+        assert_eq!(p.effective_at - p.proposed_at, 7 * 24 * H, "longer notice applies to new proposals");
+    }
 }

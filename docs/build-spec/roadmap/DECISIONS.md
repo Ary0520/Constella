@@ -75,7 +75,7 @@
 - **Context:** We need at least one lending market to accept Constella basket shares as collateral during Phase 3.
 - **Candidates:**
   - **Liqvid (SCF #45):** Purpose-built RWA collateral money market on Stellar.
-  - **Blend Protocol:** Stellar's largest lending protocol (~$165M+ TVL).
+  - **Blend Protocol:** Stellar's largest lending protocol (~$105M TVL on Blend Pools V2, 15 Nov 2026).
   - **Lucent Finance:** Emerging institutional money market.
 - **Recommendation:** **Liqvid First (Co-Design Partner), Blend Second (Scale).**
   - **Rationale:** Liqvid is purpose-built for RWA collateral and has strong incentive to co-design the Collateral Passport interface. Once proven on Liqvid, we bring the listing kit to Blend pool operators for scale.

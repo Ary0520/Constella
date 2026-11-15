@@ -48,10 +48,13 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
   - Logs the deviation event on-chain
 - Trading and rebalancing for the affected sleeve also paused
 - Unaffected sleeves continue normally
+- **Where it is detected (audit O4, 15 Nov 2026):** the deviation check runs inside every price write (`update_price`, `register_source`), so the pause and its `NAV_PAUSE` event persist in that successful transaction. Reads re-check as defence in depth, but a pause first seen inside a caller that reverts would be rolled back — so writes are the authoritative trigger. Staleness and insufficient sources (Rule 5) are evaluated live on every read and are not latched.
 
 ### Rule 5: Staleness limits and hard stop
 - Every source has a **staleness limit** (time since last update, defined per-source in registry)
 - Sources beyond staleness limit are treated as invalid (same as unavailable)
+- **Timestamp integrity (audit O2, 15 Nov 2026):** a price stamped later than the current ledger time is rejected on write and treated as invalid if found in storage (otherwise it would never go stale); a feed update older than the stored one is rejected (prevents replaying an old-but-fresh price over newer data)
+- **No sleeve may be configured below 2 sources** — `configure_sleeve` rejects `min_valid_sources < 2` (`MIN_VALID_SOURCES_FLOOR`, audit O3)
 - If **fewer than 2 valid sources** remain for a sleeve:
   - **Hard stop**: deposits, redemptions, and rebalancing for that sleeve are halted
   - Operators alerted
@@ -78,6 +81,21 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 - **Issuer NAV APIs** — Direct HTTP feeds with API keys; treat as trusted but verify
 
 ---
+
+## Production Price Flow (target design — not yet built, audit O7)
+
+```
+ Reflector (Stellar oracle network) ──┐
+ RedStone  (Stellar oracle network) ──┼──► NAV Oracle contract ──► Strategy Vault ──► share prices
+ Blend contract (supply exchange rate)┤    (2+ sources, staleness,                  │
+ Issuer NAV APIs ──► feeder service ──┘     deviation, min/median)                  ▼
+   (Franklin, Spiko, Ondo)  per-source key,                              Blend / Liqvid read the
+                            issuer signature verified where available    conservative price (SEP-40)
+```
+
+- **On-chain providers** (Reflector, RedStone, Blend) are read directly by the oracle contract; no one pushes these prices.
+- **Issuer NAVs** originate off-chain and are carried in by a Constella feeder service signing with a dedicated key per source — never the admin key. Where an issuer signs its NAV, the contract verifies that signature.
+- **Current state (15 Nov 2026):** the safety rules are implemented and tested, but every source is written via admin-only `update_price`. Tracked as audit O7.
 
 ## SEP-40 Compatible Interface
 

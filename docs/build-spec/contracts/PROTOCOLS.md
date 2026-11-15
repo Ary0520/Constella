@@ -8,12 +8,12 @@
 
 | Protocol | Codename | Mainnet Date | Key CAPs | Direct Impact on Constella |
 |---|---|---|---|---|
-| **Protocol 23** | Whisk | H1 2025 | Parallel execution | Parallel rebalancing across isolated sleeves |
-| **Protocol 25** | X-Ray | Testnet Jan 7, 2026 | CAP-74, CAP-75 | BN254 elliptic curves & Poseidon hashes for future ZK eligibility proofs |
+| **Protocol 23** | Whisk | Mainnet Sep 3, 2025 | Parallel execution | Parallel rebalancing across isolated sleeves |
+| **Protocol 25** | X-Ray | Mainnet Jan 22, 2026 | CAP-74, CAP-75 | BN254 elliptic curves & Poseidon hashes for future ZK eligibility proofs |
 | **Protocol 26** | Yardstick | Mainnet May 6, 2026 | CAP-77, CAP-78, CAP-80 | Quorum Freeze, 256-bit arithmetic, precise TTL rent control |
 | **Protocol 27** | Zipper | Mainnet Jul 8, 2026 | CAP-71 | Authentication delegation for custom accounts; passkey replay protection |
 | **Protocol 28** | Adapter | Mainnet Sep 16, 2026 | CAP-85, AddressV2 | Fast ~5s ledger close, atomic fleet contract upgrades |
-| **Protocol 29** | *(Patch)* | Mainnet Oct 1, 2026 | Security patch | Maintenance & security stability; no new CAPs |
+| **Protocol 29** | *(unverified)* | — | — | No official name, date, or CAPs found as of 15 Nov 2026; do not rely on it |
 | **Protocol 30** | Bell | **Mainnet Nov 23, 2026** | CAP-84, CAP-87, CAP-88 | W-addresses (muxed contracts), ML-DSA (quantum prep), ms timestamps |
 
 ---
@@ -42,8 +42,8 @@
 
 ### Protocol 28 (Adapter)
 
-#### CAP-85: Atomic Fleet Upgrades
-- **Mechanism:** Allows an entire fleet of contract instances that share the same WASM bytecode hash to be upgraded in a single atomic transaction.
+#### CAP-85: Externally Managed Contract Executables
+- **Mechanism:** Lets many contract instances point at an externally managed executable so they can be upgraded atomically in one transaction (Final, Protocol 28). The CAP does not require instances to share a WASM hash. There is **no** `stellar contract deploy --upgrade-fleet` CLI flag; follow the CAP-85 / stellar-cli docs for the actual procedure.
 - **Constella Role:** When Constella upgrades the vault logic, hundreds of deployed strategy and private vaults can be upgraded simultaneously. Users never suffer downtime, and migration scripts run deterministically.
 
 #### Fast Ledger Consensus
@@ -87,6 +87,7 @@
 │  3. Bell features (CAP-84 W-Addresses & CAP-87 ML-DSA)      │
 │     are engineered as modular, opt-in plugins activated     │
 │     after the Nov 23 mainnet vote clears successfully.      │
-│  4. Upgrade all SDKs (JS & Rust) to v30-compatible headers. │
+│  4. Pin soroban-sdk 28.x (matches OpenZeppelin v0.8.0).    │
+│     Move to v30 only after a stable 30.0.0 ships post-vote. │
 └─────────────────────────────────────────────────────────────┘
 ```

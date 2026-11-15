@@ -1,7 +1,7 @@
 # Slice 4 Micro-Spec: Closed Universe Asset Registry Contract (Soroban Rust)
 
 > **Module:** `contracts/registry`  
-> **Status:** Specification & Plan Phase (Pre-Implementation)  
+> **Status:** Implemented (code + tests on main). Open findings tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/contracts/CONTRACTS-SPEC.md`](../build-spec/contracts/CONTRACTS-SPEC.md#L32-L70), [`docs/build-spec/ai-engine/REGISTRY.md`](../build-spec/ai-engine/REGISTRY.md), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 4, 6, 8, 11, 12)
 
 ---
@@ -23,7 +23,8 @@ Implement and verify the on-chain Closed Universe Asset Registry contract in Sor
 #[contractclient(name = "AssetRegistryClient")]
 pub trait AssetRegistryTrait {
     /// Initialize the registry with an authorized admin address (multisig)
-    fn initialize(env: Env, admin: Address);
+    // Audit M3 (15 Nov 2026): set atomically at deployment; no `initialize`.
+    fn __constructor(env: Env, admin: Address);
 
     /// Add an approved asset to the closed universe (admin only)
     fn add_asset(env: Env, entry: AssetEntry);
@@ -67,6 +68,7 @@ pub enum SleeveType {
 pub struct AssetEntry {
     pub contract_address: Address,
     pub asset_id: Symbol,
+    pub issuer: Symbol, // required; used for issuer caps (audit P2, 15 Nov 2026)
     pub sleeve_type: SleeveType,
     pub liquidity_tier: u32, // 0=instant, 1=24h, 2=1week, 3=illiquid
     pub permissionless: bool,

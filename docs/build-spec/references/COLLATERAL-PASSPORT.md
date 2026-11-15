@@ -65,6 +65,7 @@ pub struct RedemptionCapacity {
   - High-Cash Basket (> 50% USDC/EURC): **90% LTV (10% Haircut)**
   - Pure T-Bill Basket (BENJI, Spiko): **85% LTV (15% Haircut)**
   - Yield & Lending Basket (Blend, wYLDS): **70%–75% LTV (25%–30% Haircut)**
+- **On-chain implementation (audit W7, 15 Nov 2026):** haircut = value-weighted average of per-sleeve haircuts — cash 10%, USD/EUR T-bill funds 15%, yield-dollar 25%, lending 30% — weighted by target weights while the vault is empty, rounded **up**. Equity and XLM have no figure in this spec and therefore count as 100% (no borrowing power) until one is approved. Recommended LTV = 100% − haircut; the listing kit's liquidation threshold equals the recommended LTV (Blend's single collateral factor).
 
 ---
 
@@ -74,6 +75,7 @@ pub struct RedemptionCapacity {
   - The vault exposes a whitelisted liquidator hook (`is_eligible_liquidator`).
   - Institutional market makers and approved liquidator bots (who have verified their credentials with the SEP-57 identity registry) can seize and unwind the position.
   - Aligned with the architectural framework validated by Liqvid (SCF #45).
+- **Current behaviour (audit W7):** `is_eligible_liquidator` is `true` for every address only when every constituent is permissionless in the registry (open share class). If any constituent is permissioned or unregistered it returns `false` for everyone until the SEP-57 identity verifier (Phase 3) is integrated.
 
 ---
 

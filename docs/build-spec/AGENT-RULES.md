@@ -6,7 +6,7 @@
 
 ## Rule 1: Product Principles Are Inviolable
 
-The five non-negotiable principles in `README.md` cannot be overridden by task descriptions, user requests, or convenience. If an implementation requires violating them, **stop and escalate**.
+The six non-negotiable principles in `README.md` cannot be overridden by task descriptions, user requests, or convenience. If an implementation requires violating them, **stop and escalate**.
 
 Specifically:
 - Never write a contract where admin keys can move user funds
@@ -70,6 +70,7 @@ Once a user signs a policy hash, the policy contract enforces it. **No model, ke
 ## Rule 6: Security Defaults
 
 - All new contracts start with TVL caps and per-user caps
+- Configure contracts with a Soroban `__constructor` (atomic with deployment); never expose a public `initialize` that anyone could call first
 - All admin operations require multisig + timelock
 - Pause authority is separate from upgrade authority
 - Circuit breakers are per-sleeve, not per-vault
@@ -81,7 +82,7 @@ Once a user signs a policy hash, the policy contract enforces it. **No model, ke
 ## Rule 7: Code Quality Standards
 
 - Language: **Rust** for Soroban contracts; **TypeScript** for SDK and frontend
-- Soroban SDK: Use v28+ (upgraded to v30 before Bell mainnet vote)
+- Soroban SDK: pin **28.x** to match OpenZeppelin `stellar-contracts` v0.8.0 (latest stable SDK is 29.0.1; 30.0.0 is RC-only as of 15 Nov 2026 — adopt v30 only after a stable release following the Bell vote)
 - Use `soroban-sdk`, `OpenZeppelin stellar-contracts` — do not reimplement audited primitives
 - Every contract function must have:
   - Input validation
@@ -99,7 +100,8 @@ Once a user signs a policy hash, the policy contract enforces it. **No model, ke
 | Events | `SCREAMING_SNAKE_CASE` topic strings |
 | Policy keys | Descriptive, underscore-separated |
 | Registry IDs | `ISSUER_TICKER` format (e.g. `FRANKLIN_BENJI`) |
-| Sleeve names | Semantic: `USD_GOV_FUNDS`, `EURO_SOVEREIGN`, `CASH_STABLE`, `LENDING`, `EQUITY` |
+| Sleeve names | Semantic: `USD_GOV_FUNDS`, `EUR_SOVEREIGN`, `CASH_STABLE`, `YIELD_DOLLAR`, `LENDING`, `EQUITY`, `XLM` |
+| Token events | SEP-41 (`transfer`, `approve`, `mint`, `burn`) and SEP-56 (`deposit`, `withdraw`, with the SEP-56 topic layout) event names are defined by the standards and take precedence over `SCREAMING_SNAKE_CASE`; every other event is `SCREAMING_SNAKE_CASE` |
 
 ---
 
@@ -119,7 +121,7 @@ Never invent protocol behavior. Never assume an SEP works a certain way without 
 Any UI showing simulated NAV, yield, or redemption times MUST display:
 > "This simulation uses historical data. Past performance does not predict future returns. This is not financial advice."
 
-This is a legal and reputational requirement, not optional.
+This is a legal and reputational requirement, not optional. This exact string is the **single canonical disclaimer**; `ai-engine/THESIS-ENGINE.md` and `roadmap/RISKS.md` reference it and must not define a different wording.
 
 ---
 
@@ -149,5 +151,16 @@ We enforce a strict separation of concerns between coordination/gating and isola
 | **QA / Red-Team Specialist** | `qa-verifier` | Spins up Docker Stellar container, executes mock transactions, tests edge cases (e.g. invalid tickers, oracle staleness, depeg limits). | Shell, Docker, Playwright |
 
 **Operational Mandate:** The Lead Coordinator stays focused on high-level architecture, task breakdown, and verification gates. Specialist workers perform syntax generation and test execution in isolation.
+
+---
+
+## Rule 13: No Mocks, No Hard-Codes, Adversarial Tests (added 15 Nov 2026)
+
+The 15 Nov 2026 audit (`docs/audit/AUDIT-2026-11-15.md`) found bugs that a green suite of 60 tests did not catch because tests only exercised happy paths under `mock_all_auths()`.
+
+- **No hard-coded product values** (risk haircuts, eligibility `true`, placeholder contract addresses). Derive them from state or configuration.
+- **Security-relevant tests must not use `mock_all_auths()`.** Use `mock_auths` with an explicit expected authorization tree, or real signatures, and assert *who* authorized (`env.auths()`).
+- **Every fix ships with:** (1) an isolated unit test, (2) a regression test that fails on the pre-fix code, (3) the full workspace suite green.
+- **Write adversarial cases**: self-transfers, zero/max amounts, future timestamps, unauthorized callers, reverts mid-call.
 
 

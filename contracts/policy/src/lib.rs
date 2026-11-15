@@ -2,9 +2,10 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
-    FromVal, Symbol, SymbolStr, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
+    Env, FromVal, Symbol, SymbolStr, Vec,
 };
+use soroban_sdk::xdr::ToXdr;
 
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,6 +25,7 @@ pub enum RegistrySleeveType {
 pub struct RegistryAssetEntry {
     pub contract_address: Address,
     pub asset_id: Symbol,
+    pub issuer: Symbol,
     pub sleeve_type: RegistrySleeveType,
     pub liquidity_tier: u32,
     pub permissionless: bool,
@@ -35,10 +37,25 @@ pub struct RegistryAssetEntry {
     pub added_at: u64,
 }
 
+/// Mirror of `constella_nav_oracle::PriceData` (decoupled to avoid WASM symbol clashes).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OraclePriceRef {
+    pub price: i128,
+    pub timestamp: u64,
+    pub source: Symbol,
+}
+
+#[contractclient(name = "OraclePriceClient")]
+pub trait OraclePriceInterface {
+    fn asset_price(env: Env, asset: Address) -> Option<OraclePriceRef>;
+}
+
 #[contractclient(name = "AssetRegistryClient")]
 pub trait AssetRegistryInterface {
     fn is_registered(env: Env, contract_address: Address) -> bool;
     fn get_asset(env: Env, asset_id: Symbol) -> Option<RegistryAssetEntry>;
+    fn get_asset_by_address(env: Env, contract_address: Address) -> Option<RegistryAssetEntry>;
 }
 
 #[contracterror]
@@ -57,6 +74,41 @@ pub enum PolicyError {
     LiquidityFloorBreached = 10,
     AssetNotRegistered = 11,
     SlippageLimitExceeded = 12,
+    /// A vault's policy can be registered once; afterwards only the owner may amend it.
+    PolicyAlreadyRegistered = 13,
+    /// A traded asset has no valid oracle price, so slippage cannot be measured.
+    PriceUnavailable = 14,
+    /// A trade buys an asset that is not declared (with a non-zero band) in the signed policy.
+    AssetNotInPolicy = 15,
+    /// The proposal was built against a different policy hash than the vault's current one.
+    PolicyHashMismatch = 16,
+    /// Notice period below the protocol minimum or shorter than the current one.
+    NoticeTooShort = 17,
+    /// No amendment is pending for this vault.
+    NoPendingUpdate = 18,
+    /// The pending amendment's notice period has not elapsed yet.
+    NoticeNotElapsed = 19,
+}
+
+/// Protocol minimum notice before a policy amendment takes effect (audit P4,
+/// owner decision D-E). Matches the 48h depositor notice used for upgrades in
+/// CONTRACTS-SPEC. Owners may lengthen it per vault, never shorten it.
+pub const PROTOCOL_MIN_NOTICE_SECONDS: u64 = 172_800;
+
+/// An owner-signed amendment waiting out its notice period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPolicyUpdate {
+    pub new_hash: BytesN<32>,
+    pub min_liquidity_sleeve_bps: u32,
+    pub max_single_asset_bps: u32,
+    pub max_issuer_bps: u32,
+    pub max_slippage_bps: u32,
+    pub rebalance_band_bps: u32,
+    pub sleeves: Vec<SleeveTarget>,
+    pub terms_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub effective_at: u64,
 }
 
 #[contracttype]
@@ -82,7 +134,12 @@ pub struct PolicyConfig {
     pub max_slippage_bps: u32,
     pub rebalance_band_bps: u32,
     pub is_active: bool,
-    pub admin: Address,
+    /// The policy signer (user smart account or treasury multisig). Only this
+    /// address can amend the policy (audit P3).
+    pub owner: Address,
+    /// SHA-256 of the XDR encoding of the stored terms
+    /// (registry, caps, sleeves) - lets anyone verify what was signed.
+    pub terms_hash: BytesN<32>,
 }
 
 #[contracttype]
@@ -109,6 +166,9 @@ pub struct TradeOperation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RebalanceProposal {
     pub vault: Address,
+    /// Hash of the policy the proposer built against; must equal the vault's
+    /// current registered hash (CONTRACTS-SPEC check 1, audit M1).
+    pub policy_hash: BytesN<32>,
     pub operations: Vec<TradeOperation>,
     pub weights_after: Vec<(Symbol, u32)>, // (asset_id, weight_bps)
     pub deadline: u64,
@@ -127,21 +187,27 @@ pub struct ValidationResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
+    Oracle,
     PolicyConfig(Address),
     SleeveTargets(Address),
+    PendingUpdate(Address),
+    NoticePeriod(Address),
 }
 
 #[cfg(test)]
 mod test;
 
 pub trait PolicyContractTrait {
-    /// Initialize the policy contract with a governance admin
-    fn initialize(env: Env, admin: Address);
+    /// The NAV oracle used for slippage valuation.
+    fn get_oracle(env: Env) -> Address;
 
-    /// Register a signed policy hash and configuration for a vault
+    /// Register the signed policy for a vault. Requires authorization from BOTH
+    /// the policy `owner` (who signs the hash and every term) and the `vault`
+    /// itself. One-time: re-registration fails with `PolicyAlreadyRegistered`.
     fn register_policy(
         env: Env,
         vault: Address,
+        owner: Address,
         policy_hash: BytesN<32>,
         registry_address: Address,
         min_liquidity_sleeve_bps: u32,
@@ -152,13 +218,38 @@ pub trait PolicyContractTrait {
         sleeves: Vec<SleeveTarget>,
     );
 
-    /// Update a vault's policy hash upon user re-signing
+    /// Propose an amendment. Requires a fresh signature from the stored policy
+    /// owner (audit P3). The current terms stay in force until the notice
+    /// period has elapsed and `activate_policy_update` is called (audit P4).
+    /// A new proposal replaces any pending one and restarts the clock.
     fn update_policy(
         env: Env,
         vault: Address,
         new_hash: BytesN<32>,
+        min_liquidity_sleeve_bps: u32,
+        max_single_asset_bps: u32,
+        max_issuer_bps: u32,
+        max_slippage_bps: u32,
+        rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     );
+
+    /// Apply a pending amendment once its notice period has elapsed.
+    /// Permissionless: anyone (keeper, UI, holder) may finalize it.
+    fn activate_policy_update(env: Env, vault: Address);
+
+    /// Withdraw a pending amendment. Policy owner only.
+    fn cancel_policy_update(env: Env, vault: Address);
+
+    /// The amendment waiting out its notice period, if any.
+    fn get_pending_policy_update(env: Env, vault: Address) -> Option<PendingPolicyUpdate>;
+
+    /// Lengthen this vault's amendment notice period. Owner only; can never be
+    /// shortened and never below PROTOCOL_MIN_NOTICE_SECONDS.
+    fn set_notice_period(env: Env, vault: Address, seconds: u64);
+
+    /// Current amendment notice period for this vault.
+    fn get_notice_period(env: Env, vault: Address) -> u64;
 
     /// Get registered policy hash for a vault
     fn get_policy_hash(env: Env, vault: Address) -> BytesN<32>;
@@ -183,26 +274,6 @@ pub trait PolicyContractTrait {
 #[contract]
 pub struct PolicyContract;
 
-fn get_issuer_prefix(env: &Env, asset_id: &Symbol) -> Symbol {
-    let sym_str: SymbolStr = SymbolStr::from_val(env, &asset_id.to_symbol_val());
-    let bytes: &[u8] = sym_str.as_ref();
-    let mut idx = 0;
-    let mut found_sep = false;
-    while idx < bytes.len() {
-        if bytes[idx] == b'_' {
-            found_sep = true;
-            break;
-        }
-        idx += 1;
-    }
-    if found_sep && idx > 0 {
-        if let Ok(issuer_str) = core::str::from_utf8(&bytes[..idx]) {
-            return Symbol::new(env, issuer_str);
-        }
-    }
-    asset_id.clone()
-}
-
 fn is_cash_sleeve(env: &Env, st: &Symbol) -> bool {
     let sym_str: SymbolStr = SymbolStr::from_val(env, &st.to_symbol_val());
     let bytes: &[u8] = sym_str.as_ref();
@@ -211,18 +282,87 @@ fn is_cash_sleeve(env: &Env, st: &Symbol) -> bool {
         || bytes.eq_ignore_ascii_case(b"cash_sleeve")
 }
 
+fn validate_terms(
+    env: &Env,
+    min_liquidity_sleeve_bps: u32,
+    max_single_asset_bps: u32,
+    max_issuer_bps: u32,
+    max_slippage_bps: u32,
+    sleeves: &Vec<SleeveTarget>,
+) {
+    if max_slippage_bps > 10000 {
+        panic_with_error!(env, PolicyError::SlippageLimitExceeded);
+    }
+    if min_liquidity_sleeve_bps > 10000 {
+        panic_with_error!(env, PolicyError::LiquidityFloorBreached);
+    }
+    if max_single_asset_bps > 10000 {
+        panic_with_error!(env, PolicyError::SingleAssetCapExceeded);
+    }
+    if max_issuer_bps > 10000 {
+        panic_with_error!(env, PolicyError::IssuerCapExceeded);
+    }
+    for i in 0..sleeves.len() {
+        let sleeve_i = sleeves.get(i).unwrap();
+        if sleeve_i.min_band_bps > sleeve_i.max_band_bps {
+            panic_with_error!(env, PolicyError::WeightBandExceeded);
+        }
+        for j in (i + 1)..sleeves.len() {
+            if sleeve_i.asset_id == sleeves.get(j).unwrap().asset_id {
+                panic_with_error!(env, PolicyError::WeightBandExceeded);
+            }
+        }
+    }
+}
+
+/// SHA-256 over the XDR of every enforced term, in a fixed order.
+pub fn compute_terms_hash(
+    env: &Env,
+    registry_address: &Address,
+    min_liquidity_sleeve_bps: u32,
+    max_single_asset_bps: u32,
+    max_issuer_bps: u32,
+    max_slippage_bps: u32,
+    rebalance_band_bps: u32,
+    sleeves: &Vec<SleeveTarget>,
+) -> BytesN<32> {
+    let terms = (
+        registry_address.clone(),
+        min_liquidity_sleeve_bps,
+        max_single_asset_bps,
+        max_issuer_bps,
+        max_slippage_bps,
+        rebalance_band_bps,
+        sleeves.clone(),
+    );
+    env.crypto().sha256(&terms.to_xdr(env)).to_bytes()
+}
+
+#[contractimpl]
+impl PolicyContract {
+    /// Set the governance admin and the NAV oracle used to value both legs of
+    /// every trade (audit P1). Runs atomically as part of deployment, so no one
+    /// can claim an uninitialized policy contract (audit M3). The oracle is
+    /// fixed for the life of this contract: there is deliberately no setter.
+    pub fn __constructor(env: Env, admin: Address, oracle: Address) {
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+    }
+}
+
 #[contractimpl]
 impl PolicyContractTrait for PolicyContract {
-    fn initialize(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, PolicyError::AlreadyInitialized);
+    fn get_oracle(env: Env) -> Address {
+        match env.storage().instance().get(&DataKey::Oracle) {
+            Some(o) => o,
+            None => panic_with_error!(&env, PolicyError::NotInitialized),
         }
-        env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
     fn register_policy(
         env: Env,
         vault: Address,
+        owner: Address,
         policy_hash: BytesN<32>,
         registry_address: Address,
         min_liquidity_sleeve_bps: u32,
@@ -232,48 +372,45 @@ impl PolicyContractTrait for PolicyContract {
         rebalance_band_bps: u32,
         sleeves: Vec<SleeveTarget>,
     ) {
-        let admin = Self::get_admin(env.clone());
-        admin.require_auth();
+        // Fail fast if the contract was never initialized.
+        let _ = Self::get_admin(env.clone());
+        // The vault must consent to being governed by this policy, and the
+        // owner signs the hash together with every enforced term (audit P3).
+        vault.require_auth();
+        owner.require_auth();
 
-        if max_slippage_bps > 10000 {
-            panic_with_error!(&env, PolicyError::SlippageLimitExceeded);
-        }
-        if min_liquidity_sleeve_bps > 10000 {
-            panic_with_error!(&env, PolicyError::LiquidityFloorBreached);
-        }
-        if max_single_asset_bps > 10000 {
-            panic_with_error!(&env, PolicyError::SingleAssetCapExceeded);
-        }
-        if max_issuer_bps > 10000 {
-            panic_with_error!(&env, PolicyError::IssuerCapExceeded);
-        }
-
-        // Validate sleeve band sanity if sleeves provided
-        for i in 0..sleeves.len() {
-            let sleeve_i = sleeves.get(i).unwrap();
-            if sleeve_i.min_band_bps > sleeve_i.max_band_bps {
-                panic_with_error!(&env, PolicyError::WeightBandExceeded);
-            }
-            // Check for duplicate sleeves
-            for j in (i + 1)..sleeves.len() {
-                let sleeve_j = sleeves.get(j).unwrap();
-                if sleeve_i.asset_id == sleeve_j.asset_id {
-                    panic_with_error!(&env, PolicyError::WeightBandExceeded);
-                }
-            }
-        }
-
-        let existing_version = env
+        if env
             .storage()
             .instance()
-            .get::<_, PolicyConfig>(&DataKey::PolicyConfig(vault.clone()))
-            .map(|c| c.version)
-            .unwrap_or(0);
+            .has(&DataKey::PolicyConfig(vault.clone()))
+        {
+            panic_with_error!(&env, PolicyError::PolicyAlreadyRegistered);
+        }
+
+        validate_terms(
+            &env,
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            &sleeves,
+        );
+
+        let terms_hash = compute_terms_hash(
+            &env,
+            &registry_address,
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            rebalance_band_bps,
+            &sleeves,
+        );
 
         let config = PolicyConfig {
             vault: vault.clone(),
             policy_hash: policy_hash.clone(),
-            version: existing_version + 1,
+            version: 1,
             registry_address,
             min_liquidity_sleeve_bps,
             max_single_asset_bps,
@@ -281,7 +418,8 @@ impl PolicyContractTrait for PolicyContract {
             max_slippage_bps,
             rebalance_band_bps,
             is_active: true,
-            admin: admin.clone(),
+            owner: owner.clone(),
+            terms_hash: terms_hash.clone(),
         };
 
         env.storage()
@@ -293,7 +431,7 @@ impl PolicyContractTrait for PolicyContract {
 
         env.events().publish(
             (Symbol::new(&env, "POLICY_REGISTERED"), vault),
-            policy_hash,
+            (policy_hash, owner, terms_hash),
         );
     }
 
@@ -301,25 +439,84 @@ impl PolicyContractTrait for PolicyContract {
         env: Env,
         vault: Address,
         new_hash: BytesN<32>,
+        min_liquidity_sleeve_bps: u32,
+        max_single_asset_bps: u32,
+        max_issuer_bps: u32,
+        max_slippage_bps: u32,
+        rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     ) {
-        let admin = Self::get_admin(env.clone());
-        admin.require_auth();
+        let config: PolicyConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyConfig(vault.clone()))
+        {
+            Some(cfg) => cfg,
+            None => panic_with_error!(&env, PolicyError::PolicyNotFound),
+        };
+        // Only the policy owner can amend — never the protocol admin (audit P3).
+        config.owner.require_auth();
 
-        // Validate new sleeve sanity
-        for i in 0..new_sleeves.len() {
-            let sleeve_i = new_sleeves.get(i).unwrap();
-            if sleeve_i.min_band_bps > sleeve_i.max_band_bps {
-                panic_with_error!(&env, PolicyError::WeightBandExceeded);
-            }
-            for j in (i + 1)..new_sleeves.len() {
-                let sleeve_j = new_sleeves.get(j).unwrap();
-                if sleeve_i.asset_id == sleeve_j.asset_id {
-                    panic_with_error!(&env, PolicyError::WeightBandExceeded);
-                }
-            }
+        validate_terms(
+            &env,
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            &new_sleeves,
+        );
+        let terms_hash = compute_terms_hash(
+            &env,
+            &config.registry_address,
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            rebalance_band_bps,
+            &new_sleeves,
+        );
+
+        // Audit P4: schedule, do not apply. Holders keep the current terms for
+        // the full notice period and can exit before the change lands.
+        let now = env.ledger().timestamp();
+        let effective_at = match now.checked_add(Self::get_notice_period(env.clone(), vault.clone())) {
+            Some(t) => t,
+            None => panic_with_error!(&env, PolicyError::NoticeTooShort),
+        };
+        let pending = PendingPolicyUpdate {
+            new_hash: new_hash.clone(),
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            rebalance_band_bps,
+            sleeves: new_sleeves,
+            terms_hash: terms_hash.clone(),
+            proposed_at: now,
+            effective_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpdate(vault.clone()), &pending);
+
+        env.events().publish(
+            (Symbol::new(&env, "POLICY_UPDATE_PROPOSED"), vault),
+            (new_hash, effective_at, terms_hash),
+        );
+    }
+
+    fn activate_policy_update(env: Env, vault: Address) {
+        let pending: PendingPolicyUpdate = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpdate(vault.clone()))
+        {
+            Some(p) => p,
+            None => panic_with_error!(&env, PolicyError::NoPendingUpdate),
+        };
+        if env.ledger().timestamp() < pending.effective_at {
+            panic_with_error!(&env, PolicyError::NoticeNotElapsed);
         }
-
         let mut config: PolicyConfig = match env
             .storage()
             .instance()
@@ -329,20 +526,96 @@ impl PolicyContractTrait for PolicyContract {
             None => panic_with_error!(&env, PolicyError::PolicyNotFound),
         };
 
-        config.policy_hash = new_hash.clone();
+        config.policy_hash = pending.new_hash.clone();
         config.version += 1;
+        config.min_liquidity_sleeve_bps = pending.min_liquidity_sleeve_bps;
+        config.max_single_asset_bps = pending.max_single_asset_bps;
+        config.max_issuer_bps = pending.max_issuer_bps;
+        config.max_slippage_bps = pending.max_slippage_bps;
+        config.rebalance_band_bps = pending.rebalance_band_bps;
+        config.terms_hash = pending.terms_hash.clone();
 
         env.storage()
             .instance()
             .set(&DataKey::PolicyConfig(vault.clone()), &config);
         env.storage()
             .instance()
-            .set(&DataKey::SleeveTargets(vault.clone()), &new_sleeves);
+            .set(&DataKey::SleeveTargets(vault.clone()), &pending.sleeves);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingUpdate(vault.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "POLICY_UPDATED"), vault),
-            new_hash,
+            (pending.new_hash, config.version, config.terms_hash),
         );
+    }
+
+    fn cancel_policy_update(env: Env, vault: Address) {
+        let config: PolicyConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyConfig(vault.clone()))
+        {
+            Some(cfg) => cfg,
+            None => panic_with_error!(&env, PolicyError::PolicyNotFound),
+        };
+        config.owner.require_auth();
+        let pending: PendingPolicyUpdate = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpdate(vault.clone()))
+        {
+            Some(p) => p,
+            None => panic_with_error!(&env, PolicyError::NoPendingUpdate),
+        };
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingUpdate(vault.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "POLICY_UPDATE_CANCELLED"), vault),
+            pending.new_hash,
+        );
+    }
+
+    fn get_pending_policy_update(env: Env, vault: Address) -> Option<PendingPolicyUpdate> {
+        env.storage().instance().get(&DataKey::PendingUpdate(vault))
+    }
+
+    fn set_notice_period(env: Env, vault: Address, seconds: u64) {
+        let config: PolicyConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyConfig(vault.clone()))
+        {
+            Some(cfg) => cfg,
+            None => panic_with_error!(&env, PolicyError::PolicyNotFound),
+        };
+        config.owner.require_auth();
+        let current = Self::get_notice_period(env.clone(), vault.clone());
+        if seconds < current {
+            panic_with_error!(&env, PolicyError::NoticeTooShort);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::NoticePeriod(vault.clone()), &seconds);
+        env.events().publish(
+            (Symbol::new(&env, "POLICY_NOTICE_SET"), vault),
+            (current, seconds),
+        );
+    }
+
+    fn get_notice_period(env: Env, vault: Address) -> u64 {
+        let stored: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NoticePeriod(vault))
+            .unwrap_or(PROTOCOL_MIN_NOTICE_SECONDS);
+        if stored < PROTOCOL_MIN_NOTICE_SECONDS {
+            PROTOCOL_MIN_NOTICE_SECONDS
+        } else {
+            stored
+        }
     }
 
     fn get_policy_hash(env: Env, vault: Address) -> BytesN<32> {
@@ -411,6 +684,21 @@ impl PolicyContractTrait for PolicyContract {
                 is_valid: false,
                 code: PolicyError::Unauthorized as u32,
                 message: Symbol::new(&env, "VAULT_MISMATCH"),
+            };
+            env.events().publish(
+                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                (res.is_valid, res.code),
+            );
+            return res;
+        }
+
+        // 0. The proposal must target the vault's CURRENT signed policy (audit M1).
+        // After the owner amends, proposals built for the old policy are void.
+        if proposal.policy_hash != config.policy_hash {
+            let res = ValidationResult {
+                is_valid: false,
+                code: PolicyError::PolicyHashMismatch as u32,
+                message: Symbol::new(&env, "POLICY_HASH_MISMATCH"),
             };
             env.events().publish(
                 (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
@@ -544,19 +832,47 @@ impl PolicyContractTrait for PolicyContract {
             }
         }
 
-        // 5. Verify issuer caps: no single issuer exceeds max_issuer_bps
+        // 5. Closed universe + issuer caps (audit P2). Every asset carrying
+        // weight must be an active registry entry, and issuer concentration is
+        // summed by the issuer recorded in the registry (e.g. USDC and EURC
+        // both count toward CIRCLE) - never inferred from the asset_id text.
+        let registry_client = AssetRegistryClient::new(&env, &config.registry_address);
+        let mut issuer_weights: Vec<(Symbol, u32)> = Vec::new(&env);
         for j in 0..proposal.weights_after.len() {
-            let (asset_id, _) = proposal.weights_after.get(j).unwrap();
-            let issuer = get_issuer_prefix(&env, &asset_id);
-            let mut total_issuer_weight = 0u32;
-            for k in 0..proposal.weights_after.len() {
-                let (other_asset_id, other_weight) = proposal.weights_after.get(k).unwrap();
-                let other_issuer = get_issuer_prefix(&env, &other_asset_id);
-                if issuer == other_issuer {
-                    total_issuer_weight = total_issuer_weight.saturating_add(other_weight);
+            let (asset_id, weight) = proposal.weights_after.get(j).unwrap();
+            if weight == 0 {
+                continue;
+            }
+            let entry = match registry_client.get_asset(&asset_id) {
+                Some(entry) if entry.is_active => entry,
+                _ => {
+                    let res = ValidationResult {
+                        is_valid: false,
+                        code: PolicyError::AssetNotRegistered as u32,
+                        message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
+                    };
+                    env.events().publish(
+                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                        (res.is_valid, res.code),
+                    );
+                    return res;
+                }
+            };
+            let mut found = false;
+            for k in 0..issuer_weights.len() {
+                let (issuer, total) = issuer_weights.get(k).unwrap();
+                if issuer == entry.issuer {
+                    issuer_weights.set(k, (issuer, total.saturating_add(weight)));
+                    found = true;
+                    break;
                 }
             }
-            if total_issuer_weight > config.max_issuer_bps {
+            if !found {
+                issuer_weights.push_back((entry.issuer, weight));
+            }
+        }
+        for (_, total) in issuer_weights.iter() {
+            if total > config.max_issuer_bps {
                 let res = ValidationResult {
                     is_valid: false,
                     code: PolicyError::IssuerCapExceeded as u32,
@@ -597,7 +913,7 @@ impl PolicyContractTrait for PolicyContract {
             return res;
         }
 
-        // 7. Verify each trade operation slippage: if amount_in > 0, calculate if min_amount_out respects max_slippage_bps
+        // 7. Structural checks on every trade operation
         for i in 0..proposal.operations.len() {
             let op = proposal.operations.get(i).unwrap();
             if op.amount_in <= 0 || op.min_amount_out <= 0 {
@@ -625,61 +941,9 @@ impl PolicyContractTrait for PolicyContract {
                 return res;
             }
 
-            let slippage_factor = 10000u32.saturating_sub(config.max_slippage_bps) as i128;
-            let min_required_out = match op.amount_in.checked_mul(slippage_factor) {
-                Some(product) => product / 10000,
-                None => {
-                    let res = ValidationResult {
-                        is_valid: false,
-                        code: PolicyError::SlippageLimitExceeded as u32,
-                        message: Symbol::new(&env, "SLIPPAGE_OVERFLOW"),
-                    };
-                    env.events().publish(
-                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                        (res.is_valid, res.code),
-                    );
-                    return res;
-                }
-            };
-            if op.min_amount_out < min_required_out {
-                let res = ValidationResult {
-                    is_valid: false,
-                    code: PolicyError::SlippageLimitExceeded as u32,
-                    message: Symbol::new(&env, "SLIPPAGE_EXCEEDED"),
-                };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
-                return res;
-            }
         }
 
-        // 8. Cross-contract call to constella-registry
-        let registry_client = AssetRegistryClient::new(&env, &config.registry_address);
-
-        // 8a. Verify all assets with positive weight in weights_after are registered and active
-        for j in 0..proposal.weights_after.len() {
-            let (asset_id, weight) = proposal.weights_after.get(j).unwrap();
-            if weight > 0 {
-                match registry_client.get_asset(&asset_id) {
-                    Some(entry) if entry.is_active => {}
-                    _ => {
-                        let res = ValidationResult {
-                            is_valid: false,
-                            code: PolicyError::AssetNotRegistered as u32,
-                            message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
-                        };
-                        env.events().publish(
-                            (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                            (res.is_valid, res.code),
-                        );
-                        return res;
-                    }
-                }
-            }
-        }
-
+        // 8. (weighted assets were verified against the registry in step 5)
         // 8b. Verify all traded assets in operations are registered and active
         for i in 0..proposal.operations.len() {
             let op = proposal.operations.get(i).unwrap();
@@ -690,6 +954,90 @@ impl PolicyContractTrait for PolicyContract {
                     is_valid: false,
                     code: PolicyError::AssetNotRegistered as u32,
                     message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
+                };
+                env.events().publish(
+                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                    (res.is_valid, res.code),
+                );
+                return res;
+            }
+        }
+
+        // 8c. Exclusions (audit M1, EXECUTION.md "no excluded asset is bought"):
+        // the signed sleeve list is the allow-list. Every asset bought must be
+        // declared there with a non-zero upper band. Selling is not restricted.
+        for i in 0..proposal.operations.len() {
+            let op = proposal.operations.get(i).unwrap();
+            let bought = registry_client.get_asset_by_address(&op.asset_out);
+            let allowed = match bought {
+                Some(entry) => {
+                    let mut ok = false;
+                    for k in 0..sleeves.len() {
+                        let sleeve = sleeves.get(k).unwrap();
+                        if sleeve.asset_id == entry.asset_id && sleeve.max_band_bps > 0 {
+                            ok = true;
+                            break;
+                        }
+                    }
+                    ok
+                }
+                None => false,
+            };
+            if !allowed {
+                let res = ValidationResult {
+                    is_valid: false,
+                    code: PolicyError::AssetNotInPolicy as u32,
+                    message: Symbol::new(&env, "ASSET_NOT_IN_POLICY"),
+                };
+                env.events().publish(
+                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                    (res.is_valid, res.code),
+                );
+                return res;
+            }
+        }
+
+        // 9. Slippage measured in VALUE (audit P1). Both legs are priced by the
+        // NAV oracle (median of each asset's valid sources, numéraire = 1.0) and
+        // normalised by each token's decimals:
+        //   value = amount * price / 10^token_decimals
+        //   require  min_value_out >= value_in * (1 - max_slippage)
+        let oracle = OraclePriceClient::new(&env, &Self::get_oracle(env.clone()));
+        let keep_bps = 10000i128 - config.max_slippage_bps as i128;
+        for i in 0..proposal.operations.len() {
+            let op = proposal.operations.get(i).unwrap();
+            let (p_in, p_out) = match (oracle.asset_price(&op.asset_in), oracle.asset_price(&op.asset_out)) {
+                (Some(a), Some(b)) if a.price > 0 && b.price > 0 => (a.price, b.price),
+                _ => {
+                    let res = ValidationResult {
+                        is_valid: false,
+                        code: PolicyError::PriceUnavailable as u32,
+                        message: Symbol::new(&env, "PRICE_UNAVAILABLE"),
+                    };
+                    env.events().publish(
+                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                        (res.is_valid, res.code),
+                    );
+                    return res;
+                }
+            };
+            let dec_in = token::Client::new(&env, &op.asset_in).decimals();
+            let dec_out = token::Client::new(&env, &op.asset_out).decimals();
+            let checked = (|| -> Option<bool> {
+                let value_in = op.amount_in.checked_mul(p_in)? / 10i128.checked_pow(dec_in)?;
+                let min_value_out = op.min_amount_out.checked_mul(p_out)? / 10i128.checked_pow(dec_out)?;
+                Some(min_value_out.checked_mul(10000)? >= value_in.checked_mul(keep_bps)?)
+            })();
+            let (ok, msg) = match checked {
+                Some(true) => (true, ""),
+                Some(false) => (false, "SLIPPAGE_EXCEEDED"),
+                None => (false, "SLIPPAGE_OVERFLOW"),
+            };
+            if !ok {
+                let res = ValidationResult {
+                    is_valid: false,
+                    code: PolicyError::SlippageLimitExceeded as u32,
+                    message: Symbol::new(&env, msg),
                 };
                 env.events().publish(
                     (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),

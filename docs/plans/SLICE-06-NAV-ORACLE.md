@@ -1,7 +1,7 @@
 # Slice 6 Micro-Spec: NAV Oracle Contract (SEP-40 Multi-Source & Deviation Circuit Breakers)
 
 > **Module:** `contracts/nav-oracle`  
-> **Status:** Implemented & Verified  
+> **Status:** Implemented. Open findings (O1–O4, W5) tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/architecture/NAV-ORACLE.md`](../build-spec/architecture/NAV-ORACLE.md), [`docs/build-spec/contracts/CONTRACTS-SPEC.md`](../build-spec/contracts/CONTRACTS-SPEC.md#L197-L240), [`docs/build-spec/contracts/SEPS.md`](../build-spec/contracts/SEPS.md#L87-L111), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 3, 6, 8, 11, 12)
 
 ---
@@ -15,8 +15,8 @@ Implement and verify the on-chain NAV Oracle contract in Soroban Rust:
    - **Rule 3 (Dual NAV):**
      - `collateral_nav` = **Minimum** of valid sources (conservative lender collateral sizing).
      - `deposit_nav` = **Median** of valid sources (equitable share minting/redemption).
-   - **Rule 4 (Circuit Breaker):** Automated sleeve pause if valid sources diverge by > 2%–3% (`deviation_threshold_bps`). Emits `NAV_PAUSE`.
-   - **Rule 5 (Hard Stop & Staleness):** Feeds exceeding `staleness_limit_seconds` are invalid; if fewer than 2 valid sources remain, trigger hard stop on the sleeve.
+   - **Rule 4 (Circuit Breaker):** Automated sleeve pause if valid sources diverge by > 2%–3% (`deviation_threshold_bps`). Emits `NAV_PAUSE`. Latched on price writes (`update_price` / `register_source`) so it cannot be rolled back by a reverting reader (audit O4).
+   - **Rule 5 (Hard Stop & Staleness):** Feeds exceeding `staleness_limit_seconds` are invalid; if fewer than 2 valid sources remain, trigger hard stop on the sleeve. Future-dated timestamps are rejected/invalid and updates may not go backwards in time (audit O2).
 2. **SEP-40 Interface Compliance:** Full compatibility with Stellar's oracle standard (`price`, `lastprice`, `base`, `decimals`, `resolution`, `assets`) for direct lending integration on Blend and Liqvid.
 3. **Per-Sleeve Isolation:** An issue or pause on one sleeve never halts or corrupts unaffected sleeves.
 
@@ -28,7 +28,8 @@ Implement and verify the on-chain NAV Oracle contract in Soroban Rust:
 #[contractclient(name = "NavOracleClient")]
 pub trait NavOracleTrait {
     /// Initialize oracle with admin, base asset (numéraire), decimals, and resolution
-    fn initialize(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32);
+    // Audit M3 (15 Nov 2026): set atomically at deployment; no `initialize`.
+    fn __constructor(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32);
 
     /// Configure sleeve deviation threshold (bps) and staleness limits
     fn configure_sleeve(
@@ -70,7 +71,9 @@ pub trait NavOracleTrait {
 
     /// Circuit breaker status and management
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool;
-    fn trigger_circuit_breaker(env: Env, sleeve_id: Symbol, reason: Symbol);
+    fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol); // pause authority or admin (audit O1)
+    fn set_pause_authority(env: Env, new_authority: Address); // admin only
+    fn get_pause_authority(env: Env) -> Address;
     fn clear_circuit_breaker(env: Env, sleeve_id: Symbol);
 
     /// Admin query

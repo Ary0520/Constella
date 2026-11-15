@@ -27,7 +27,7 @@ Before any asset is added to the registry:
 5. Begin issuer allow-listing conversation (for permissioned assets)
 6. Add to registry contract (requires admin multisig + legal/compliance sign-off)
 7. Add to vector search index with metadata and description
-8. Update this file + notify all agents via research-updates/LOG.md
+8. Update this file + notify all agents via `references/RESEARCH-UPDATES.md`
 ```
 
 **An asset that skips any step is NOT in the registry.**
@@ -77,7 +77,7 @@ DeFi lending yield on Stellar.
 
 | Asset ID | Asset | Protocol | Permissioned? | Liquidity Tier | Notes |
 |---|---|---|---|---|---|
-| `BLEND_USDC_SUPPLY` | Blend USDC supply | Blend | No | 1 (24h) | Dominant Stellar lending protocol; ~$195M TVL |
+| `BLEND_USDC_SUPPLY` | Blend USDC supply | Blend | No | 1 (24h) | Dominant Stellar lending protocol; ~$105M TVL (Blend Pools V2, 15 Nov 2026) |
 | `DEFINDEX_USDC` | DeFindex USDC | DeFindex | No | 1 (24h) | Yield aggregator; ~$18.5M TVL |
 
 Higher yield, higher risk. Hard-capped at 15% in any basket by default.
@@ -99,6 +99,9 @@ Higher yield, higher risk. Hard-capped at 15% in any basket by default.
 ---
 
 ## Issuer Concentration Policy
+
+The issuer cap is computed from the **`issuer` field of each on-chain registry entry** (audit P2, 15 Nov 2026) — never inferred from the asset ID. USDC and EURC both carry `issuer = CIRCLE`, so they share one cap; Spiko USD and Spiko EUR both count toward `SPIKO`.
+
 
 | Constraint | Default | Configurable by user? |
 |---|---|---|
@@ -130,7 +133,7 @@ Higher yield, higher risk. Hard-capped at 15% in any basket by default.
 When a new asset is confirmed for the registry, or an existing asset's status changes:
 
 1. Update this file (asset-registry entry)
-2. Update `research-updates/LOG.md` with the date and what changed
+2. Update `references/RESEARCH-UPDATES.md` with the date and what changed
 3. Update the on-chain registry contract (admin multisig required)
 4. Update the vector search index
 5. Notify any active agents referencing the registry

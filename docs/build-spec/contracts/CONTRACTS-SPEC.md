@@ -1,7 +1,7 @@
 # Contracts Specification
 
 > All contracts are written in **Rust**, compiled to **WASM**, deployed on **Soroban**.  
-> Base: OpenZeppelin stellar-contracts **v0.8.0** (released October 2026).  
+> Base: OpenZeppelin stellar-contracts **v0.8.0** (released 20 October 2026; requires `soroban-sdk` **28.0.0**).  
 > Reference: Product doc §4.3, §4.6, §4.9; `architecture/VAULT-DESIGN.md`
 
 ---
@@ -47,6 +47,7 @@ fn is_registered(env: Env, contract_address: Address) -> bool
 pub struct AssetEntry {
     contract_address: Address,
     asset_id: String,            // e.g. "FRANKLIN_BENJI"
+    issuer: Symbol,              // e.g. "CIRCLE" for USDC and EURC; required (audit P2)
     sleeve_type: SleeveType,     // cash | usd_gov_fund | eur_sovereign | yield_usd | lending | equity
     liquidity_tier: u8,          // 0=instant, 1=24h, 2=1week, 3=illiquid
     permissionless: bool,
@@ -74,11 +75,26 @@ pub struct AssetEntry {
 
 **Key functions:**
 ```rust
-fn register_policy(env: Env, vault: Address, policy_hash: BytesN<32>)
+// Requires vault.require_auth() AND owner.require_auth(); one-time per vault.
+fn register_policy(env: Env, vault: Address, owner: Address, policy_hash: BytesN<32>,
+                   registry_address: Address, min_liquidity_sleeve_bps: u32, max_single_asset_bps: u32,
+                   max_issuer_bps: u32, max_slippage_bps: u32, rebalance_band_bps: u32,
+                   sleeves: Vec<SleeveTarget>)
+// Requires the stored owner's fresh signature; SCHEDULES the amendment (audit P4).
+fn update_policy(env: Env, vault: Address, new_hash: BytesN<32>, min_liquidity_sleeve_bps: u32,
+                 max_single_asset_bps: u32, max_issuer_bps: u32, max_slippage_bps: u32,
+                 rebalance_band_bps: u32, new_sleeves: Vec<SleeveTarget>)
 fn validate_rebalance(env: Env, vault: Address, proposal: RebalanceProposal) -> ValidationResult
 fn get_policy_hash(env: Env, vault: Address) -> BytesN<32>
-fn update_policy(env: Env, vault: Address, new_hash: BytesN<32>) // requires user re-sign
+fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfig> // includes owner + terms_hash
 ```
+
+**Signing model (audit P3, 15 Nov 2026):**
+- The **policy owner** (user passkey smart account or treasury multisig) signs `register_policy` / `update_policy`. Soroban authorization covers every argument, so one signature binds the canonical-JSON `policy_hash` to the exact on-chain caps and sleeves.
+- The **vault** consents by invoking registration itself through `vault.bind_policy(...)`, which also requires the vault admin (who selects the owner). Neither the admin nor the owner can bind alone.
+- **Amendments wait a notice period** (audit P4, owner decision D-E): `update_policy` only schedules; the current terms govern until `activate_policy_update` (permissionless) is called after `max(per-vault notice, 48h protocol minimum)`. The owner may `cancel_policy_update`, and may lengthen — never shorten — the notice with `set_notice_period`. Holders can redeem under the old terms throughout.
+- The **protocol admin cannot register, replace, or amend** a policy. Registration is one-time per vault (`PolicyAlreadyRegistered`), preventing squatting.
+- `terms_hash = SHA-256(XDR(registry_address, min_liquidity_sleeve_bps, max_single_asset_bps, max_issuer_bps, max_slippage_bps, rebalance_band_bps, sleeves))` is stored on every write so anyone can verify the enforced terms.
 
 **Validation checks (ALL must pass — any failure rejects the entire proposal):**
 1. `policy_hash` matches the vault's registered hash
@@ -88,12 +104,14 @@ fn update_policy(env: Env, vault: Address, new_hash: BytesN<32>) // requires use
 5. Liquidity sleeve minimum maintained
 6. All assets in proposal are in the registry and active
 7. Proposal deadline not exceeded (prevents replays)
-8. Slippage per operation within limit
+8. Slippage per operation within limit — measured in **value**, not token units (audit P1): each leg is `amount × asset_price / 10^token_decimals` using the NAV oracle's per-asset median (numéraire = 1.0); require `min_value_out ≥ value_in × (1 − max_slippage_bps/10000)`. No valid price → proposal invalid (`PriceUnavailable`). The policy contract's oracle is set once in `initialize(admin, oracle)` and has no setter.
+9. Every asset **bought** is declared in the signed sleeves with a non-zero upper band — the signed list is the allow-list that enforces exclusions (audit M1). Selling undeclared assets is allowed.
 
 **RebalanceProposal struct:**
 ```rust
 pub struct RebalanceProposal {
     vault: Address,
+    policy_hash: BytesN<32>,  // must equal the vault's current hash (check 1)
     operations: Vec<TradeOperation>,
     weights_after: Vec<(String, u32)>, // (asset_id, weight_bps)
     deadline: u64,
@@ -140,7 +158,12 @@ fn get_listing_kit(env: Env) -> ListingKit
 // Admin
 fn pause(env: Env)             // pause authority (single key — fast)
 fn unpause(env: Env)           // admin multisig required
-fn upgrade(env: Env, new_wasm: BytesN<32>)  // admin multisig + 48h timelock
+fn propose_upgrade(env: Env, new_wasm: BytesN<32>)  // admin; executable after 48h (audit W3)
+fn execute_upgrade(env: Env)                         // admin; fails before the timelock
+fn cancel_upgrade(env: Env)                          // admin
+fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade>
+fn lower_caps(env: Env, tvl_cap: i128, per_user_cap: i128)  // admin; decrease only
+fn max_deposit(env: Env, receiver: Address) -> i128  // real remaining room under both caps
 ```
 
 **VaultState struct:**
@@ -156,6 +179,8 @@ pub struct VaultState {
     is_paused: bool,
     last_fee_accrual: u64,
     management_fee_bps: u32,
+    tvl_cap: i128,        // required, > 0; total vault value cap (Rule 6; $1M in beta)
+    per_user_cap: i128,   // required, > 0, <= tvl_cap; per-receiver cap on deposit/mint
 }
 
 pub struct SleeveState {
@@ -183,8 +208,8 @@ pub struct RedemptionCapacity {
 **RiskSheet struct:**
 ```rust
 pub struct RiskSheet {
-    recommended_ltv_bps: u32,     // e.g. 9800 = 98% (2% haircut)
-    recommended_haircut_bps: u32, // e.g. 200 = 2%
+    recommended_ltv_bps: u32,     // derived from composition, see references/COLLATERAL-PASSPORT.md Pillar 3
+    recommended_haircut_bps: u32, // e.g. 1000 = 10% for a >50% cash basket; never hard-coded
     weighted_avg_redemption_hours: u32,
     computed_at: u64,
 }
@@ -200,22 +225,32 @@ pub struct RiskSheet {
 
 **Key functions:**
 ```rust
-// SEP-40 compatible
-fn get_price(env: Env) -> Option<PriceData>          // conservative NAV
-fn get_deposit_price(env: Env) -> Option<PriceData>  // median NAV
-fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>
-fn resolution(env: Env) -> u32   // seconds
-fn base(env: Env) -> Address     // numéraire
+// SEP-40 (Draft v0.1.0) — exact interface; Blend v2 calls lastprice(Asset::Stellar(addr))
+// enum Asset { Stellar(Address), Other(Symbol) }
+// struct PriceData { price: i128, timestamp: u64 }
+fn base(env: Env) -> Asset                                         // numéraire
+fn assets(env: Env) -> Vec<Asset>
 fn decimals(env: Env) -> u32
-fn assets(env: Env) -> Vec<Address>
+fn resolution(env: Env) -> u32                                     // seconds
+fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData>
+fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>>
+fn lastprice(env: Env, asset: Asset) -> Option<PriceData>          // conservative NAV; None while sleeve paused/halted
+
+// Constella extensions (non-SEP-40)
+fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>  // minimum of valid sources
+fn asset_price(env: Env, asset: Address) -> Option<PriceData>            // median of the asset's own valid sources; base = 1.0
+fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>     // median of valid sources
 
 // Oracle management
 fn get_sources(env: Env) -> Vec<OracleSource>
 fn is_halted(env: Env) -> bool
 fn is_sleeve_paused(env: Env, sleeve_id: String) -> bool
 fn update_source(env: Env, source_id: String, price: i128, timestamp: u64)  // oracle feeds only
-fn trigger_circuit_breaker(env: Env, sleeve_id: String, reason: CircuitBreakerReason)
-fn clear_circuit_breaker(env: Env, sleeve_id: String)  // admin only
+// caller must sign AND be the pause authority or the admin (audit O1)
+fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol)
+fn clear_circuit_breaker(env: Env, sleeve_id: Symbol)  // admin (multisig) only
+fn set_pause_authority(env: Env, new_authority: Address)  // admin only; defaults to admin
+fn get_pause_authority(env: Env) -> Address
 ```
 
 **PriceData struct:**
@@ -289,9 +324,11 @@ pub trait IssuerAdapter {
 | Admin cannot move user funds | `redeem()` checks `owner == caller` or allowance; no admin bypass |
 | Policy cannot be exceeded | Policy contract validates every proposal; rejects if any check fails |
 | Oracle cannot be gamed by thin markets | Min-liquidity-depth check in NAV oracle (Rule 2) |
-| Upgrade requires multisig + timelock | `upgrade()` gated by admin multisig and 48h timelock |
+| Upgrade requires multisig + timelock | `propose_upgrade` → 48h → `execute_upgrade` (admin multisig), cancellable; events `UPGRADE_PROPOSED` / `UPGRADE` / `UPGRADE_CANCELLED` |
+| Deposits are capped | `tvl_cap` and `per_user_cap` enforced on deposit/mint; caps can be lowered in place, raised only via a timelocked upgrade |
 | Pause is fast | Single-sig pause authority; multi-sig required to unpause |
 | Circuit breakers are per-sleeve | One bad oracle/issuer does not halt the whole vault |
+| No front-runnable initialization | Every contract is configured by a Soroban `__constructor`, which runs atomically inside the deployment; there is no public `initialize` (audit M3) |
 | Fee accrual is transparent | On-chain, visible at all times as share dilution |
 | Keeper is not trusted | Keeper keypair has only proposal authority; policy contract validates |
 
@@ -299,12 +336,7 @@ pub trait IssuerAdapter {
 
 ## Upgrade and Deployment
 
-All strategy vault instances share one WASM binary (CAP-85, Adapter Protocol 28):
-
-```bash
-# Atomic fleet upgrade — upgrades all vault instances sharing this WASM
-stellar contract deploy --wasm vault.wasm --upgrade-fleet true
-```
+All strategy vault instances share one WASM binary. Fleet upgrades use CAP-85 "externally managed contract executables" (Protocol 28). There is **no** `--upgrade-fleet` CLI flag; follow the CAP-85 and stellar-cli documentation for the exact procedure and verify on testnet first.
 
 State migrations use the standard CAP-85 data-migration path.
 
@@ -327,8 +359,9 @@ Data: { relevant fields, timestamp }
 
 | Event | Trigger |
 |---|---|
-| `DEPOSIT` | User deposits numéraire |
-| `REDEEM` | User redeems shares |
+| `deposit` | SEP-56 event (name defined by the standard): topics `[deposit, operator, from, receiver]`, data `(assets, shares)`; emitted by `deposit` and `mint` |
+| `withdraw` | SEP-56 event: topics `[withdraw, operator, receiver, owner]`, data `(assets, shares)`; emitted by `withdraw` and `redeem` |
+| `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard) |
 | `REBALANCE_STEP` | Each trade in a rebalance |
 | `REBALANCE_COMPLETE` | Full rebalance completed |
 | `NAV_PAUSE` | Circuit breaker triggered |
@@ -338,4 +371,6 @@ Data: { relevant fields, timestamp }
 | `POLICY_UPDATED` | Policy hash updated |
 | `VAULT_PAUSED` | Vault paused |
 | `VAULT_UNPAUSED` | Vault unpaused |
+| `VAULT_INITIALIZED` / `SLEEVES_UPDATED` / `CAPS_LOWERED` | Vault configured at deployment / layout changed / caps lowered |
+| `UPGRADE_PROPOSED` / `UPGRADE_CANCELLED` | Timelocked upgrade lifecycle (audit W3) |
 | `UPGRADE` | WASM upgraded |

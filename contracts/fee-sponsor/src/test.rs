@@ -9,8 +9,6 @@ use soroban_sdk::{
 #[test]
 fn test_t52_sponsorship_whitelist() {
     let env = Env::default();
-    let contract_id = env.register(FeeSponsorContract, ());
-    let client = FeeSponsorContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
@@ -18,7 +16,8 @@ fn test_t52_sponsorship_whitelist() {
     let foreign_contract = Address::generate(&env);
 
     // Initialize sponsor contract with 10 ops/hour, 50 ops/day, 1,000,000 stroops daily budget
-    client.initialize(&admin, &10, &50, &1_000_000);
+    let contract_id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &contract_id);
 
     // Verify initial config
     let config = client.get_config();
@@ -65,15 +64,14 @@ fn test_t52_sponsorship_whitelist() {
 #[test]
 fn test_t53_sponsorship_rate_limits() {
     let env = Env::default();
-    let contract_id = env.register(FeeSponsorContract, ());
-    let client = FeeSponsorContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let user = Address::generate(&env);
     let vault_contract = Address::generate(&env);
 
     // Set tight rate limits: 3 ops/hour, 5 ops/day, 1,000,000 stroops budget
-    client.initialize(&admin, &3, &5, &1_000_000);
+    let contract_id = env.register(FeeSponsorContract, (admin.clone(), 3u32, 5u32, 1_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &contract_id);
 
     env.mock_all_auths();
     client.whitelist_contract(&vault_contract);
@@ -152,8 +150,6 @@ fn test_t53_sponsorship_rate_limits() {
 #[test]
 fn test_t54_sponsorship_daily_budget() {
     let env = Env::default();
-    let contract_id = env.register(FeeSponsorContract, ());
-    let client = FeeSponsorContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let user_1 = Address::generate(&env);
@@ -161,7 +157,8 @@ fn test_t54_sponsorship_daily_budget() {
     let vault_contract = Address::generate(&env);
 
     // Set daily budget: 50,000 stroops (e.g. 0.005 XLM)
-    client.initialize(&admin, &100, &200, &50_000);
+    let contract_id = env.register(FeeSponsorContract, (admin.clone(), 100u32, 200u32, 50_000u64));
+    let client = FeeSponsorContractClient::new(&env, &contract_id);
 
     env.mock_all_auths();
     client.whitelist_contract(&vault_contract);
@@ -231,15 +228,13 @@ fn test_t54_sponsorship_daily_budget() {
 #[test]
 fn test_fee_sponsor_admin_transfer_and_limits_reconfiguration() {
     let env = Env::default();
-    let contract_id = env.register(FeeSponsorContract, ());
-    let client = FeeSponsorContractClient::new(&env, &contract_id);
 
     let admin = Address::generate(&env);
     let new_admin = Address::generate(&env);
-    let user = Address::generate(&env);
     let vault = Address::generate(&env);
 
-    client.initialize(&admin, &5, &20, &100_000);
+    let contract_id = env.register(FeeSponsorContract, (admin.clone(), 5u32, 20u32, 100_000u64));
+    let client = FeeSponsorContractClient::new(&env, &contract_id);
 
     // Non-admin cannot whitelist contract
     let unauth_res = client.try_whitelist_contract(&vault);
@@ -278,15 +273,61 @@ fn test_fee_sponsor_admin_transfer_and_limits_reconfiguration() {
     assert_eq!(whitelisted.len(), 1);
     assert_eq!(whitelisted.get(0).unwrap(), vault);
 
-    // Uninitialized checks on a fresh contract
-    let uninit_id = env.register(FeeSponsorContract, ());
-    let uninit_client = FeeSponsorContractClient::new(&env, &uninit_id);
-    assert_eq!(
-        uninit_client.try_validate_sponsorship(&user, &vault, &1000),
-        Err(Ok(SponsorError::NotInitialized))
-    );
-    assert_eq!(
-        uninit_client.try_get_config(),
-        Err(Ok(SponsorError::NotInitialized))
-    );
+    // (Audit M3: an uninitialized sponsor can no longer exist - configuration
+    // happens in the constructor, atomically with deployment.)
+}
+
+// -------------------------------------------------------------------------
+// Audit M3 (2026-11-15): a freshly deployed sponsor must not be claimable by
+// whoever calls `initialize` first (they would control the fee budget).
+// -------------------------------------------------------------------------
+#[test]
+fn m3_fresh_sponsor_cannot_be_claimed_by_a_stranger() {
+    use soroban_sdk::{testutils::Address as _, IntoVal};
+    let env = Env::default();
+    let owner = Address::generate(&env);
+    let sponsor = env.register(FeeSponsorContract, (owner.clone(), 10u32, 50u32, 1_000u64));
+    let attacker = Address::generate(&env);
+    let args = (attacker, 1_000u32, 1_000u32, u64::MAX).into_val(&env);
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(&sponsor, &Symbol::new(&env, "initialize"), args);
+    assert!(!matches!(r, Ok(Ok(()))), "a stranger must not be able to claim the sponsor");
+    assert_eq!(FeeSponsorContractClient::new(&env, &sponsor).get_config().admin, owner);
+}
+
+// -------------------------------------------------------------------------
+// Audit M2 (2026-11-15): custom events use SCREAMING_SNAKE_CASE (Rule 8).
+// -------------------------------------------------------------------------
+#[test]
+fn m2_every_sponsor_event_follows_rule_8() {
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::{FromVal, Symbol, SymbolStr, TryFromVal};
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &id);
+    let check = |env: &Env| -> usize {
+        let mut n = 0;
+        for (c, topics, _) in env.events().all().iter() {
+            if c != id { continue; }
+            let sym = Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap();
+            let s = SymbolStr::from_val(env, &sym.to_symbol_val());
+            let bytes: &[u8] = s.as_ref();
+            assert!(bytes.iter().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_'),
+                "event `{}` violates Rule 8", core::str::from_utf8(bytes).unwrap());
+            n += 1;
+        }
+        n
+    };
+    let vault = Address::generate(&env);
+    let user = Address::generate(&env);
+    let mut n = 0;
+    client.whitelist_contract(&vault); n += check(&env);
+    client.record_sponsored_op(&user, &vault, &100); n += check(&env);
+    client.set_limits(&20, &60, &2_000_000); n += check(&env);
+    client.pause(); n += check(&env);
+    client.unpause(); n += check(&env);
+    client.remove_contract(&vault); n += check(&env);
+    client.set_admin(&Address::generate(&env)); n += check(&env);
+    assert!(n >= 7, "saw {n} events");
 }

@@ -19,7 +19,7 @@ This is the **single source of truth** for every agent, engineer, auditor, and c
 
 Constella turns a plain-English investment thesis into a rule-bound basket of Stellar's tokenized real-world assets (RWAs), packaged as a single non-custodial vault-share token on Soroban. A user types a thesis; an AI engine proposes an optimized basket using only assets that actually exist on Stellar and that this user is legally eligible to hold; a historical risk and redemption simulation is displayed; and a vault-share token is minted on Soroban. The vault self-rebalances within signed on-chain guardrails, costs 0.05%–0.25% per year with zero gas for the user, and ships with a **Collateral Passport** (multi-source conservative NAV, instant-redemption capacity, dynamic risk sheets, and compliant liquidation paths) so money markets and lenders on Stellar can accept it as collateral.
 
-**The Market Gap:** Stellar has $4.1B+ of tokenized RWAs, but only ~$195M–$273M of DeFi TVL — meaning over 95% of tokenized value sits idle in wallets. Constella provides the infrastructure to move Stellar RWAs from "useful" (earning idle yield) to "used" (active daily collateral).
+**The Market Gap:** Stellar has $4.1B+ of tokenized RWAs, but only ~$198M of DeFi TVL (DefiLlama, 15 Nov 2026) — meaning over 95% of tokenized value sits idle in wallets. Constella provides the infrastructure to move Stellar RWAs from "useful" (earning idle yield) to "used" (active daily collateral).
 
 ---
 

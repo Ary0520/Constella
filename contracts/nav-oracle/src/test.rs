@@ -10,11 +10,10 @@ use soroban_sdk::{
 
 fn setup_oracle(env: &Env) -> (NavOracleClient<'_>, Address, Address) {
     env.mock_all_auths();
-    let contract_id = env.register(NavOracle, ());
-    let client = NavOracleClient::new(env, &contract_id);
     let admin = Address::generate(env);
     let base_asset = Address::generate(env);
-    client.initialize(&admin, &base_asset, &7, &300);
+    let contract_id = env.register(NavOracle, (admin.clone(), base_asset.clone(), 7u32, 300u32));
+    let client = NavOracleClient::new(env, &contract_id);
     (client, admin, base_asset)
 }
 
@@ -196,12 +195,13 @@ fn test_t37_deviation_circuit_breaker() {
 
     client.register_source(&s1);
     client.register_source(&s2);
+    // Audit O4: deviation latches and NAV_PAUSE is emitted in the call that
+    // adds the deviating feed (persisted even if a later caller reverts).
+    let events = env.events().all();
 
     // Query triggers circuit breaker and returns None
     assert!(client.get_collateral_nav(&sleeve).is_none());
 
-    // Verify NAV_PAUSE event emission IMMEDIATELY after trigger
-    let events = env.events().all();
     let nav_pause_sym = Symbol::new(&env, "NAV_PAUSE");
     let mut found_pause_event = false;
     for event in events.iter() {
@@ -234,7 +234,7 @@ fn test_t37_deviation_circuit_breaker() {
 #[test]
 fn test_t38_per_sleeve_isolation() {
     let env = Env::default();
-    let (client, _admin, _base) = setup_oracle(&env);
+    let (client, admin, _base) = setup_oracle(&env);
 
     let sleeve_gov = Symbol::new(&env, "USD_GOV_FUNDS");
     let sleeve_cash = Symbol::new(&env, "CASH_STABLE");
@@ -259,7 +259,7 @@ fn test_t38_per_sleeve_isolation() {
     client.register_source(&c2);
 
     // Trigger pause exclusively on USD_GOV_FUNDS
-    client.trigger_circuit_breaker(&sleeve_gov, &Symbol::new(&env, "EMERGENCY_HALT"));
+    client.trigger_circuit_breaker(&admin, &sleeve_gov, &Symbol::new(&env, "EMERGENCY_HALT"));
 
     assert!(client.is_sleeve_paused(&sleeve_gov));
     assert!(!client.is_sleeve_paused(&sleeve_cash));
@@ -376,7 +376,9 @@ fn test_update_price_and_events() {
     let s1 = create_source(&env, "BENJI_NAV", &benji_asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000);
     client.register_source(&s1);
 
-    // Update price
+    // Update price once ledger time has reached the new observation time
+    // (audit O2: future-dated prices are rejected).
+    env.ledger().set_timestamp(1500);
     client.update_price(&Symbol::new(&env, "BENJI_NAV"), &1_050_000, &250_000, &1500);
 
     // Verify PRICE_UPDATED event IMMEDIATELY after update_price
@@ -409,48 +411,34 @@ fn test_update_price_and_events() {
 #[test]
 fn test_uninitialized_and_authorization_checks() {
     let env = Env::default();
-    let contract_id = env.register(NavOracle, ());
-    let client = NavOracleClient::new(&env, &contract_id);
-
-    // Calling before initialization fails
-    assert_eq!(
-        client.try_get_admin(),
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            OracleError::NotInitialized as u32
-        )))
-    );
-    assert_eq!(
-        client.try_base(),
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            OracleError::NotInitialized as u32
-        )))
-    );
-    assert_eq!(
-        client.try_trigger_circuit_breaker(&Symbol::new(&env, "SLEEVE"), &Symbol::new(&env, "TEST")),
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            OracleError::NotInitialized as u32
-        )))
-    );
-
-    // Initialize
+    // Audit M3: configuration happens in the constructor, atomically with
+    // deployment; there is no uninitialized window and no `initialize`.
     env.mock_all_auths();
     let admin = Address::generate(&env);
     let base = Address::generate(&env);
-    client.initialize(&admin, &base, &7, &300);
+    let contract_id = env.register(NavOracle, (admin.clone(), base.clone(), 7u32, 300u32));
+    let client = NavOracleClient::new(&env, &contract_id);
+    assert_eq!(client.get_admin(), admin);
+    assert_eq!(client.base(), base);
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "initialize"),
+        soroban_sdk::vec![
+            &env,
+            soroban_sdk::IntoVal::into_val(&Address::generate(&env), &env),
+            soroban_sdk::IntoVal::into_val(&base, &env),
+            soroban_sdk::IntoVal::into_val(&7u32, &env),
+            soroban_sdk::IntoVal::into_val(&300u32, &env),
+        ],
+    );
+    assert!(!matches!(r, Ok(Ok(()))));
+    assert_eq!(client.get_admin(), admin);
 
     // Trigger circuit breaker on non-existent sleeve fails
     assert_eq!(
-        client.try_trigger_circuit_breaker(&Symbol::new(&env, "NON_EXISTENT"), &Symbol::new(&env, "TEST")),
+        client.try_trigger_circuit_breaker(&admin, &Symbol::new(&env, "NON_EXISTENT"), &Symbol::new(&env, "TEST")),
         Err(Ok(soroban_sdk::Error::from_contract_error(
             OracleError::SleeveNotFound as u32
-        )))
-    );
-
-    // Duplicate initialization fails
-    assert_eq!(
-        client.try_initialize(&admin, &base, &7, &300),
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            OracleError::AlreadyInitialized as u32
         )))
     );
 
@@ -544,12 +532,13 @@ fn test_extreme_price_difference_no_overflow() {
 
     client.register_source(&s1);
     client.register_source(&s2);
+    // Audit O4: deviation latches and NAV_PAUSE is emitted in the call that
+    // adds the deviating feed (persisted even if a later caller reverts).
+    let events = env.events().all();
 
     // Calling get_collateral_nav must trip deviation circuit breaker WITHOUT PANICKING from integer overflow
     assert!(client.get_collateral_nav(&sleeve).is_none());
 
-    // Verify NAV_PAUSE event emission IMMEDIATELY after trigger
-    let events = env.events().all();
     let nav_pause_sym = Symbol::new(&env, "NAV_PAUSE");
     let mut found_pause = false;
     for event in events.iter() {
@@ -638,4 +627,409 @@ fn test_property_collateral_nav_le_deposit_nav() {
     let c = client.get_collateral_nav(&sleeve).unwrap();
     let d = client.get_deposit_nav(&sleeve).unwrap();
     assert!(c.price <= d.price);
+}
+
+// -------------------------------------------------------------------------
+// Audit O1 (2026-11-15): only the pause authority or admin may pause a
+// sleeve; only the admin may clear it or rotate the pause authority.
+// Every call under test uses an explicit auth tree (AGENT-RULES Rule 13).
+// -------------------------------------------------------------------------
+mod o1 {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    fn setup_with_sleeve(env: &Env) -> (NavOracleClient<'_>, Address, Symbol) {
+        let (client, admin, _base) = setup_oracle(env);
+        let sleeve = Symbol::new(env, "USD_GOV_FUNDS");
+        client.configure_sleeve(&sleeve, &200, &2);
+        (client, admin, sleeve)
+    }
+
+    fn try_trip(env: &Env, client: &NavOracleClient, caller: &Address, sleeve: &Symbol) -> bool {
+        let reason = Symbol::new(env, "MANUAL");
+        env.mock_auths(&[MockAuth {
+            address: caller,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "trigger_circuit_breaker",
+                args: (caller.clone(), sleeve.clone(), reason.clone()).into_val(env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.try_trigger_circuit_breaker(caller, sleeve, &reason).is_ok()
+    }
+
+    #[test]
+    fn unsigned_call_is_rejected() {
+        let env = Env::default();
+        let (client, admin, sleeve) = setup_with_sleeve(&env);
+        env.set_auths(&[]);
+        // Even naming the admin as caller fails without the admin's signature.
+        assert!(client.try_trigger_circuit_breaker(&admin, &sleeve, &Symbol::new(&env, "X")).is_err());
+        assert!(!client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn signed_stranger_is_rejected_with_unauthorized() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = setup_with_sleeve(&env);
+        let stranger = Address::generate(&env);
+        assert!(!try_trip(&env, &client, &stranger, &sleeve));
+        let reason = Symbol::new(&env, "MANUAL");
+        env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "trigger_circuit_breaker",
+                args: (stranger.clone(), sleeve.clone(), reason.clone()).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert_eq!(
+            client.try_trigger_circuit_breaker(&stranger, &sleeve, &reason),
+            Err(Ok(soroban_sdk::Error::from_contract_error(OracleError::Unauthorized as u32)))
+        );
+        assert!(!client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn admin_and_pause_authority_can_pause() {
+        let env = Env::default();
+        let (client, admin, sleeve) = setup_with_sleeve(&env);
+        assert_eq!(client.get_pause_authority(), admin);
+        assert!(try_trip(&env, &client, &admin, &sleeve));
+        assert_eq!(env.auths()[0].0, admin);
+        assert!(client.is_sleeve_paused(&sleeve));
+
+        env.mock_all_auths();
+        client.clear_circuit_breaker(&sleeve);
+        let guardian = Address::generate(&env);
+        client.set_pause_authority(&guardian);
+        assert!(try_trip(&env, &client, &guardian, &sleeve));
+        assert_eq!(env.auths()[0].0, guardian);
+        assert!(client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn rotated_out_authority_loses_power() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = setup_with_sleeve(&env);
+        let g1 = Address::generate(&env);
+        let g2 = Address::generate(&env);
+        env.mock_all_auths();
+        client.set_pause_authority(&g1);
+        client.set_pause_authority(&g2);
+        assert!(!try_trip(&env, &client, &g1, &sleeve));
+        assert!(try_trip(&env, &client, &g2, &sleeve));
+    }
+
+    #[test]
+    fn only_admin_can_rotate_authority_or_clear() {
+        let env = Env::default();
+        let (client, admin, sleeve) = setup_with_sleeve(&env);
+        let guardian = Address::generate(&env);
+        env.mock_all_auths();
+        client.set_pause_authority(&guardian);
+        assert!(try_trip(&env, &client, &guardian, &sleeve));
+
+        // The pause authority can neither clear a pause nor rotate itself.
+        env.mock_auths(&[MockAuth {
+            address: &guardian,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "clear_circuit_breaker",
+                args: (sleeve.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_clear_circuit_breaker(&sleeve).is_err());
+        let other = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &guardian,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "set_pause_authority",
+                args: (other.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_set_pause_authority(&other).is_err());
+        assert!(client.is_sleeve_paused(&sleeve));
+        assert_eq!(client.get_pause_authority(), guardian);
+
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "clear_circuit_breaker",
+                args: (sleeve.clone(),).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.clear_circuit_breaker(&sleeve);
+        assert!(!client.is_sleeve_paused(&sleeve));
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit O4 (2026-11-15): deviation must latch (and NAV_PAUSE must be emitted)
+// in the successful call that changes prices, not only on reads that may be
+// rolled back by a reverting caller.
+// -------------------------------------------------------------------------
+mod o4 {
+    use super::*;
+
+    fn deviation_event_bps(env: &Env, sleeve: &Symbol) -> Option<u32> {
+        let nav_pause = Symbol::new(env, "NAV_PAUSE");
+        for (_cid, topics, data) in env.events().all().iter() {
+            if topics.len() >= 2
+                && Symbol::try_from_val(env, &topics.get(0).unwrap()) == Ok(nav_pause.clone())
+                && Symbol::try_from_val(env, &topics.get(1).unwrap()) == Ok(sleeve.clone())
+            {
+                let d = NavPauseData::try_from_val(env, &data).unwrap();
+                assert_eq!(d.reason, Symbol::new(env, "DEVIATION"));
+                return Some(d.deviation_bps);
+            }
+        }
+        None
+    }
+
+    fn two_feed_sleeve(env: &Env) -> (NavOracleClient<'_>, Address, Symbol) {
+        let (client, admin, _base) = setup_oracle(env);
+        let sleeve = Symbol::new(env, "USD_GOV_FUNDS");
+        client.configure_sleeve(&sleeve, &200, &2);
+        env.ledger().set_timestamp(1000);
+        let asset = Address::generate(env);
+        client.register_source(&create_source(env, "NAV", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000));
+        client.register_source(&create_source(env, "RFL", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000));
+        (client, admin, sleeve)
+    }
+
+    #[test]
+    fn deviating_price_update_latches_pause_and_emits_event() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        client.update_price(&Symbol::new(&env, "RFL"), &1_030_000, &200_000, &1000);
+        assert_eq!(deviation_event_bps(&env, &sleeve), Some(300));
+        assert!(client.is_sleeve_paused(&sleeve));
+        // The new price is still recorded so data stays current while paused.
+        assert_eq!(client.get_source(&Symbol::new(&env, "RFL")).unwrap().price, 1_030_000);
+        assert!(client.get_collateral_nav(&sleeve).is_none());
+    }
+
+    #[test]
+    fn update_within_threshold_does_not_pause() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        client.update_price(&Symbol::new(&env, "RFL"), &1_015_000, &200_000, &1000);
+        assert_eq!(deviation_event_bps(&env, &sleeve), None);
+        assert!(!client.is_sleeve_paused(&sleeve));
+        assert_eq!(client.get_collateral_nav(&sleeve).unwrap().price, 1_000_000);
+    }
+
+    #[test]
+    fn registering_a_deviating_source_latches_pause() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        let asset = client.get_source(&Symbol::new(&env, "NAV")).unwrap().asset;
+        client.register_source(&create_source(&env, "THIRD", &asset, "USD_GOV_FUNDS", 1_050_000, 200_000, 1000));
+        assert_eq!(deviation_event_bps(&env, &sleeve), Some(500));
+        assert!(client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn clearing_while_still_deviating_relatches_on_next_update() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        client.update_price(&Symbol::new(&env, "RFL"), &1_030_000, &200_000, &1000);
+        client.clear_circuit_breaker(&sleeve);
+        assert!(!client.is_sleeve_paused(&sleeve));
+        client.update_price(&Symbol::new(&env, "NAV"), &1_000_000, &200_000, &1000);
+        assert!(client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn insufficient_sources_at_update_time_does_not_latch() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        // Depth drops below the floor: the feed becomes invalid (live hard stop),
+        // but that is not a latched deviation pause.
+        client.update_price(&Symbol::new(&env, "RFL"), &1_030_000, &10_000, &1000);
+        assert!(!client.is_sleeve_paused(&sleeve));
+        assert!(client.get_collateral_nav(&sleeve).is_none());
+        client.update_price(&Symbol::new(&env, "RFL"), &1_000_000, &200_000, &1000);
+        assert_eq!(client.get_collateral_nav(&sleeve).unwrap().price, 1_000_000);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit O2 (2026-11-15): timestamps must not be in the future, updates must
+// not go backwards, and any future-dated stored source is invalid.
+// -------------------------------------------------------------------------
+mod o2 {
+    use super::*;
+
+    fn err(e: OracleError) -> Result<(), Result<soroban_sdk::Error, soroban_sdk::InvokeError>> {
+        Err(Ok(soroban_sdk::Error::from_contract_error(e as u32)))
+    }
+
+    fn feed(env: &Env) -> (NavOracleClient<'_>, Symbol, Address) {
+        let (client, _admin, _base) = setup_oracle(env);
+        let sleeve = Symbol::new(env, "USD_GOV_FUNDS");
+        client.configure_sleeve(&sleeve, &200, &2);
+        env.ledger().set_timestamp(10_000);
+        let asset = Address::generate(env);
+        client.register_source(&create_source(env, "NAV", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 10_000));
+        client.register_source(&create_source(env, "RFL", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 10_000));
+        (client, sleeve, asset)
+    }
+
+    #[test]
+    fn update_with_future_timestamp_rejected() {
+        let env = Env::default();
+        let (client, _sleeve, _asset) = feed(&env);
+        let nav = Symbol::new(&env, "NAV");
+        assert_eq!(
+            client.try_update_price(&nav, &1_000_000, &200_000, &10_001).map(|_| ()),
+            err(OracleError::FutureTimestamp)
+        );
+        assert_eq!(client.get_source(&nav).unwrap().timestamp, 10_000);
+    }
+
+    #[test]
+    fn register_with_future_timestamp_rejected() {
+        let env = Env::default();
+        let (client, _sleeve, asset) = feed(&env);
+        let src = create_source(&env, "LATE", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 99_999);
+        assert_eq!(client.try_register_source(&src).map(|_| ()), err(OracleError::FutureTimestamp));
+        assert!(client.get_source(&Symbol::new(&env, "LATE")).is_none());
+    }
+
+    #[test]
+    fn out_of_order_update_rejected_but_equal_and_newer_accepted() {
+        let env = Env::default();
+        let (client, _sleeve, _asset) = feed(&env);
+        let nav = Symbol::new(&env, "NAV");
+        env.ledger().set_timestamp(20_000);
+        client.update_price(&nav, &1_001_000, &200_000, &15_000);
+        assert_eq!(
+            client.try_update_price(&nav, &1_002_000, &200_000, &14_999).map(|_| ()),
+            err(OracleError::OutOfOrderUpdate)
+        );
+        client.update_price(&nav, &1_002_000, &200_000, &15_000); // same-time correction
+        client.update_price(&nav, &1_003_000, &200_000, &20_000); // ledger "now"
+        assert_eq!(client.get_source(&nav).unwrap().price, 1_003_000);
+    }
+
+    #[test]
+    fn stored_future_dated_source_is_treated_as_invalid() {
+        let env = Env::default();
+        let (client, sleeve, _asset) = feed(&env);
+        assert!(client.get_collateral_nav(&sleeve).is_some());
+        // Ledger time moves behind the stored timestamps (e.g. data written
+        // before this fix or a misconfigured network): sources are invalid.
+        env.ledger().set_timestamp(9_000);
+        assert!(client.get_collateral_nav(&sleeve).is_none());
+        assert!(client.get_deposit_nav(&sleeve).is_none());
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit O3 (2026-11-15): single-source configurations are refused.
+// -------------------------------------------------------------------------
+mod o3 {
+    use super::*;
+
+    #[test]
+    fn min_valid_sources_below_two_rejected() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        let sleeve = Symbol::new(&env, "XLM");
+        for n in [0u32, 1] {
+            assert_eq!(
+                client.try_configure_sleeve(&sleeve, &200, &n),
+                Err(Ok(soroban_sdk::Error::from_contract_error(OracleError::InvalidThreshold as u32)))
+            );
+        }
+        assert!(client.get_sleeve_config(&sleeve).is_none());
+    }
+
+    #[test]
+    fn two_or_more_accepted() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        let sleeve = Symbol::new(&env, "XLM");
+        client.configure_sleeve(&sleeve, &200, &2);
+        assert_eq!(client.get_sleeve_config(&sleeve).unwrap().min_valid_sources, 2);
+        client.configure_sleeve(&sleeve, &200, &3);
+        assert_eq!(client.get_sleeve_config(&sleeve).unwrap().min_valid_sources, 3);
+    }
+
+    #[test]
+    fn cannot_lower_an_existing_sleeve_to_one() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        let sleeve = Symbol::new(&env, "XLM");
+        client.configure_sleeve(&sleeve, &200, &3);
+        assert!(client.try_configure_sleeve(&sleeve, &200, &1).is_err());
+        assert_eq!(client.get_sleeve_config(&sleeve).unwrap().min_valid_sources, 3);
+    }
+
+    #[test]
+    fn one_valid_source_never_prices() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        env.ledger().set_timestamp(1000);
+        let asset = Address::generate(&env);
+        client.register_source(&create_source(&env, "ONLY", &asset, "XLM", 107_000_000, 200_000, 1000));
+        assert!(client.price(&asset).is_none());
+        assert!(client.get_collateral_nav(&Symbol::new(&env, "XLM")).is_none());
+        assert!(client.get_deposit_nav(&Symbol::new(&env, "XLM")).is_none());
+    }
+}
+
+// -------------------------------------------------------------------------
+// asset_price (needed by audit P1): fair per-asset price = median of the
+// asset's own valid sources; the numéraire (base) is exactly 1.
+// -------------------------------------------------------------------------
+mod asset_price {
+    use super::*;
+
+    #[test]
+    fn median_of_the_assets_own_sources() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        env.ledger().set_timestamp(1000);
+        client.configure_sleeve(&Symbol::new(&env, "EURC"), &300, &2);
+        let eurc = Address::generate(&env);
+        client.register_source(&create_source(&env, "E1", &eurc, "EURC", 1_080_000, 200_000, 1000));
+        client.register_source(&create_source(&env, "E2", &eurc, "EURC", 1_090_000, 200_000, 1000));
+        client.register_source(&create_source(&env, "E3", &eurc, "EURC", 1_085_000, 200_000, 1000));
+        assert_eq!(client.asset_price(&eurc).unwrap().price, 1_085_000);
+    }
+
+    #[test]
+    fn base_asset_is_exactly_one() {
+        let env = Env::default();
+        let (client, _admin, base) = setup_oracle(&env);
+        assert_eq!(client.asset_price(&base).unwrap().price, 10_000_000); // 7 decimals
+    }
+
+    #[test]
+    fn unknown_single_source_or_paused_asset_has_no_price() {
+        let env = Env::default();
+        let (client, admin, _base) = setup_oracle(&env);
+        env.ledger().set_timestamp(1000);
+        assert!(client.asset_price(&Address::generate(&env)).is_none());
+
+        let a = Address::generate(&env);
+        client.register_source(&create_source(&env, "A1", &a, "A", 1_000_000, 200_000, 1000));
+        assert!(client.asset_price(&a).is_none(), "single source");
+
+        client.register_source(&create_source(&env, "A2", &a, "A", 1_000_000, 200_000, 1000));
+        assert!(client.asset_price(&a).is_some());
+        client.trigger_circuit_breaker(&admin, &Symbol::new(&env, "A"), &Symbol::new(&env, "MANUAL"));
+        assert!(client.asset_price(&a).is_none(), "paused");
+    }
 }

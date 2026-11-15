@@ -21,6 +21,10 @@ pub enum OracleError {
     PriceStale = 9,
     InsufficientLiquidityDepth = 10,
     InvalidThreshold = 11,
+    /// Price timestamp is later than the current ledger time.
+    FutureTimestamp = 12,
+    /// Update is older than the price already stored for this source.
+    OutOfOrderUpdate = 13,
 }
 
 #[contracttype]
@@ -97,12 +101,10 @@ pub enum DataKey {
     AssetSleeve(Address),
     AllAssets,
     LastPrice(Address),
+    PauseAuthority,
 }
 
 pub trait NavOracleTrait {
-    /// Initialize oracle with admin, base asset (numéraire), decimals, and resolution
-    fn initialize(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32);
-
     /// Configure sleeve deviation threshold (bps) and min valid sources
     fn configure_sleeve(
         env: Env,
@@ -135,6 +137,11 @@ pub trait NavOracleTrait {
     /// SEP-40: Standard last price query
     fn lastprice(env: Env, asset: Address) -> Option<PriceData>;
 
+    /// Fair price of one asset in the numéraire: median of the asset's own
+    /// valid sources (same validity rules as every other read). The base
+    /// asset is exactly 1.0. Used to value both legs of a trade (audit P1).
+    fn asset_price(env: Env, asset: Address) -> Option<PriceData>;
+
     /// SEP-40: Standard batch price query
     fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>;
 
@@ -146,8 +153,15 @@ pub trait NavOracleTrait {
 
     /// Circuit breaker status and management
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool;
-    fn trigger_circuit_breaker(env: Env, sleeve_id: Symbol, reason: Symbol);
+    /// Manually pause a sleeve. `caller` must sign and be the pause
+    /// authority or the admin (audit O1). Fast, single-key by design.
+    fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol);
+    /// Resume a sleeve. Admin (multisig) only.
     fn clear_circuit_breaker(env: Env, sleeve_id: Symbol);
+    /// Rotate the pause authority. Admin only.
+    fn set_pause_authority(env: Env, new_authority: Address);
+    /// Current pause authority (defaults to the admin).
+    fn get_pause_authority(env: Env) -> Address;
 
     /// Admin query
     fn get_admin(env: Env) -> Address;
@@ -163,6 +177,16 @@ pub trait NavOracleTrait {
 
     /// Inspect all sources across all registered assets
     fn get_sources(env: Env) -> Vec<OracleSource>;
+}
+
+/// A source is fresh only if its timestamp is not in the future and is within
+/// its staleness limit (audit O2: future-dated data must never count as fresh).
+/// NAV-ORACLE Rule 5 / AGENT-RULES Rule 3: fewer than 2 valid sources is a
+/// hard stop, so no sleeve may be configured to accept fewer (audit O3).
+pub const MIN_VALID_SOURCES_FLOOR: u32 = 2;
+
+fn is_fresh(now: u64, source: &OracleSource) -> bool {
+    source.timestamp <= now && now - source.timestamp <= source.staleness_limit_seconds
 }
 
 fn sort_sources_by_price(mut sources: Vec<OracleSource>) -> Vec<OracleSource> {
@@ -181,6 +205,28 @@ fn sort_sources_by_price(mut sources: Vec<OracleSource>) -> Vec<OracleSource> {
         }
     }
     sources
+}
+
+/// Median of an already-validated, non-empty source list.
+fn median_price(sources: Vec<OracleSource>) -> PriceData {
+    let sorted = sort_sources_by_price(sources);
+    let len = sorted.len();
+    if len % 2 == 1 {
+        let m = sorted.get(len / 2).unwrap();
+        PriceData {
+            price: m.price,
+            timestamp: m.timestamp,
+            source: m.source_id.clone(),
+        }
+    } else {
+        let s1 = sorted.get(len / 2 - 1).unwrap();
+        let s2 = sorted.get(len / 2).unwrap();
+        PriceData {
+            price: s1.price + (s2.price - s1.price) / 2,
+            timestamp: s1.timestamp.min(s2.timestamp),
+            source: s2.source_id.clone(),
+        }
+    }
 }
 
 fn evaluate_sources(
@@ -214,8 +260,8 @@ fn evaluate_sources(
             if source.current_liquidity_depth_usd < source.min_liquidity_depth_usd {
                 continue;
             }
-            // Filter 3: Staleness check (Rule 5)
-            if now.saturating_sub(source.timestamp) > source.staleness_limit_seconds {
+            // Filter 3: Staleness check (Rule 5) — future-dated data is invalid too.
+            if !is_fresh(now, &source) {
                 continue;
             }
             // Positive price check
@@ -279,22 +325,57 @@ fn evaluate_sources(
     Ok(valid_sources)
 }
 
+/// Audit O4: evaluate a sleeve's sources right after a price write and latch a
+/// deviation pause (persisting `NAV_PAUSE`) inside that successful call.
+///
+/// Previously deviation was only detected on reads; a read inside a caller
+/// that later reverted rolled the pause and its event back. Staleness and
+/// insufficient-sources remain live checks on every read (never latched).
+fn latch_deviation_on_write(env: &Env, sleeve_id: &Symbol) {
+    let mut config: SleeveOracleConfig = env
+        .storage()
+        .instance()
+        .get(&DataKey::SleeveConfig(sleeve_id.clone()))
+        .unwrap_or(SleeveOracleConfig {
+            sleeve_id: sleeve_id.clone(),
+            deviation_threshold_bps: 200,
+            min_valid_sources: MIN_VALID_SOURCES_FLOOR,
+            is_paused: false,
+            pause_reason: Symbol::new(env, ""),
+        });
+    if config.is_paused {
+        return;
+    }
+    let source_ids: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::SleeveSources(sleeve_id.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    // On DeviationExceeded the pause + NAV_PAUSE are already persisted by
+    // evaluate_sources; InsufficientSources is intentionally not latched.
+    let _ = evaluate_sources(env, &source_ids, sleeve_id, &mut config);
+}
+
 #[contract]
 pub struct NavOracle;
 
 #[contractimpl]
-impl NavOracleTrait for NavOracle {
-    fn initialize(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, OracleError::AlreadyInitialized);
-        }
+impl NavOracle {
+    /// Runs atomically as part of deployment, so no one can claim an
+    /// uninitialized oracle (audit M3). There is no `initialize` entrypoint.
+    pub fn __constructor(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::PauseAuthority, &admin);
         env.storage().instance().set(&DataKey::BaseAsset, &base_asset);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
         env.storage().instance().set(&DataKey::Resolution, &resolution);
         let empty_assets: Vec<Address> = Vec::new(&env);
         env.storage().instance().set(&DataKey::AllAssets, &empty_assets);
     }
+}
+
+#[contractimpl]
+impl NavOracleTrait for NavOracle {
 
     fn configure_sleeve(
         env: Env,
@@ -310,7 +391,7 @@ impl NavOracleTrait for NavOracle {
 
         if deviation_threshold_bps == 0
             || deviation_threshold_bps > 10000
-            || min_valid_sources == 0
+            || min_valid_sources < MIN_VALID_SOURCES_FLOOR
         {
             panic_with_error!(&env, OracleError::InvalidThreshold);
         }
@@ -346,6 +427,9 @@ impl NavOracleTrait for NavOracle {
         }
         if source.min_liquidity_depth_usd < 0 {
             panic_with_error!(&env, OracleError::InsufficientLiquidityDepth);
+        }
+        if source.timestamp > env.ledger().timestamp() {
+            panic_with_error!(&env, OracleError::FutureTimestamp);
         }
 
         env.storage()
@@ -414,6 +498,8 @@ impl NavOracleTrait for NavOracle {
             all_assets.push_back(source.asset.clone());
             env.storage().instance().set(&DataKey::AllAssets, &all_assets);
         }
+
+        latch_deviation_on_write(&env, &source.sleeve);
     }
 
     fn update_price(
@@ -444,6 +530,14 @@ impl NavOracleTrait for NavOracle {
         if liquidity_depth_usd < 0 {
             panic_with_error!(&env, OracleError::InsufficientLiquidityDepth);
         }
+        // Audit O2: a future timestamp would never go stale; an older one would
+        // overwrite newer data (replay of a still-fresh old price).
+        if timestamp > env.ledger().timestamp() {
+            panic_with_error!(&env, OracleError::FutureTimestamp);
+        }
+        if timestamp < source.timestamp {
+            panic_with_error!(&env, OracleError::OutOfOrderUpdate);
+        }
 
         source.price = price;
         source.current_liquidity_depth_usd = liquidity_depth_usd;
@@ -461,6 +555,8 @@ impl NavOracleTrait for NavOracle {
                 timestamp,
             },
         );
+
+        latch_deviation_on_write(&env, &source.sleeve);
     }
 
     fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData> {
@@ -471,7 +567,7 @@ impl NavOracleTrait for NavOracle {
             .unwrap_or(SleeveOracleConfig {
                 sleeve_id: sleeve_id.clone(),
                 deviation_threshold_bps: 200,
-                min_valid_sources: 2,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
                 is_paused: false,
                 pause_reason: Symbol::new(&env, ""),
             });
@@ -512,7 +608,7 @@ impl NavOracleTrait for NavOracle {
             .unwrap_or(SleeveOracleConfig {
                 sleeve_id: sleeve_id.clone(),
                 deviation_threshold_bps: 200,
-                min_valid_sources: 2,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
                 is_paused: false,
                 pause_reason: Symbol::new(&env, ""),
             });
@@ -525,30 +621,7 @@ impl NavOracleTrait for NavOracle {
 
         let valid_sources = evaluate_sources(&env, &source_ids, &sleeve_id, &mut config).ok()?;
 
-        let sorted = sort_sources_by_price(valid_sources);
-        let len = sorted.len();
-
-        let price_data = if len % 2 == 1 {
-            let mid = len / 2;
-            let median_source = sorted.get(mid).unwrap();
-            PriceData {
-                price: median_source.price,
-                timestamp: median_source.timestamp,
-                source: median_source.source_id.clone(),
-            }
-        } else {
-            let mid = len / 2;
-            let s1 = sorted.get(mid - 1).unwrap();
-            let s2 = sorted.get(mid).unwrap();
-            let median_price = s1.price + (s2.price - s1.price) / 2;
-            PriceData {
-                price: median_price,
-                timestamp: s1.timestamp.min(s2.timestamp),
-                source: s2.source_id.clone(),
-            }
-        };
-
-        Some(price_data)
+        Some(median_price(valid_sources))
     }
 
     fn price(env: Env, asset: Address) -> Option<PriceData> {
@@ -564,7 +637,7 @@ impl NavOracleTrait for NavOracle {
             .unwrap_or(SleeveOracleConfig {
                 sleeve_id: sleeve_id.clone(),
                 deviation_threshold_bps: 200,
-                min_valid_sources: 2,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
                 is_paused: false,
                 pause_reason: Symbol::new(&env, ""),
             });
@@ -595,6 +668,40 @@ impl NavOracleTrait for NavOracle {
             .set(&DataKey::LastPrice(asset), &price_data);
 
         Some(price_data)
+    }
+
+    fn asset_price(env: Env, asset: Address) -> Option<PriceData> {
+        let base: Address = env.storage().instance().get(&DataKey::BaseAsset)?;
+        if asset == base {
+            let decimals: u32 = env.storage().instance().get(&DataKey::Decimals)?;
+            return Some(PriceData {
+                price: 10i128.pow(decimals),
+                timestamp: env.ledger().timestamp(),
+                source: Symbol::new(&env, "BASE"),
+            });
+        }
+        let sleeve_id: Symbol = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetSleeve(asset.clone()))?;
+        let mut config: SleeveOracleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::SleeveConfig(sleeve_id.clone()))
+            .unwrap_or(SleeveOracleConfig {
+                sleeve_id: sleeve_id.clone(),
+                deviation_threshold_bps: 200,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
+                is_paused: false,
+                pause_reason: Symbol::new(&env, ""),
+            });
+        let source_ids: Vec<Symbol> = env
+            .storage()
+            .instance()
+            .get(&DataKey::AssetSources(asset))
+            .unwrap_or_else(|| Vec::new(&env));
+        let valid = evaluate_sources(&env, &source_ids, &sleeve_id, &mut config).ok()?;
+        Some(median_price(valid))
     }
 
     fn lastprice(env: Env, asset: Address) -> Option<PriceData> {
@@ -692,9 +799,21 @@ impl NavOracleTrait for NavOracle {
         }
     }
 
-    fn trigger_circuit_breaker(env: Env, sleeve_id: Symbol, reason: Symbol) {
-        if !env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, OracleError::NotInitialized);
+    fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol) {
+        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(a) => a,
+            None => panic_with_error!(&env, OracleError::NotInitialized),
+        };
+        // Audit O1: only the pause authority or the admin may pause, and they
+        // must actually sign. Previously anyone could pause any sleeve.
+        caller.require_auth();
+        let pause_authority: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseAuthority)
+            .unwrap_or(admin.clone());
+        if caller != pause_authority && caller != admin {
+            panic_with_error!(&env, OracleError::Unauthorized);
         }
 
         let has_sources = env.storage().instance().has(&DataKey::SleeveSources(sleeve_id.clone()));
@@ -710,7 +829,7 @@ impl NavOracleTrait for NavOracle {
             .unwrap_or(SleeveOracleConfig {
                 sleeve_id: sleeve_id.clone(),
                 deviation_threshold_bps: 200,
-                min_valid_sources: 2,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
                 is_paused: false,
                 pause_reason: Symbol::new(&env, ""),
             });
@@ -738,7 +857,7 @@ impl NavOracleTrait for NavOracle {
                 if source.is_active
                     && source.sleeve == sleeve_id
                     && source.current_liquidity_depth_usd >= source.min_liquidity_depth_usd
-                    && now.saturating_sub(source.timestamp) <= source.staleness_limit_seconds
+                    && is_fresh(now, &source)
                     && source.price > 0
                 {
                     sources_valid += 1;
@@ -798,7 +917,7 @@ impl NavOracleTrait for NavOracle {
                 if source.is_active
                     && source.sleeve == sleeve_id
                     && source.current_liquidity_depth_usd >= source.min_liquidity_depth_usd
-                    && now.saturating_sub(source.timestamp) <= source.staleness_limit_seconds
+                    && is_fresh(now, &source)
                     && source.price > 0
                 {
                     sources_valid += 1;
@@ -814,6 +933,37 @@ impl NavOracleTrait for NavOracle {
                 timestamp: now,
             },
         );
+    }
+
+    fn set_pause_authority(env: Env, new_authority: Address) {
+        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(a) => a,
+            None => panic_with_error!(&env, OracleError::NotInitialized),
+        };
+        admin.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseAuthority)
+            .unwrap_or(admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseAuthority, &new_authority);
+        env.events().publish(
+            (Symbol::new(&env, "PAUSE_AUTHORITY_SET"), old),
+            new_authority,
+        );
+    }
+
+    fn get_pause_authority(env: Env) -> Address {
+        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(a) => a,
+            None => panic_with_error!(&env, OracleError::NotInitialized),
+        };
+        env.storage()
+            .instance()
+            .get(&DataKey::PauseAuthority)
+            .unwrap_or(admin)
     }
 
     fn get_admin(env: Env) -> Address {
