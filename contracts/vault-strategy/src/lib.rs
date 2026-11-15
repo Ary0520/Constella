@@ -3,7 +3,7 @@
 
 use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    token, Address, BytesN, Env, FromVal, String, Symbol, SymbolStr, Vec,
+    token, Address, BytesN, Env, FromVal, MuxedAddress, String, Symbol, SymbolStr, Vec,
 };
 // Audit W2/W4.2: the share ledger (balances, allowances, total supply) uses the
 // OpenZeppelin stellar-tokens storage primitives: per-holder persistent
@@ -28,6 +28,19 @@ pub struct Transfer {
     pub from: Address,
     #[topic]
     pub to: Address,
+    pub amount: i128,
+}
+
+/// SEP-41 (v0.5) transfer to a muxed account: topics [transfer, from, to]
+/// (`to` is the underlying address); data map {amount, to_muxed_id}.
+/// Same layout as OpenZeppelin stellar-tokens `MuxedTransfer`.
+#[contractevent(topics = ["transfer"], data_format = "map")]
+pub struct MuxedTransfer {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+    pub to_muxed_id: Option<u64>,
     pub amount: i128,
 }
 
@@ -1243,7 +1256,10 @@ impl StrategyVault {
         Base::balance(&env, &id)
     }
 
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+    /// SEP-41 transfer. `to` may be a muxed account (exchange / custodian
+    /// sub-account): shares are credited to the underlying address and the
+    /// muxed id is reported in the event only.
+    pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
         from.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
@@ -1254,9 +1270,13 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        move_shares(&env, &from, &to, amount);
+        let to_addr = to.address();
+        move_shares(&env, &from, &to_addr, amount);
 
-        Transfer { from, to, amount }.publish(&env);
+        match to.id() {
+            Some(id) => MuxedTransfer { from, to: to_addr, to_muxed_id: Some(id), amount }.publish(&env),
+            None => Transfer { from, to: to_addr, amount }.publish(&env),
+        }
     }
 
     /// SEP-41 approve. `expiration_ledger` (SEP-41 `live_until_ledger`) is
