@@ -1,14 +1,27 @@
 #![no_std]
-// TEMPORARY (audit W4.1, 15 Nov 2026): `Events::publish` is deprecated since
-// soroban-sdk 23 in favour of `#[contractevent]`. Publishing behaves exactly as
-// before; the migration to `#[contractevent]` (with byte-for-byte event
-// encoding tests) is sub-step W4.1b, which removes this allowance.
-#![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Symbol,
-    Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
+    Env, Symbol, Vec,
 };
+
+/// An asset was added to (or updated in) the closed universe.
+/// Topics: [ASSET_ADDED, asset_id]. Data: contract address.
+#[contractevent(topics = ["ASSET_ADDED"], data_format = "single-value")]
+pub struct AssetAdded {
+    #[topic]
+    pub asset_id: Symbol,
+    pub contract_address: Address,
+}
+
+/// An asset was deactivated.
+/// Topics: [ASSET_DEACTIVATED, asset_id]. Data: contract address.
+#[contractevent(topics = ["ASSET_DEACTIVATED"], data_format = "single-value")]
+pub struct AssetDeactivated {
+    #[topic]
+    pub asset_id: Symbol,
+    pub contract_address: Address,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -163,10 +176,11 @@ impl AssetRegistryTrait for AssetRegistry {
             &entry.asset_id,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "ASSET_ADDED"), entry.asset_id.clone()),
-            entry.contract_address.clone(),
-        );
+        AssetAdded {
+            asset_id: entry.asset_id.clone(),
+            contract_address: entry.contract_address.clone(),
+        }
+        .publish(&env);
     }
 
     fn deactivate_asset(env: Env, asset_id: Symbol) {
@@ -190,10 +204,11 @@ impl AssetRegistryTrait for AssetRegistry {
             .instance()
             .set(&DataKey::Asset(asset_id.clone()), &entry);
 
-        env.events().publish(
-            (Symbol::new(&env, "ASSET_DEACTIVATED"), asset_id.clone()),
-            entry.contract_address.clone(),
-        );
+        AssetDeactivated {
+            asset_id: asset_id.clone(),
+            contract_address: entry.contract_address.clone(),
+        }
+        .publish(&env);
     }
 
     fn get_asset(env: Env, asset_id: Symbol) -> Option<AssetEntry> {
