@@ -1,16 +1,50 @@
 #![no_std]
-// TEMPORARY (audit W4.1, 15 Nov 2026): `Events::publish` is deprecated since
-// soroban-sdk 23 in favour of `#[contractevent]`. Publishing behaves exactly as
-// before; the migration to `#[contractevent]` (with byte-for-byte event
-// encoding tests) is sub-step W4.1b, which removes this allowance.
-#![allow(deprecated)]
 
 use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
-    contract, contracterror, contractimpl, contracttype,
+    contract, contracterror, contractevent, contractimpl, contracttype,
     crypto::Hash,
-    BytesN, Env, String, Symbol, Vec,
+    Address, BytesN, Env, String, Vec,
 };
+
+// Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
+// Events::publish encodings; pinned by golden/events.txt). Each has topics
+// [NAME, account] and the affected key / threshold as single-value data.
+
+#[contractevent(topics = ["ACCOUNT_INITIALIZED"], data_format = "single-value")]
+pub struct AccountInitialized {
+    #[topic]
+    pub account: Address,
+    pub public_key: BytesN<65>,
+}
+
+#[contractevent(topics = ["SIGNER_ADDED"], data_format = "single-value")]
+pub struct SignerAdded {
+    #[topic]
+    pub account: Address,
+    pub public_key: BytesN<65>,
+}
+
+#[contractevent(topics = ["SIGNER_UPDATED"], data_format = "single-value")]
+pub struct SignerUpdated {
+    #[topic]
+    pub account: Address,
+    pub public_key: BytesN<65>,
+}
+
+#[contractevent(topics = ["SIGNER_REMOVED"], data_format = "single-value")]
+pub struct SignerRemoved {
+    #[topic]
+    pub account: Address,
+    pub public_key: BytesN<65>,
+}
+
+#[contractevent(topics = ["THRESHOLD_UPDATED"], data_format = "single-value")]
+pub struct ThresholdUpdated {
+    #[topic]
+    pub account: Address,
+    pub threshold: u32,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -183,13 +217,11 @@ impl SmartAccountContract {
 
         env.storage().instance().set(&DataKey::Initialized, &true);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "ACCOUNT_INITIALIZED"),
-                env.current_contract_address(),
-            ),
-            admin_public_key,
-        );
+        AccountInitialized {
+            account: env.current_contract_address(),
+            public_key: admin_public_key,
+        }
+        .publish(&env);
 
     }
 
@@ -230,13 +262,11 @@ impl SmartAccountContract {
         keys.push_back(signer.public_key.clone());
         env.storage().instance().set(&DataKey::SignerKeys, &keys);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "SIGNER_ADDED"),
-                env.current_contract_address(),
-            ),
-            signer.public_key,
-        );
+        SignerAdded {
+            account: env.current_contract_address(),
+            public_key: signer.public_key,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -301,13 +331,11 @@ impl SmartAccountContract {
             .instance()
             .set(&DataKey::Signer(signer.public_key.clone()), &signer);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "SIGNER_UPDATED"),
-                env.current_contract_address(),
-            ),
-            signer.public_key,
-        );
+        SignerUpdated {
+            account: env.current_contract_address(),
+            public_key: signer.public_key,
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -371,13 +399,11 @@ impl SmartAccountContract {
         }
         env.storage().instance().set(&DataKey::SignerKeys, &new_keys);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "SIGNER_REMOVED"),
-                env.current_contract_address(),
-            ),
+        SignerRemoved {
+            account: env.current_contract_address(),
             public_key,
-        );
+        }
+        .publish(&env);
 
         Ok(())
     }
@@ -419,13 +445,11 @@ impl SmartAccountContract {
             .instance()
             .set(&DataKey::Threshold, &new_threshold);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "THRESHOLD_UPDATED"),
-                env.current_contract_address(),
-            ),
-            new_threshold,
-        );
+        ThresholdUpdated {
+            account: env.current_contract_address(),
+            threshold: new_threshold,
+        }
+        .publish(&env);
 
         Ok(())
     }
