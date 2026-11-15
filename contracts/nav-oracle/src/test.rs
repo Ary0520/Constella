@@ -605,8 +605,9 @@ fn test_median_price_no_overflow() {
     let (client, _admin, _base) = setup_oracle(&env);
 
     let sleeve = Symbol::new(&env, "LARGE_NUMS");
-    // Threshold 10,000 bps (100%) to allow small relative spread
-    client.configure_sleeve(&sleeve, &10_000, &2);
+    // The two prices differ by 10 units out of ~1.7e38 (~0 bps), so the
+    // capped maximum threshold (O5) is far more than enough.
+    client.configure_sleeve(&sleeve, &MAX_DEVIATION_THRESHOLD_BPS, &2);
 
     let test_asset = Address::generate(&env);
     env.ledger().set_timestamp(1000);
@@ -2021,5 +2022,97 @@ mod o7c {
         assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL_EURC")).unwrap().price, 10_988_098);
         assert_eq!(s.oracle.asset_price(&s.eurc).unwrap().price, 10_988_049, "median of the two independent providers");
         assert_eq!(s.oracle.collateral_price(&s.eurc).unwrap().price, 10_988_000, "collateral = the lower");
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit O5 / decision D-G (2026-11-15): the deviation breaker cannot be
+// disabled. Thresholds are capped at 5% (defaults: 2% stablecoins, 3% money-
+// market funds); loosening a sleeve (higher threshold or fewer required
+// sources) waits 48 hours, tightening applies at once.
+// -------------------------------------------------------------------------
+mod o5 {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    const T0: u64 = 50_000;
+    const DELAY: u64 = 48 * 3600;
+
+    fn setup(env: &Env) -> (NavOracleClient<'_>, Address, Symbol) {
+        let (client, admin, _base) = setup_oracle(env);
+        env.ledger().set_timestamp(T0);
+        let sleeve = Symbol::new(env, "CASH");
+        client.configure_sleeve(&sleeve, &200, &3);
+        (client, admin, sleeve)
+    }
+
+    fn cfg(client: &NavOracleClient, sleeve: &Symbol) -> (u32, u32) {
+        let c = client.get_sleeve_config(sleeve).unwrap();
+        (c.deviation_threshold_bps, c.min_valid_sources)
+    }
+
+    #[test]
+    fn the_breaker_cannot_be_set_wider_than_five_percent() {
+        let env = Env::default();
+        let (client, _admin, _sleeve) = setup(&env);
+        let fresh = Symbol::new(&env, "FUNDS");
+        assert!(client.try_configure_sleeve(&fresh, &501, &2).is_err());
+        assert!(client.try_configure_sleeve(&fresh, &10_000, &2).is_err(), "100% would disable the breaker");
+        client.configure_sleeve(&fresh, &500, &2);
+        assert_eq!(cfg(&client, &fresh), (500, 2));
+        assert_eq!(MAX_DEVIATION_THRESHOLD_BPS, 500);
+    }
+
+    #[test]
+    fn tightening_applies_immediately() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = setup(&env);
+        client.configure_sleeve(&sleeve, &150, &4);
+        assert_eq!(cfg(&client, &sleeve), (150, 4));
+        assert_eq!(client.get_pending_sleeve_config(&sleeve), None);
+    }
+
+    #[test]
+    fn loosening_waits_48_hours_then_anyone_activates() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = setup(&env);
+        client.configure_sleeve(&sleeve, &300, &3); // wider threshold
+        assert_eq!(cfg(&client, &sleeve), (200, 3), "old, tighter config stays in force");
+        let p = client.get_pending_sleeve_config(&sleeve).unwrap();
+        assert_eq!((p.deviation_threshold_bps, p.min_valid_sources, p.effective_at), (300, 3, T0 + DELAY));
+        env.ledger().set_timestamp(T0 + DELAY - 1);
+        assert!(client.try_activate_sleeve_config(&sleeve).is_err());
+        env.ledger().set_timestamp(T0 + DELAY);
+        env.mock_auths(&[]);
+        client.activate_sleeve_config(&sleeve);
+        assert_eq!(cfg(&client, &sleeve), (300, 3));
+    }
+
+    #[test]
+    fn requiring_fewer_sources_is_loosening_too() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = setup(&env);
+        client.configure_sleeve(&sleeve, &200, &2);
+        assert_eq!(cfg(&client, &sleeve), (200, 3));
+        assert!(client.get_pending_sleeve_config(&sleeve).is_some());
+    }
+
+    #[test]
+    fn only_the_admin_can_cancel_a_pending_loosening() {
+        let env = Env::default();
+        let (client, admin, sleeve) = setup(&env);
+        client.configure_sleeve(&sleeve, &400, &3);
+        let stranger = Address::generate(&env);
+        env.mock_auths(&[MockAuth { address: &stranger, invoke: &MockAuthInvoke {
+            contract: &client.address, fn_name: "cancel_sleeve_config", args: (sleeve.clone(),).into_val(&env), sub_invokes: &[] } }]);
+        assert!(client.try_cancel_sleeve_config(&sleeve).is_err());
+        env.mock_auths(&[MockAuth { address: &admin, invoke: &MockAuthInvoke {
+            contract: &client.address, fn_name: "cancel_sleeve_config", args: (sleeve.clone(),).into_val(&env), sub_invokes: &[] } }]);
+        client.cancel_sleeve_config(&sleeve);
+        assert_eq!(env.auths()[0].0, admin);
+        env.ledger().set_timestamp(T0 + DELAY);
+        assert!(client.try_activate_sleeve_config(&sleeve).is_err());
+        assert_eq!(cfg(&client, &sleeve), (200, 3));
     }
 }
