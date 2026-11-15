@@ -350,7 +350,7 @@ State migrations use the standard CAP-85 data-migration path.
 
 ## Events Reference
 
-All state-changing functions must emit events. Format:
+All state-changing functions must emit events, declared as typed `#[contractevent]` structs (audit W4.1b) so they appear in the contract interface spec for wallets, indexers and generated clients. Exact encodings are pinned by each crate's `golden/events.txt`. Format:
 
 ```
 Topic: ["EVENT_NAME", ...discriminators]
