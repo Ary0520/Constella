@@ -108,9 +108,7 @@ fn setup_test_context() -> TestContext {
     }
 
     // Register policy contract
-    let policy_id = env.register(PolicyContract, ());
-    let policy_client = PolicyContractClient::new(&env, &policy_id);
-    policy_client.initialize(&admin, &oracle_id);
+    let policy_id = env.register(PolicyContract, (admin.clone(), oracle_id.clone()));
 
     TestContext {
         env,
@@ -303,57 +301,30 @@ fn test_t26_policy_registration_and_hash_storage() {
 #[test]
 fn test_t26_uninitialized_and_unauthorized_checks() {
     let env = Env::default();
-    let policy_id = env.register(PolicyContract, ());
+    // Audit M3: admin and oracle are set by the constructor, atomically with
+    // deployment; there is no uninitialized window and no `initialize`.
+    let admin = Address::generate(&env);
+    let oracle_addr = Address::generate(&env); // never called in this test
+    let policy_id = env.register(PolicyContract, (admin.clone(), oracle_addr.clone()));
     let policy = PolicyContractClient::new(&env, &policy_id);
-
-    // Calling get_admin on uninitialized contract fails
-    let admin_res = policy.try_get_admin();
-    assert_eq!(
-        admin_res,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            PolicyError::NotInitialized as u32
-        )))
+    assert_eq!(policy.get_admin(), admin);
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &policy_id,
+        &Symbol::new(&env, "initialize"),
+        soroban_sdk::vec![
+            &env,
+            soroban_sdk::IntoVal::into_val(&Address::generate(&env), &env),
+            soroban_sdk::IntoVal::into_val(&Address::generate(&env), &env),
+        ],
     );
+    assert!(!matches!(r, Ok(Ok(()))));
+    assert_eq!(policy.get_oracle(), oracle_addr);
 
-    // Calling register_policy on uninitialized contract fails
     let vault = Address::generate(&env);
     let owner = Address::generate(&env);
     let reg_addr = Address::generate(&env);
     let p_hash = sample_hash(&env, 0x01);
     let sleeves = sample_sleeves(&env);
-
-    let reg_res = policy.try_register_policy(
-        &vault,
-        &owner,
-        &p_hash,
-        &reg_addr,
-        &1000,
-        &2500,
-        &3000,
-        &50,
-        &500,
-        &sleeves,
-    );
-    assert_eq!(
-        reg_res,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            PolicyError::NotInitialized as u32
-        )))
-    );
-
-    // Initialize with admin
-    let admin = Address::generate(&env);
-    let oracle_addr = Address::generate(&env); // never called in this test
-    policy.initialize(&admin, &oracle_addr);
-
-    // Double initialization must fail
-    let double_init = policy.try_initialize(&admin, &oracle_addr);
-    assert_eq!(
-        double_init,
-        Err(Ok(soroban_sdk::Error::from_contract_error(
-            PolicyError::AlreadyInitialized as u32
-        )))
-    );
 
     // Registration without owner + vault authorization fails
     env.mock_auths(&[]);
@@ -1774,8 +1745,17 @@ mod p1 {
         let ctx = setup_test_context();
         let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
         assert_eq!(policy.get_oracle(), ctx.oracle_address);
-        // Re-initializing (the only way to set it) is refused.
-        assert!(policy.try_initialize(&ctx.admin, &Address::generate(&ctx.env)).is_err());
+        // There is no setter and no `initialize` entrypoint (audit M3).
+        let r = ctx.env.try_invoke_contract::<(), soroban_sdk::Error>(
+            &ctx.policy_address,
+            &Symbol::new(&ctx.env, "initialize"),
+            soroban_sdk::vec![
+                &ctx.env,
+                soroban_sdk::IntoVal::into_val(&ctx.admin, &ctx.env),
+                soroban_sdk::IntoVal::into_val(&Address::generate(&ctx.env), &ctx.env),
+            ],
+        );
+        assert!(!matches!(r, Ok(Ok(()))));
         assert_eq!(policy.get_oracle(), ctx.oracle_address);
     }
 }

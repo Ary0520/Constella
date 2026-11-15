@@ -668,13 +668,11 @@ fn test_t55_sponsored_passkey_vault_deposit() {
     });
 
     // 3. Deploy Policy
-    let policy_id = env.register(constella_policy::PolicyContract, ());
-    let policy_client = constella_policy::PolicyContractClient::new(&env, &policy_id);
 
     // 4. Deploy Oracle
     let oracle_id = env.register(constella_nav_oracle::NavOracle, (admin.clone(), numeraire_address.clone(), 7u32, 300u32));
     let oracle_client = constella_nav_oracle::NavOracleClient::new(&env, &oracle_id);
-    policy_client.initialize(&admin, &oracle_id);
+    let policy_id = env.register(constella_policy::PolicyContract, (admin.clone(), oracle_id.clone()));
 
     let sleeve_sym = Symbol::new(&env, "VAULT");
     oracle_client.configure_sleeve(&sleeve_sym, &300, &2);

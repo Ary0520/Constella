@@ -198,11 +198,6 @@ pub enum DataKey {
 mod test;
 
 pub trait PolicyContractTrait {
-    /// Initialize with a governance admin and the NAV oracle used to value
-    /// both legs of every trade (audit P1). The oracle is fixed for the life
-    /// of this contract: there is deliberately no setter.
-    fn initialize(env: Env, admin: Address, oracle: Address);
-
     /// The NAV oracle used for slippage valuation.
     fn get_oracle(env: Env) -> Address;
 
@@ -344,15 +339,19 @@ pub fn compute_terms_hash(
 }
 
 #[contractimpl]
-impl PolicyContractTrait for PolicyContract {
-    fn initialize(env: Env, admin: Address, oracle: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, PolicyError::AlreadyInitialized);
-        }
+impl PolicyContract {
+    /// Set the governance admin and the NAV oracle used to value both legs of
+    /// every trade (audit P1). Runs atomically as part of deployment, so no one
+    /// can claim an uninitialized policy contract (audit M3). The oracle is
+    /// fixed for the life of this contract: there is deliberately no setter.
+    pub fn __constructor(env: Env, admin: Address, oracle: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Oracle, &oracle);
     }
+}
 
+#[contractimpl]
+impl PolicyContractTrait for PolicyContract {
     fn get_oracle(env: Env) -> Address {
         match env.storage().instance().get(&DataKey::Oracle) {
             Some(o) => o,
