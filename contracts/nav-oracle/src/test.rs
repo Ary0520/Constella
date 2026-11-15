@@ -196,12 +196,13 @@ fn test_t37_deviation_circuit_breaker() {
 
     client.register_source(&s1);
     client.register_source(&s2);
+    // Audit O4: deviation latches and NAV_PAUSE is emitted in the call that
+    // adds the deviating feed (persisted even if a later caller reverts).
+    let events = env.events().all();
 
     // Query triggers circuit breaker and returns None
     assert!(client.get_collateral_nav(&sleeve).is_none());
 
-    // Verify NAV_PAUSE event emission IMMEDIATELY after trigger
-    let events = env.events().all();
     let nav_pause_sym = Symbol::new(&env, "NAV_PAUSE");
     let mut found_pause_event = false;
     for event in events.iter() {
@@ -544,12 +545,13 @@ fn test_extreme_price_difference_no_overflow() {
 
     client.register_source(&s1);
     client.register_source(&s2);
+    // Audit O4: deviation latches and NAV_PAUSE is emitted in the call that
+    // adds the deviating feed (persisted even if a later caller reverts).
+    let events = env.events().all();
 
     // Calling get_collateral_nav must trip deviation circuit breaker WITHOUT PANICKING from integer overflow
     assert!(client.get_collateral_nav(&sleeve).is_none());
 
-    // Verify NAV_PAUSE event emission IMMEDIATELY after trigger
-    let events = env.events().all();
     let nav_pause_sym = Symbol::new(&env, "NAV_PAUSE");
     let mut found_pause = false;
     for event in events.iter() {

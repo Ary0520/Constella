@@ -287,6 +287,37 @@ fn evaluate_sources(
     Ok(valid_sources)
 }
 
+/// Audit O4: evaluate a sleeve's sources right after a price write and latch a
+/// deviation pause (persisting `NAV_PAUSE`) inside that successful call.
+///
+/// Previously deviation was only detected on reads; a read inside a caller
+/// that later reverted rolled the pause and its event back. Staleness and
+/// insufficient-sources remain live checks on every read (never latched).
+fn latch_deviation_on_write(env: &Env, sleeve_id: &Symbol) {
+    let mut config: SleeveOracleConfig = env
+        .storage()
+        .instance()
+        .get(&DataKey::SleeveConfig(sleeve_id.clone()))
+        .unwrap_or(SleeveOracleConfig {
+            sleeve_id: sleeve_id.clone(),
+            deviation_threshold_bps: 200,
+            min_valid_sources: 2,
+            is_paused: false,
+            pause_reason: Symbol::new(env, ""),
+        });
+    if config.is_paused {
+        return;
+    }
+    let source_ids: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::SleeveSources(sleeve_id.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    // On DeviationExceeded the pause + NAV_PAUSE are already persisted by
+    // evaluate_sources; InsufficientSources is intentionally not latched.
+    let _ = evaluate_sources(env, &source_ids, sleeve_id, &mut config);
+}
+
 #[contract]
 pub struct NavOracle;
 
@@ -423,6 +454,8 @@ impl NavOracleTrait for NavOracle {
             all_assets.push_back(source.asset.clone());
             env.storage().instance().set(&DataKey::AllAssets, &all_assets);
         }
+
+        latch_deviation_on_write(&env, &source.sleeve);
     }
 
     fn update_price(
@@ -470,6 +503,8 @@ impl NavOracleTrait for NavOracle {
                 timestamp,
             },
         );
+
+        latch_deviation_on_write(&env, &source.sleeve);
     }
 
     fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData> {
