@@ -4,8 +4,9 @@ use soroban_sdk::{
     auth::{Context, CustomAccountInterface},
     contract, contracterror, contractevent, contractimpl, contracttype,
     crypto::Hash,
-    Address, BytesN, Env, String, Vec,
+    Address, Bytes, BytesN, Env, String, Vec,
 };
+use stellar_accounts::verifiers::webauthn::{self, WebAuthnSigData};
 
 // Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
 // Events::publish encodings; pinned by golden/events.txt). Each has topics
@@ -81,11 +82,16 @@ pub struct Signer {
     pub name: String,
 }
 
+/// One passkey's WebAuthn assertion (audit S1). `signature` carries the
+/// authenticator's P-256 signature together with the raw `authenticator_data`
+/// and `client_data` (clientDataJSON) it signed, exactly as returned by
+/// `navigator.credentials.get()`. The client must submit a low-S signature
+/// (Soroban's secp256r1 verification rejects high-S; normalize s -> n - s).
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
 pub struct PasskeySignature {
     pub public_key: BytesN<65>,
-    pub signature: BytesN<64>,
+    pub signature: WebAuthnSigData,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -150,7 +156,7 @@ impl CustomAccountInterface for SmartAccountContract {
             }
 
             // Validate raw signature: neither r nor s can be all zeros
-            let sig_arr = sig.signature.to_array();
+            let sig_arr = sig.signature.signature.to_array();
             let r_is_zero = sig_arr[..32].iter().all(|&b| b == 0);
             let s_is_zero = sig_arr[32..].iter().all(|&b| b == 0);
             if r_is_zero || s_is_zero {
@@ -167,9 +173,13 @@ impl CustomAccountInterface for SmartAccountContract {
                 None => return Err(AccError::InvalidSignature),
             };
 
-            // Cryptographic secp256r1 P-256 verification
-            env.crypto()
-                .secp256r1_verify(&sig.public_key, &signature_payload, &sig.signature);
+            // Audit S1: verify the WebAuthn assertion with OpenZeppelin's audited
+            // verifier - type "webauthn.get", challenge == base64url(payload),
+            // User Present + User Verified flags, BE/BS consistency, and P-256
+            // over SHA-256(authenticatorData || SHA-256(clientDataJSON)).
+            // Panics (rejecting the authorization) on any failure.
+            let payload = Bytes::from_array(&env, &signature_payload.to_array());
+            webauthn::verify(&env, &payload, &sig.public_key, &sig.signature);
 
             accumulated_weight = accumulated_weight.saturating_add(signer.weight);
         }

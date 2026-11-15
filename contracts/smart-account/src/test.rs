@@ -56,6 +56,12 @@ fn sign_payload(env: &Env, keypair: &KeyPair, payload_hash: &[u8; 32]) -> BytesN
     BytesN::<64>::from_array(env, &sig_arr)
 }
 
+/// A real WebAuthn assertion (UP + UV, "webauthn.get") over `payload` - what a
+/// Face ID / Touch ID passkey returns (audit S1; see `s1::assertion`).
+fn passkey_sign(env: &Env, keypair: &KeyPair, payload: &[u8; 32]) -> stellar_accounts::verifiers::webauthn::WebAuthnSigData {
+    s1::assertion(env, keypair, payload, 0x01 | 0x04, "webauthn.get")
+}
+
 fn make_payload_hash(env: &Env, seed: &[u8]) -> (Hash<32>, BytesN<32>, [u8; 32]) {
     let mut msg_bytes = Bytes::new(env);
     msg_bytes.append(&Bytes::from_slice(env, seed));
@@ -118,7 +124,7 @@ fn test_t48_secp256r1_valid_auth() {
     let contract_id = env.register(SmartAccountContract, (admin_kp.public_key_bytes.clone(), 1u32, String::from_str(&env, "Alice iPhone Passkey")));
 
     let (_hash_obj, payload_hash, payload_bytes) = make_payload_hash(&env, b"tx_authorization_payload_t48");
-    let signature_bytes = sign_payload(&env, &admin_kp, &payload_bytes);
+    let signature_bytes = passkey_sign(&env, &admin_kp, &payload_bytes);
 
     let auth = PasskeyAuth {
         signatures: vec![
@@ -149,7 +155,7 @@ fn test_t49_invalid_signature_rejection() {
     let contract_id = env.register(SmartAccountContract, (admin_kp.public_key_bytes.clone(), 1u32, String::from_str(&env, "Alice Key")));
 
     let (_hash_obj, payload_hash, payload_bytes) = make_payload_hash(&env, b"tx_authorization_payload_t49");
-    let signature_bytes = sign_payload(&env, &admin_kp, &payload_bytes);
+    let signature_bytes = passkey_sign(&env, &admin_kp, &payload_bytes);
 
     let empty_contexts: Vec<Context> = vec![&env];
 
@@ -173,7 +179,8 @@ fn test_t49_invalid_signature_rejection() {
     assert_eq!(stranger_res, Err(Ok(AccError::InvalidSignature)));
 
     // Case 2: All-zero signature submitted
-    let zero_sig = BytesN::<64>::from_array(&env, &[0u8; 64]);
+    let mut zero_sig = signature_bytes.clone();
+    zero_sig.signature = BytesN::<64>::from_array(&env, &[0u8; 64]);
     let zero_auth = PasskeyAuth {
         signatures: vec![
             &env,
@@ -292,7 +299,8 @@ fn test_t49_invalid_signature_rejection() {
     for b in zero_r_bytes[..32].iter_mut() {
         *b = 0;
     }
-    let zero_r_sig = BytesN::<64>::from_array(&env, &zero_r_bytes);
+    let mut zero_r_sig = signature_bytes.clone();
+    zero_r_sig.signature = BytesN::<64>::from_array(&env, &zero_r_bytes);
     let zero_r_auth = PasskeyAuth {
         signatures: vec![
             &env,
@@ -348,9 +356,9 @@ fn test_t50_multi_signer_threshold() {
     let (_hash_obj, payload_hash, payload_bytes) = make_payload_hash(&env, b"tx_authorization_payload_t50");
     let empty_contexts: Vec<Context> = vec![&env];
 
-    let sig_owner = sign_payload(&env, &kp_owner, &payload_bytes);
-    let sig_backup = sign_payload(&env, &kp_backup, &payload_bytes);
-    let sig_guardian = sign_payload(&env, &kp_guardian, &payload_bytes);
+    let sig_owner = passkey_sign(&env, &kp_owner, &payload_bytes);
+    let sig_backup = passkey_sign(&env, &kp_backup, &payload_bytes);
+    let sig_guardian = passkey_sign(&env, &kp_guardian, &payload_bytes);
 
     // 1-of-3 submitted: fails threshold check (weight 1 < 2)
     let auth_1_sig = PasskeyAuth {
