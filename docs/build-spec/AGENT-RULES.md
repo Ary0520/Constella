@@ -70,6 +70,7 @@ Once a user signs a policy hash, the policy contract enforces it. **No model, ke
 ## Rule 6: Security Defaults
 
 - All new contracts start with TVL caps and per-user caps
+- Configure contracts with a Soroban `__constructor` (atomic with deployment); never expose a public `initialize` that anyone could call first
 - All admin operations require multisig + timelock
 - Pause authority is separate from upgrade authority
 - Circuit breakers are per-sleeve, not per-vault
