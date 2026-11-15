@@ -114,7 +114,7 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 | **Worst-case exit time** | Slowest plausible full exit scenario |
 
 **UI requirements (non-negotiable):**
-> Every simulation screen MUST display: *"This is a risk and liquidity simulation, not a performance forecast. Historical data does not predict future returns."*
+> Every simulation screen MUST display the canonical disclaimer from `AGENT-RULES.md` Rule 10: *"This simulation uses historical data. Past performance does not predict future returns. This is not financial advice."*
 
 - Label clearly: "Simulation" not "Backtest"
 - Simulation is free and unlimited; no money moves until user explicitly initiates

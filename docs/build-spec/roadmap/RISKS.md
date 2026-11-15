@@ -141,5 +141,5 @@
 - **Risk:** Users claim historical replay was an investment guarantee during market drawdowns.
 - **Probability:** High | **Impact:** Medium
 - **Mitigation:**
-  - Prominent, unmissable disclaimers on every simulation view: *"This is a risk and liquidity simulation, not a performance forecast. Historical data does not predict future returns."*
+  - Prominent, unmissable disclaimers on every simulation view, using the canonical text from `AGENT-RULES.md` Rule 10: *"This simulation uses historical data. Past performance does not predict future returns. This is not financial advice."*
   - Use term "Simulation" rather than "Backtest" across all documentation and UI copy.
