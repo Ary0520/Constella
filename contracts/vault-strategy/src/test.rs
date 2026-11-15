@@ -1409,3 +1409,68 @@ mod v3 {
         assert_vault_operates(&ctx);
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit V4 (2026-11-15): every valuation path (share NAVs, total_assets,
+// redemption capacity, risk sheet) must agree and must never substitute a
+// $1.00 price for a missing oracle price. Funded non-cash sleeves cannot
+// exist until W1, so these guard the reachable behaviour; the funded
+// unpriced-sleeve hard-stop test ships with W1 (tracked in the audit).
+// -------------------------------------------------------------------------
+mod v4 {
+    use super::*;
+
+    fn vault_with_empty_gov(ctx: &TestContext) {
+        let gov = register_gov_fund(ctx);
+        ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
+        ctx.vault_client.deposit(&600_0000000, &ctx.alice);
+        let mut sleeves = SdkVec::new(&ctx.env);
+        sleeves.push_back(sleeve(ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 4000, 600_0000000));
+        sleeves.push_back(sleeve(ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 6000, 0));
+        ctx.vault_client.set_sleeves(&sleeves);
+    }
+
+    fn assert_views_consistent(ctx: &TestContext) {
+        let total = ctx.vault_client.total_assets();
+        assert_eq!(total, 600_0000000, "only the real cash holdings count");
+        let cons = ctx.vault_client.get_nav_conservative().unwrap().price;
+        assert_eq!(cons * ctx.vault_client.total_supply() / 10_000_000, total);
+        let cap = ctx.vault_client.get_redemption_capacity();
+        assert_eq!((cap.in_24h, cap.in_1w, cap.longer), (0, 0, 0));
+        assert!(cap.instant > 0 && cap.instant <= total);
+        assert_eq!(ctx.vault_client.get_risk_sheet().weighted_avg_redemption_hours, 0);
+    }
+
+    #[test]
+    fn views_agree_with_healthy_oracle() {
+        let ctx = setup_test_context();
+        vault_with_empty_gov(&ctx);
+        assert_views_consistent(&ctx);
+    }
+
+    #[test]
+    fn views_survive_paused_empty_sleeve() {
+        let ctx = setup_test_context();
+        vault_with_empty_gov(&ctx);
+        ctx.oracle_client.trigger_circuit_breaker(&ctx.admin, &Symbol::new(&ctx.env, "USD_GOV_FUNDS"), &Symbol::new(&ctx.env, "MANUAL"));
+        assert_views_consistent(&ctx);
+    }
+
+    #[test]
+    fn views_survive_stale_empty_sleeve() {
+        let ctx = setup_test_context();
+        vault_with_empty_gov(&ctx);
+        ctx.env.ledger().set_timestamp(1_000_000 + 86_400);
+        ctx.vault_client.accrue_fees(); // fee dilution changes supply, not assets
+        let total = ctx.vault_client.total_assets();
+        assert_eq!(total, 600_0000000);
+        let cons = ctx.vault_client.get_nav_conservative().unwrap().price;
+        let supply = ctx.vault_client.total_supply();
+        let implied = cons * supply / 10_000_000;
+        // NAV/share is rounded DOWN to 7 decimals (favours the vault), so the
+        // implied total can trail real assets by at most ~1 unit per whole share.
+        assert!(implied <= total, "rounding must favour the vault: {implied} > {total}");
+        assert!(total - implied <= supply / 10_000_000 + 1, "total {total} vs implied {implied}");
+        assert!(ctx.vault_client.get_redemption_capacity().instant > 0);
+    }
+}
