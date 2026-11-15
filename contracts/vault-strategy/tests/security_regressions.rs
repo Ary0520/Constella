@@ -31,6 +31,7 @@ struct Stack<'a> {
     usdc_addr: Address,
     policy: PolicyContractClient<'a>,
     registry_id: Address,
+    oracle: NavOracleClient<'a>,
 }
 
 fn oracle_source(env: &Env, id: &str, asset: &Address, price: i128) -> OracleSource {
@@ -100,7 +101,7 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
             pause_authority: Address::generate(&env),
             numeraire: usdc_addr.clone(),
             policy_contract: policy_id,
-            oracle_contract: oracle_id,
+            oracle_contract: oracle_id.clone(),
             registry_contract: registry_id.clone(),
             treasury: treasury.clone(),
             management_fee_bps: 0,
@@ -121,6 +122,7 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
         usdc_addr,
         policy,
         registry_id,
+        oracle,
     }
 }
 
@@ -310,4 +312,27 @@ fn p3_admin_alone_cannot_replace_a_signed_policy() {
     s.policy.update_policy(&s.vault_id, &amended, &1500, &10_000, &10_000, &50, &500, &targets);
     assert_eq!(s.env.auths()[0].0, owner);
     assert_eq!(s.policy.get_policy_hash(&s.vault_id), amended);
+}
+
+// ---------------------------------------------------------------------------
+// O1 — trigger_circuit_breaker had no authorization: anyone could pause any
+// sleeve (griefing / denial of service). CONTRACTS-SPEC "Security Properties":
+// pause is single-sig *pause authority*; unpause requires the admin multisig.
+// ---------------------------------------------------------------------------
+#[test]
+fn o1_stranger_cannot_trip_a_circuit_breaker() {
+    let s = deploy_stack(); // vault NAV priced by the VAULT oracle sleeve
+    let vault_sleeve = Symbol::new(&s.env, "VAULT");
+    let user = Address::generate(&s.env);
+    s.usdc_admin.mint(&user, &(100 * ONE));
+
+    // Attack: a caller with no role and no signatures at all.
+    s.env.set_auths(&[]);
+    let res = s.oracle.try_trigger_circuit_breaker(&vault_sleeve, &Symbol::new(&s.env, "GRIEF"));
+    assert!(res.is_err(), "an unauthorized caller must not be able to pause a sleeve");
+    assert!(!s.oracle.is_sleeve_paused(&vault_sleeve));
+
+    // The vault keeps working for honest users.
+    s.env.mock_all_auths();
+    assert_eq!(s.vault.deposit(&(100 * ONE), &user), 100 * ONE);
 }
