@@ -1,13 +1,9 @@
 #![no_std]
-// TEMPORARY (audit W4.1, 15 Nov 2026): `Events::publish` is deprecated since
-// soroban-sdk 23 in favour of `#[contractevent]`. Publishing behaves exactly as
-// before; the migration to `#[contractevent]` (with byte-for-byte event
-// encoding tests) is sub-step W4.1b, which removes this allowance.
-#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
+    Address, BytesN,
     Env, FromVal, Symbol, SymbolStr, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
@@ -61,6 +57,65 @@ pub trait AssetRegistryInterface {
     fn is_registered(env: Env, contract_address: Address) -> bool;
     fn get_asset(env: Env, asset_id: Symbol) -> Option<RegistryAssetEntry>;
     fn get_asset_by_address(env: Env, contract_address: Address) -> Option<RegistryAssetEntry>;
+}
+
+// Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
+// Events::publish encodings; pinned by golden/events.txt).
+
+/// Topics [POLICY_REGISTERED, vault]; data (policy_hash, owner, terms_hash).
+#[contractevent(topics = ["POLICY_REGISTERED"], data_format = "vec")]
+pub struct PolicyRegistered {
+    #[topic]
+    pub vault: Address,
+    pub policy_hash: BytesN<32>,
+    pub owner: Address,
+    pub terms_hash: BytesN<32>,
+}
+
+/// Topics [POLICY_UPDATE_PROPOSED, vault]; data (new_hash, effective_at, terms_hash).
+#[contractevent(topics = ["POLICY_UPDATE_PROPOSED"], data_format = "vec")]
+pub struct PolicyUpdateProposed {
+    #[topic]
+    pub vault: Address,
+    pub new_hash: BytesN<32>,
+    pub effective_at: u64,
+    pub terms_hash: BytesN<32>,
+}
+
+/// Topics [POLICY_UPDATED, vault]; data (new_hash, version, terms_hash).
+#[contractevent(topics = ["POLICY_UPDATED"], data_format = "vec")]
+pub struct PolicyUpdated {
+    #[topic]
+    pub vault: Address,
+    pub new_hash: BytesN<32>,
+    pub version: u32,
+    pub terms_hash: BytesN<32>,
+}
+
+/// Topics [POLICY_UPDATE_CANCELLED, vault]; data the cancelled hash.
+#[contractevent(topics = ["POLICY_UPDATE_CANCELLED"], data_format = "single-value")]
+pub struct PolicyUpdateCancelled {
+    #[topic]
+    pub vault: Address,
+    pub new_hash: BytesN<32>,
+}
+
+/// Topics [POLICY_NOTICE_SET, vault]; data (previous_seconds, new_seconds).
+#[contractevent(topics = ["POLICY_NOTICE_SET"], data_format = "vec")]
+pub struct PolicyNoticeSet {
+    #[topic]
+    pub vault: Address,
+    pub previous_seconds: u64,
+    pub new_seconds: u64,
+}
+
+/// Topics [REBALANCE_VALIDATED, vault]; data (is_valid, code).
+#[contractevent(topics = ["REBALANCE_VALIDATED"], data_format = "vec")]
+pub struct RebalanceValidated {
+    #[topic]
+    pub vault: Address,
+    pub is_valid: bool,
+    pub code: u32,
 }
 
 #[contracterror]
@@ -434,10 +489,7 @@ impl PolicyContractTrait for PolicyContract {
             .instance()
             .set(&DataKey::SleeveTargets(vault.clone()), &sleeves);
 
-        env.events().publish(
-            (Symbol::new(&env, "POLICY_REGISTERED"), vault),
-            (policy_hash, owner, terms_hash),
-        );
+        PolicyRegistered { vault, policy_hash, owner, terms_hash }.publish(&env);
     }
 
     fn update_policy(
@@ -504,10 +556,7 @@ impl PolicyContractTrait for PolicyContract {
             .instance()
             .set(&DataKey::PendingUpdate(vault.clone()), &pending);
 
-        env.events().publish(
-            (Symbol::new(&env, "POLICY_UPDATE_PROPOSED"), vault),
-            (new_hash, effective_at, terms_hash),
-        );
+        PolicyUpdateProposed { vault, new_hash, effective_at, terms_hash }.publish(&env);
     }
 
     fn activate_policy_update(env: Env, vault: Address) {
@@ -550,10 +599,13 @@ impl PolicyContractTrait for PolicyContract {
             .instance()
             .remove(&DataKey::PendingUpdate(vault.clone()));
 
-        env.events().publish(
-            (Symbol::new(&env, "POLICY_UPDATED"), vault),
-            (pending.new_hash, config.version, config.terms_hash),
-        );
+        PolicyUpdated {
+            vault,
+            new_hash: pending.new_hash,
+            version: config.version,
+            terms_hash: config.terms_hash,
+        }
+        .publish(&env);
     }
 
     fn cancel_policy_update(env: Env, vault: Address) {
@@ -577,10 +629,7 @@ impl PolicyContractTrait for PolicyContract {
         env.storage()
             .instance()
             .remove(&DataKey::PendingUpdate(vault.clone()));
-        env.events().publish(
-            (Symbol::new(&env, "POLICY_UPDATE_CANCELLED"), vault),
-            pending.new_hash,
-        );
+        PolicyUpdateCancelled { vault, new_hash: pending.new_hash }.publish(&env);
     }
 
     fn get_pending_policy_update(env: Env, vault: Address) -> Option<PendingPolicyUpdate> {
@@ -604,10 +653,7 @@ impl PolicyContractTrait for PolicyContract {
         env.storage()
             .instance()
             .set(&DataKey::NoticePeriod(vault.clone()), &seconds);
-        env.events().publish(
-            (Symbol::new(&env, "POLICY_NOTICE_SET"), vault),
-            (current, seconds),
-        );
+        PolicyNoticeSet { vault, previous_seconds: current, new_seconds: seconds }.publish(&env);
     }
 
     fn get_notice_period(env: Env, vault: Address) -> u64 {
@@ -662,10 +708,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::PolicyNotFound as u32,
                     message: Symbol::new(&env, "POLICY_NOT_FOUND"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
         };
@@ -676,10 +719,7 @@ impl PolicyContractTrait for PolicyContract {
                 code: PolicyError::PolicyNotFound as u32,
                 message: Symbol::new(&env, "POLICY_INACTIVE"),
             };
-            env.events().publish(
-                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                (res.is_valid, res.code),
-            );
+            RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
             return res;
         }
 
@@ -690,10 +730,7 @@ impl PolicyContractTrait for PolicyContract {
                 code: PolicyError::Unauthorized as u32,
                 message: Symbol::new(&env, "VAULT_MISMATCH"),
             };
-            env.events().publish(
-                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                (res.is_valid, res.code),
-            );
+            RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
             return res;
         }
 
@@ -705,10 +742,7 @@ impl PolicyContractTrait for PolicyContract {
                 code: PolicyError::PolicyHashMismatch as u32,
                 message: Symbol::new(&env, "POLICY_HASH_MISMATCH"),
             };
-            env.events().publish(
-                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                (res.is_valid, res.code),
-            );
+            RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
             return res;
         }
 
@@ -719,10 +753,7 @@ impl PolicyContractTrait for PolicyContract {
                 code: PolicyError::DeadlineExceeded as u32,
                 message: Symbol::new(&env, "DEADLINE_EXCEEDED"),
             };
-            env.events().publish(
-                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                (res.is_valid, res.code),
-            );
+            RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
             return res;
         }
 
@@ -738,10 +769,7 @@ impl PolicyContractTrait for PolicyContract {
                 code: PolicyError::WeightsDoNotSumTo10000 as u32,
                 message: Symbol::new(&env, "WEIGHTS_NOT_10000"),
             };
-            env.events().publish(
-                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                (res.is_valid, res.code),
-            );
+            RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
             return res;
         }
 
@@ -756,10 +784,7 @@ impl PolicyContractTrait for PolicyContract {
                         code: PolicyError::WeightBandExceeded as u32,
                         message: Symbol::new(&env, "DUPLICATE_ASSET"),
                     };
-                    env.events().publish(
-                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                        (res.is_valid, res.code),
-                    );
+                    RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                     return res;
                 }
             }
@@ -788,10 +813,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::WeightBandExceeded as u32,
                     message: Symbol::new(&env, "WEIGHT_BAND_EXCEEDED"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
         }
@@ -812,10 +834,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::WeightBandExceeded as u32,
                     message: Symbol::new(&env, "UNDECLARED_SLEEVE"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
         }
@@ -829,10 +848,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::SingleAssetCapExceeded as u32,
                     message: Symbol::new(&env, "SINGLE_ASSET_CAP"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
         }
@@ -856,10 +872,7 @@ impl PolicyContractTrait for PolicyContract {
                         code: PolicyError::AssetNotRegistered as u32,
                         message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
                     };
-                    env.events().publish(
-                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                        (res.is_valid, res.code),
-                    );
+                    RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                     return res;
                 }
             };
@@ -883,10 +896,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::IssuerCapExceeded as u32,
                     message: Symbol::new(&env, "ISSUER_CAP_EXCEEDED"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
         }
@@ -911,10 +921,7 @@ impl PolicyContractTrait for PolicyContract {
                 code: PolicyError::LiquidityFloorBreached as u32,
                 message: Symbol::new(&env, "LIQUIDITY_FLOOR_BREACHED"),
             };
-            env.events().publish(
-                (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                (res.is_valid, res.code),
-            );
+            RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
             return res;
         }
 
@@ -927,10 +934,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::SlippageLimitExceeded as u32,
                     message: Symbol::new(&env, "INVALID_TRADE_AMOUNT"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
             if op.asset_in == op.asset_out {
@@ -939,10 +943,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::SlippageLimitExceeded as u32,
                     message: Symbol::new(&env, "IDENTICAL_ASSETS"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
 
@@ -960,10 +961,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::AssetNotRegistered as u32,
                     message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
         }
@@ -994,10 +992,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::AssetNotInPolicy as u32,
                     message: Symbol::new(&env, "ASSET_NOT_IN_POLICY"),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
         }
@@ -1019,10 +1014,7 @@ impl PolicyContractTrait for PolicyContract {
                         code: PolicyError::PriceUnavailable as u32,
                         message: Symbol::new(&env, "PRICE_UNAVAILABLE"),
                     };
-                    env.events().publish(
-                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                        (res.is_valid, res.code),
-                    );
+                    RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                     return res;
                 }
             };
@@ -1044,10 +1036,7 @@ impl PolicyContractTrait for PolicyContract {
                     code: PolicyError::SlippageLimitExceeded as u32,
                     message: Symbol::new(&env, msg),
                 };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
+                RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
                 return res;
             }
         }
@@ -1058,10 +1047,7 @@ impl PolicyContractTrait for PolicyContract {
             code: 0,
             message: Symbol::new(&env, "VALID"),
         };
-        env.events().publish(
-            (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-            (res.is_valid, res.code),
-        );
+        RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
         res
     }
 
