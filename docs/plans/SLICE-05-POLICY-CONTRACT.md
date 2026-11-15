@@ -31,7 +31,7 @@ Implement and verify the on-chain Policy Storage & Validation contract in Soroba
 pub trait PolicyContractTrait {
     /// Initialize with a governance admin and the (immutable) NAV oracle used
     /// to value trade legs for slippage (audit P1).
-    fn initialize(env: Env, admin: Address, oracle: Address);
+    fn __constructor(env: Env, admin: Address, oracle: Address); // audit M3: atomic at deployment
 
     /// Register a signed policy (requires vault + owner auth; one-time).
     /// Updated 15 Nov 2026 for audit P3 — see CONTRACTS-SPEC.md "Signing model".

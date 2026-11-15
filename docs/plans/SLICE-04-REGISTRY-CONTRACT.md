@@ -23,7 +23,8 @@ Implement and verify the on-chain Closed Universe Asset Registry contract in Sor
 #[contractclient(name = "AssetRegistryClient")]
 pub trait AssetRegistryTrait {
     /// Initialize the registry with an authorized admin address (multisig)
-    fn initialize(env: Env, admin: Address);
+    // Audit M3 (15 Nov 2026): set atomically at deployment; no `initialize`.
+    fn __constructor(env: Env, admin: Address);
 
     /// Add an approved asset to the closed universe (admin only)
     fn add_asset(env: Env, entry: AssetEntry);

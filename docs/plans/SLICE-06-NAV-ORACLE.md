@@ -28,7 +28,8 @@ Implement and verify the on-chain NAV Oracle contract in Soroban Rust:
 #[contractclient(name = "NavOracleClient")]
 pub trait NavOracleTrait {
     /// Initialize oracle with admin, base asset (numéraire), decimals, and resolution
-    fn initialize(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32);
+    // Audit M3 (15 Nov 2026): set atomically at deployment; no `initialize`.
+    fn __constructor(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32);
 
     /// Configure sleeve deviation threshold (bps) and staleness limits
     fn configure_sleeve(
