@@ -32,10 +32,12 @@ pub trait PolicyContractTrait {
     /// Initialize the policy contract with a governance admin
     fn initialize(env: Env, admin: Address);
 
-    /// Register a signed policy hash and configuration for a vault
+    /// Register a signed policy (requires vault + owner auth; one-time).
+    /// Updated 15 Nov 2026 for audit P3 — see CONTRACTS-SPEC.md "Signing model".
     fn register_policy(
         env: Env,
         vault: Address,
+        owner: Address,
         policy_hash: BytesN<32>,
         registry_address: Address,
         min_liquidity_sleeve_bps: u32,
@@ -46,11 +48,16 @@ pub trait PolicyContractTrait {
         sleeves: Vec<SleeveTarget>,
     );
 
-    /// Update a vault's policy hash upon user re-signing
+    /// Amend a vault's policy (requires the stored owner's fresh signature)
     fn update_policy(
         env: Env,
         vault: Address,
         new_hash: BytesN<32>,
+        min_liquidity_sleeve_bps: u32,
+        max_single_asset_bps: u32,
+        max_issuer_bps: u32,
+        max_slippage_bps: u32,
+        rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     );
 
