@@ -21,6 +21,10 @@ pub enum OracleError {
     PriceStale = 9,
     InsufficientLiquidityDepth = 10,
     InvalidThreshold = 11,
+    /// Price timestamp is later than the current ledger time.
+    FutureTimestamp = 12,
+    /// Update is older than the price already stored for this source.
+    OutOfOrderUpdate = 13,
 }
 
 #[contracttype]
