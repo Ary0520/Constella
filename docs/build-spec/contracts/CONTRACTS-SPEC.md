@@ -102,7 +102,7 @@ fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfig> // includ
 5. Liquidity sleeve minimum maintained
 6. All assets in proposal are in the registry and active
 7. Proposal deadline not exceeded (prevents replays)
-8. Slippage per operation within limit
+8. Slippage per operation within limit — measured in **value**, not token units (audit P1): each leg is `amount × asset_price / 10^token_decimals` using the NAV oracle's per-asset median (numéraire = 1.0); require `min_value_out ≥ value_in × (1 − max_slippage_bps/10000)`. No valid price → proposal invalid (`PriceUnavailable`). The policy contract's oracle is set once in `initialize(admin, oracle)` and has no setter.
 
 **RebalanceProposal struct:**
 ```rust
@@ -227,6 +227,7 @@ fn lastprice(env: Env, asset: Asset) -> Option<PriceData>          // conservati
 
 // Constella extensions (non-SEP-40)
 fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>  // minimum of valid sources
+fn asset_price(env: Env, asset: Address) -> Option<PriceData>            // median of the asset's own valid sources; base = 1.0
 fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>     // median of valid sources
 
 // Oracle management
