@@ -70,7 +70,9 @@ pub trait NavOracleTrait {
 
     /// Circuit breaker status and management
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool;
-    fn trigger_circuit_breaker(env: Env, sleeve_id: Symbol, reason: Symbol);
+    fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol); // pause authority or admin (audit O1)
+    fn set_pause_authority(env: Env, new_authority: Address); // admin only
+    fn get_pause_authority(env: Env) -> Address;
     fn clear_circuit_breaker(env: Env, sleeve_id: Symbol);
 
     /// Admin query
