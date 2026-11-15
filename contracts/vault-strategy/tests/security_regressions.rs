@@ -680,3 +680,28 @@ fn m1_rebalance_cannot_buy_an_asset_outside_the_signed_policy() {
     assert!(!r.is_valid, "buying an asset outside the signed policy must be rejected");
     assert_eq!(r.message, Symbol::new(&s.env, "ASSET_NOT_IN_POLICY"));
 }
+
+// ---------------------------------------------------------------------------
+// P4 (owner decision D-E) — an owner's amendment took effect immediately for
+// every depositor of a shared vault. Amendments must wait a notice period so
+// holders can exit under the terms they signed up for.
+// ---------------------------------------------------------------------------
+#[test]
+fn p4_amendment_does_not_take_effect_before_the_notice_period() {
+    let s = deploy_stack();
+    let owner = Address::generate(&s.env);
+    let signed = soroban_sdk::BytesN::from_array(&s.env, &[0x41; 32]);
+    let amended = soroban_sdk::BytesN::from_array(&s.env, &[0x42; 32]);
+    let targets = cash_only_targets(&s.env);
+    s.env.mock_all_auths();
+    s.policy.register_policy(
+        &s.vault_id, &owner, &signed, &s.registry_id, &1000, &10_000, &10_000, &50, &500, &targets,
+    );
+
+    // Owner signs an amendment that drops the liquidity floor to 0.
+    s.policy.update_policy(&s.vault_id, &amended, &0, &10_000, &10_000, &50, &500, &targets);
+
+    // Depositors are still protected by the terms they joined under.
+    assert_eq!(s.policy.get_policy_hash(&s.vault_id), signed, "amendment must not apply immediately");
+    assert_eq!(s.policy.get_policy_config(&s.vault_id).unwrap().min_liquidity_sleeve_bps, 1000);
+}
