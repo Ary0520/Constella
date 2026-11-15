@@ -801,3 +801,31 @@ fn w7_passport_is_derived_from_the_basket_not_hard_coded() {
     s.vault.set_sleeves(&sleeves);
     assert!(!s.vault.is_eligible_liquidator(&Address::generate(&s.env)), "gated basket: no unverified liquidators");
 }
+
+// ---------------------------------------------------------------------------
+// V5 — if the oracle had sources under the pseudo-sleeve "VAULT", the vault
+// used them AS its share price and ignored what it actually holds, so the
+// oracle admin could set NAV per share. VAULT-DESIGN: shares are priced from
+// the vault's holdings; NAV-ORACLE: the vault PUBLISHES its NAV (output only).
+// ---------------------------------------------------------------------------
+#[test]
+fn v5_share_price_comes_from_holdings_not_an_oracle_override() {
+    let s = deploy_stack_with(false);
+    let vault_key = Symbol::new(&s.env, "VAULT");
+    // Oracle admin publishes a $2.00 "share price" with two consistent feeds.
+    s.oracle.configure_sleeve(&vault_key, &200, &2);
+    let dummy = Address::generate(&s.env);
+    for id in ["OVERRIDE_A", "OVERRIDE_B"] {
+        let mut src = oracle_source(&s.env, id, &dummy, 2 * ONE);
+        src.sleeve = vault_key.clone();
+        s.oracle.register_source(&src);
+    }
+
+    // The vault holds only USDC: a share is worth exactly $1.00.
+    assert_eq!(s.vault.get_nav_deposit().unwrap().price, ONE, "deposit NAV must come from holdings");
+    assert_eq!(s.vault.get_nav_conservative().unwrap().price, ONE);
+    let alice = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(100 * ONE));
+    assert_eq!(s.vault.deposit(&(100 * ONE), &alice), 100 * ONE, "100 USDC buys 100 shares, not 50");
+    assert_eq!(s.vault.redeem(&(100 * ONE), &alice, &alice), 100 * ONE);
+}
