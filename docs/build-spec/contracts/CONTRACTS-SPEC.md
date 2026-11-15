@@ -328,6 +328,7 @@ pub trait IssuerAdapter {
 | Deposits are capped | `tvl_cap` and `per_user_cap` enforced on deposit/mint; caps can be lowered in place, raised only via a timelocked upgrade |
 | Pause is fast | Single-sig pause authority; multi-sig required to unpause |
 | Circuit breakers are per-sleeve | One bad oracle/issuer does not halt the whole vault |
+| No front-runnable initialization | Every contract is configured by a Soroban `__constructor`, which runs atomically inside the deployment; there is no public `initialize` (audit M3) |
 | Fee accrual is transparent | On-chain, visible at all times as share dilution |
 | Keeper is not trusted | Keeper keypair has only proposal authority; policy contract validates |
 
