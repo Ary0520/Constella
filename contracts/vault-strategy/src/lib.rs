@@ -1,15 +1,160 @@
 #![no_std]
-// TEMPORARY (audit W4.1, 15 Nov 2026): `Events::publish` is deprecated since
-// soroban-sdk 23 in favour of `#[contractevent]`. Publishing behaves exactly as
-// before; the migration to `#[contractevent]` (with byte-for-byte event
-// encoding tests) is sub-step W4.1b, which removes this allowance.
-#![allow(deprecated)]
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
     token, Address, BytesN, Env, FromVal, String, Symbol, SymbolStr, Vec,
 };
+
+// Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
+// Events::publish encodings; pinned by golden/events.txt). Lower-case names are
+// defined by SEP-41 (transfer, approve, mint, burn) and SEP-56 (deposit,
+// withdraw); everything else follows AGENT-RULES Rule 8.
+
+/// SEP-41: topics [transfer, from, to]; data amount.
+#[contractevent(topics = ["transfer"], data_format = "single-value")]
+pub struct Transfer {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+}
+
+/// SEP-41: topics [approve, from, spender]; data amount (live_until_ledger is
+/// added with the OpenZeppelin token in W4.2 / audit W6).
+#[contractevent(topics = ["approve"], data_format = "single-value")]
+pub struct Approve {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub spender: Address,
+    pub amount: i128,
+}
+
+/// SEP-41: topics [mint, to]; data amount.
+#[contractevent(topics = ["mint"], data_format = "single-value")]
+pub struct Mint {
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+}
+
+/// SEP-41: topics [burn, from]; data amount.
+#[contractevent(topics = ["burn"], data_format = "single-value")]
+pub struct Burn {
+    #[topic]
+    pub from: Address,
+    pub amount: i128,
+}
+
+/// SEP-56: topics [deposit, operator, from, receiver]; data (assets, shares).
+#[contractevent(topics = ["deposit"], data_format = "vec")]
+pub struct Deposit {
+    #[topic]
+    pub operator: Address,
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub receiver: Address,
+    pub assets: i128,
+    pub shares: i128,
+}
+
+/// SEP-56: topics [withdraw, operator, receiver, owner]; data (assets, shares).
+#[contractevent(topics = ["withdraw"], data_format = "vec")]
+pub struct Withdraw {
+    #[topic]
+    pub operator: Address,
+    #[topic]
+    pub receiver: Address,
+    #[topic]
+    pub owner: Address,
+    pub assets: i128,
+    pub shares: i128,
+}
+
+/// Topics [FEE_ACCRUAL, treasury]; data shares minted to the treasury.
+#[contractevent(topics = ["FEE_ACCRUAL"], data_format = "single-value")]
+pub struct FeeAccrual {
+    #[topic]
+    pub treasury: Address,
+    pub shares: i128,
+}
+
+/// Topics [VAULT_INITIALIZED, admin]; data ledger timestamp.
+#[contractevent(topics = ["VAULT_INITIALIZED"], data_format = "single-value")]
+pub struct VaultInitialized {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Topics [CAPS_LOWERED, admin]; data (tvl_cap, per_user_cap).
+#[contractevent(topics = ["CAPS_LOWERED"], data_format = "vec")]
+pub struct CapsLowered {
+    #[topic]
+    pub admin: Address,
+    pub tvl_cap: i128,
+    pub per_user_cap: i128,
+}
+
+/// Topics [SLEEVES_UPDATED, admin]; data number of sleeves.
+#[contractevent(topics = ["SLEEVES_UPDATED"], data_format = "single-value")]
+pub struct SleevesUpdated {
+    #[topic]
+    pub admin: Address,
+    pub count: u32,
+}
+
+/// Topics [VAULT_PAUSED, by]; data ledger timestamp (by = pause authority or admin).
+#[contractevent(topics = ["VAULT_PAUSED"], data_format = "single-value")]
+pub struct VaultPaused {
+    #[topic]
+    pub by: Address,
+    pub timestamp: u64,
+}
+
+/// Topics [VAULT_UNPAUSED, admin]; data ledger timestamp.
+#[contractevent(topics = ["VAULT_UNPAUSED"], data_format = "single-value")]
+pub struct VaultUnpaused {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Topics [UPGRADE_PROPOSED, admin]; data (wasm_hash, executable_at).
+#[contractevent(topics = ["UPGRADE_PROPOSED"], data_format = "vec")]
+pub struct UpgradeProposed {
+    #[topic]
+    pub admin: Address,
+    pub wasm_hash: BytesN<32>,
+    pub executable_at: u64,
+}
+
+/// Topics [UPGRADE, admin]; data wasm hash.
+#[contractevent(topics = ["UPGRADE"], data_format = "single-value")]
+pub struct Upgrade {
+    #[topic]
+    pub admin: Address,
+    pub wasm_hash: BytesN<32>,
+}
+
+/// Topics [UPGRADE_CANCELLED, admin]; data wasm hash.
+#[contractevent(topics = ["UPGRADE_CANCELLED"], data_format = "single-value")]
+pub struct UpgradeCancelled {
+    #[topic]
+    pub admin: Address,
+    pub wasm_hash: BytesN<32>,
+}
+
+/// Topics [POLICY_BOUND, owner]; data policy hash.
+#[contractevent(topics = ["POLICY_BOUND"], data_format = "single-value")]
+pub struct PolicyBound {
+    #[topic]
+    pub owner: Address,
+    pub policy_hash: BytesN<32>,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -354,10 +499,7 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
             env.storage().instance().set(&DataKey::LastFeeAccrual, &now);
         }
 
-        env.events().publish(
-            (Symbol::new(env, "FEE_ACCRUAL"), config.treasury.clone()),
-            d_shares,
-        );
+        FeeAccrual { treasury: config.treasury.clone(), shares: d_shares }.publish(env);
         d_shares
     } else {
         0
@@ -623,10 +765,7 @@ fn mint_shares_internal(env: &Env, receiver: &Address, shares: i128) {
         .instance()
         .set(&DataKey::Balance(receiver.clone()), &(bal + shares));
 
-    env.events().publish(
-        (Symbol::new(env, "mint"), receiver.clone()),
-        shares,
-    );
+    Mint { to: receiver.clone(), amount: shares }.publish(env);
 }
 
 /// Moves `amount` shares from `from` to `to` (SEP-41 transfer semantics).
@@ -694,10 +833,7 @@ fn burn_shares_internal(env: &Env, owner: &Address, shares: i128) {
         env.storage().instance().set(&DataKey::Balance(owner.clone()), &new_bal);
     }
 
-    env.events().publish(
-        (Symbol::new(env, "burn"), owner.clone()),
-        shares,
-    );
+    Burn { from: owner.clone(), amount: shares }.publish(env);
 }
 
 /// Remaining room under (tvl_cap, per_user_cap) for `receiver`, in numéraire
@@ -787,10 +923,7 @@ impl StrategyVault {
         });
         env.storage().instance().set(&DataKey::Sleeves, &sleeves);
 
-        env.events().publish(
-            (Symbol::new(&env, "VAULT_INITIALIZED"), admin),
-            env.ledger().timestamp(),
-        );
+        VaultInitialized { admin, timestamp: env.ledger().timestamp() }.publish(&env);
     }
 
     // SEP-56 Vault Operations
@@ -831,12 +964,15 @@ impl StrategyVault {
         update_cash_sleeve_balance(&env, assets, true);
         mint_shares_internal(&env, &receiver, shares);
 
-        env.events().publish(
-            // SEP-56 Deposit: [deposit, operator, from, receiver] (assets, shares).
-            // The receiver authorizes and pays, so it is also operator and from.
-            (Symbol::new(&env, "deposit"), receiver.clone(), receiver.clone(), receiver),
-            (assets, shares),
-        );
+        // SEP-56 Deposit. The receiver authorizes and pays, so it is also operator and from.
+        Deposit {
+            operator: receiver.clone(),
+            from: receiver.clone(),
+            receiver,
+            assets,
+            shares,
+        }
+        .publish(&env);
 
         shares
     }
@@ -878,12 +1014,15 @@ impl StrategyVault {
         update_cash_sleeve_balance(&env, assets, true);
         mint_shares_internal(&env, &receiver, shares);
 
-        env.events().publish(
-            // SEP-56 Deposit: [deposit, operator, from, receiver] (assets, shares).
-            // The receiver authorizes and pays, so it is also operator and from.
-            (Symbol::new(&env, "deposit"), receiver.clone(), receiver.clone(), receiver),
-            (assets, shares),
-        );
+        // SEP-56 Deposit. The receiver authorizes and pays, so it is also operator and from.
+        Deposit {
+            operator: receiver.clone(),
+            from: receiver.clone(),
+            receiver,
+            assets,
+            shares,
+        }
+        .publish(&env);
 
         assets
     }
@@ -951,12 +1090,15 @@ impl StrategyVault {
             &assets,
         );
 
-        env.events().publish(
-            // SEP-56 Withdraw: [withdraw, operator, receiver, owner] (assets, shares).
-            // The owner authorizes, so it is the operator.
-            (Symbol::new(&env, "withdraw"), owner.clone(), receiver, owner),
-            (assets, shares),
-        );
+        // SEP-56 Withdraw. The owner authorizes, so it is the operator.
+        Withdraw {
+            operator: owner.clone(),
+            receiver,
+            owner,
+            assets,
+            shares,
+        }
+        .publish(&env);
 
         assets
     }
@@ -1020,12 +1162,15 @@ impl StrategyVault {
             &assets,
         );
 
-        env.events().publish(
-            // SEP-56 Withdraw: [withdraw, operator, receiver, owner] (assets, shares).
-            // The owner authorizes, so it is the operator.
-            (Symbol::new(&env, "withdraw"), owner.clone(), receiver, owner),
-            (assets, shares),
-        );
+        // SEP-56 Withdraw. The owner authorizes, so it is the operator.
+        Withdraw {
+            operator: owner.clone(),
+            receiver,
+            owner,
+            assets,
+            shares,
+        }
+        .publish(&env);
 
         shares
     }
@@ -1132,10 +1277,7 @@ impl StrategyVault {
         config.tvl_cap = tvl_cap;
         config.per_user_cap = per_user_cap;
         env.storage().instance().set(&DataKey::Config, &config);
-        env.events().publish(
-            (Symbol::new(&env, "CAPS_LOWERED"), config.admin),
-            (tvl_cap, per_user_cap),
-        );
+        CapsLowered { admin: config.admin, tvl_cap, per_user_cap }.publish(&env);
     }
 
     pub fn max_withdraw(env: Env, owner: Address) -> i128 {
@@ -1208,10 +1350,7 @@ impl StrategyVault {
 
         move_shares(&env, &from, &to, amount);
 
-        env.events().publish(
-            (Symbol::new(&env, "transfer"), from, to),
-            amount,
-        );
+        Transfer { from, to, amount }.publish(&env);
     }
 
     pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
@@ -1237,10 +1376,7 @@ impl StrategyVault {
             env.storage().instance().set(&key, &val);
         }
 
-        env.events().publish(
-            (Symbol::new(&env, "approve"), from, spender),
-            amount,
-        );
+        Approve { from, spender, amount }.publish(&env);
     }
 
     pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
@@ -1287,10 +1423,7 @@ impl StrategyVault {
 
         move_shares(&env, &from, &to, amount);
 
-        env.events().publish(
-            (Symbol::new(&env, "transfer"), from, to),
-            amount,
-        );
+        Transfer { from, to, amount }.publish(&env);
     }
 
     pub fn decimals(env: Env) -> u32 {
@@ -1628,10 +1761,7 @@ impl StrategyVault {
         }
 
         env.storage().instance().set(&DataKey::Sleeves, &sleeves);
-        env.events().publish(
-            (Symbol::new(&env, "SLEEVES_UPDATED"), config.admin),
-            sleeves.len(),
-        );
+        SleevesUpdated { admin: config.admin, count: sleeves.len() }.publish(&env);
     }
 
     pub fn get_config(env: Env) -> VaultConfig {
@@ -1657,10 +1787,7 @@ impl StrategyVault {
         config.pause_authority.require_auth();
 
         env.storage().instance().set(&DataKey::IsPaused, &true);
-        env.events().publish(
-            (Symbol::new(&env, "VAULT_PAUSED"), config.pause_authority),
-            env.ledger().timestamp(),
-        );
+        VaultPaused { by: config.pause_authority, timestamp: env.ledger().timestamp() }.publish(&env);
     }
 
     pub fn unpause(env: Env) {
@@ -1668,10 +1795,7 @@ impl StrategyVault {
         config.admin.require_auth();
 
         env.storage().instance().set(&DataKey::IsPaused, &false);
-        env.events().publish(
-            (Symbol::new(&env, "VAULT_UNPAUSED"), config.admin),
-            env.ledger().timestamp(),
-        );
+        VaultUnpaused { admin: config.admin, timestamp: env.ledger().timestamp() }.publish(&env);
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -1690,10 +1814,12 @@ impl StrategyVault {
             executable_at: now + UPGRADE_TIMELOCK_SECONDS,
         };
         env.storage().instance().set(&DataKey::PendingUpgrade, &pending);
-        env.events().publish(
-            (Symbol::new(&env, "UPGRADE_PROPOSED"), config.admin),
-            (new_wasm_hash, pending.executable_at),
-        );
+        UpgradeProposed {
+            admin: config.admin,
+            wasm_hash: new_wasm_hash,
+            executable_at: pending.executable_at,
+        }
+        .publish(&env);
     }
 
     /// Execute the proposed upgrade once its timelock has elapsed (admin).
@@ -1708,10 +1834,7 @@ impl StrategyVault {
             panic_with_error!(&env, VaultError::UpgradeNotReady);
         }
         env.storage().instance().remove(&DataKey::PendingUpgrade);
-        env.events().publish(
-            (Symbol::new(&env, "UPGRADE"), config.admin),
-            pending.wasm_hash.clone(),
-        );
+        Upgrade { admin: config.admin, wasm_hash: pending.wasm_hash.clone() }.publish(&env);
         env.deployer()
             .update_current_contract(soroban_sdk::ContractExecutable::Wasm(pending.wasm_hash));
     }
@@ -1725,10 +1848,7 @@ impl StrategyVault {
             None => panic_with_error!(&env, VaultError::NoPendingUpgrade),
         };
         env.storage().instance().remove(&DataKey::PendingUpgrade);
-        env.events().publish(
-            (Symbol::new(&env, "UPGRADE_CANCELLED"), config.admin),
-            pending.wasm_hash,
-        );
+        UpgradeCancelled { admin: config.admin, wasm_hash: pending.wasm_hash }.publish(&env);
     }
 
     pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
@@ -1740,10 +1860,7 @@ impl StrategyVault {
         config.admin.require_auth();
 
         env.storage().instance().set(&DataKey::IsPaused, &true);
-        env.events().publish(
-            (Symbol::new(&env, "VAULT_PAUSED"), config.admin),
-            env.ledger().timestamp(),
-        );
+        VaultPaused { by: config.admin, timestamp: env.ledger().timestamp() }.publish(&env);
     }
 
     pub fn set_pause_authority(env: Env, new_pause_authority: Address) {
@@ -1787,10 +1904,7 @@ impl StrategyVault {
             &sleeves,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "POLICY_BOUND"), owner),
-            policy_hash,
-        );
+        PolicyBound { owner, policy_hash }.publish(&env);
     }
 
     pub fn get_policy_hash(env: Env) -> Option<BytesN<32>> {
