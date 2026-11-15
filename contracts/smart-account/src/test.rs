@@ -1,5 +1,7 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey, VerifyingKey};
 use soroban_sdk::{
@@ -43,18 +45,15 @@ fn make_payload_hash(env: &Env, seed: &[u8]) -> (Hash<32>, BytesN<32>, [u8; 32])
 #[test]
 fn test_t47_passkey_account_init() {
     let env = Env::default();
-    let contract_id = env.register(SmartAccountContract, ());
-    let client = SmartAccountContractClient::new(&env, &contract_id);
-
     let admin_kp = generate_keypair(&env);
 
-    // Initialize with threshold 1
-    let init_res = client.try_initialize(
-        &admin_kp.public_key_bytes,
-        &1,
-        &String::from_str(&env, "Treasury Admin Passkey"),
+    // Audit M3: the owner passkey is installed by the constructor, atomically
+    // with deployment, so there is no window for anyone else to claim it.
+    let contract_id = env.register(
+        SmartAccountContract,
+        (admin_kp.public_key_bytes.clone(), 1u32, String::from_str(&env, "Treasury Admin Passkey")),
     );
-    assert!(init_res.is_ok());
+    let client = SmartAccountContractClient::new(&env, &contract_id);
 
     // Verify threshold
     assert_eq!(client.get_threshold(), 1);
@@ -72,38 +71,30 @@ fn test_t47_passkey_account_init() {
     let all_signers = client.get_signers();
     assert_eq!(all_signers.len(), 1);
 
-    // Idempotency check: Cannot re-initialize
+    // There is no `initialize` entrypoint to install an attacker key.
     let second_kp = generate_keypair(&env);
-    let reinit_res = client.try_initialize(
-        &second_kp.public_key_bytes,
-        &1,
-        &String::from_str(&env, "Attacker Key"),
+    let r = env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &contract_id,
+        &Symbol::new(&env, "initialize"),
+        (second_kp.public_key_bytes.clone(), 1u32, String::from_str(&env, "Attacker Key")).into_val(&env),
     );
-    assert_eq!(reinit_res, Err(Ok(AccError::AlreadyInitialized)));
+    assert!(!matches!(r, Ok(Ok(()))));
+    assert_eq!(client.get_signers().len(), 1);
 
-    // Zero threshold rejected on fresh deployment
-    let fresh_id = env.register(SmartAccountContract, ());
-    let fresh_client = SmartAccountContractClient::new(&env, &fresh_id);
-    let zero_thresh_res = fresh_client.try_initialize(
-        &second_kp.public_key_bytes,
-        &0,
-        &String::from_str(&env, "Zero Thresh"),
-    );
-    assert_eq!(zero_thresh_res, Err(Ok(AccError::InvalidThreshold)));
+    // Zero threshold makes the deployment itself fail.
+    let env2 = Env::default();
+    let key = second_kp.public_key_bytes.to_array();
+    let deployed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env2.register(SmartAccountContract, (BytesN::from_array(&env2, &key), 0u32, String::from_str(&env2, "Zero Thresh")))
+    }));
+    assert!(deployed.is_err());
 }
 
 #[test]
 fn test_t48_secp256r1_valid_auth() {
     let env = Env::default();
-    let contract_id = env.register(SmartAccountContract, ());
-    let client = SmartAccountContractClient::new(&env, &contract_id);
-
     let admin_kp = generate_keypair(&env);
-    client.initialize(
-        &admin_kp.public_key_bytes,
-        &1,
-        &String::from_str(&env, "Alice iPhone Passkey"),
-    );
+    let contract_id = env.register(SmartAccountContract, (admin_kp.public_key_bytes.clone(), 1u32, String::from_str(&env, "Alice iPhone Passkey")));
 
     let (_hash_obj, payload_hash, payload_bytes) = make_payload_hash(&env, b"tx_authorization_payload_t48");
     let signature_bytes = sign_payload(&env, &admin_kp, &payload_bytes);
@@ -132,15 +123,9 @@ fn test_t48_secp256r1_valid_auth() {
 #[test]
 fn test_t49_invalid_signature_rejection() {
     let env = Env::default();
-    let contract_id = env.register(SmartAccountContract, ());
-    let client = SmartAccountContractClient::new(&env, &contract_id);
 
     let admin_kp = generate_keypair(&env);
-    client.initialize(
-        &admin_kp.public_key_bytes,
-        &1,
-        &String::from_str(&env, "Alice Key"),
-    );
+    let contract_id = env.register(SmartAccountContract, (admin_kp.public_key_bytes.clone(), 1u32, String::from_str(&env, "Alice Key")));
 
     let (_hash_obj, payload_hash, payload_bytes) = make_payload_hash(&env, b"tx_authorization_payload_t49");
     let signature_bytes = sign_payload(&env, &admin_kp, &payload_bytes);
@@ -304,32 +289,20 @@ fn test_t49_invalid_signature_rejection() {
     );
     assert_eq!(zero_r_res, Err(Ok(AccError::InvalidSignature)));
 
-    // Case 9: Check auth on uninitialized contract fails with NotInitialized
-    let uninit_id = env.register(SmartAccountContract, ());
-    let uninit_res = env.try_invoke_contract_check_auth::<AccError>(
-        &uninit_id,
-        &payload_hash,
-        valid_auth.into_val(&env),
-        &empty_contexts,
-    );
-    assert_eq!(uninit_res, Err(Ok(AccError::NotInitialized)));
+    // (Audit M3: an uninitialized account can no longer exist; the owner key is
+    // installed by the constructor, atomically with deployment.)
 }
 
 #[test]
 fn test_t50_multi_signer_threshold() {
     let env = Env::default();
-    let contract_id = env.register(SmartAccountContract, ());
-    let client = SmartAccountContractClient::new(&env, &contract_id);
 
     let kp_owner = generate_keypair(&env);
     let kp_backup = generate_keypair(&env);
     let kp_guardian = generate_keypair(&env);
 
-    client.initialize(
-        &kp_owner.public_key_bytes,
-        &1,
-        &String::from_str(&env, "Owner Passkey"),
-    );
+    let contract_id = env.register(SmartAccountContract, (kp_owner.public_key_bytes.clone(), 1u32, String::from_str(&env, "Owner Passkey")));
+    let client = SmartAccountContractClient::new(&env, &contract_id);
 
     // Add backup and guardian keys using self-authorized call
     env.mock_all_auths();
@@ -450,17 +423,12 @@ fn test_t50_multi_signer_threshold() {
 #[test]
 fn test_t51_signer_rotation_and_safety() {
     let env = Env::default();
-    let contract_id = env.register(SmartAccountContract, ());
-    let client = SmartAccountContractClient::new(&env, &contract_id);
 
     let kp_old = generate_keypair(&env);
     let kp_new = generate_keypair(&env);
 
-    client.initialize(
-        &kp_old.public_key_bytes,
-        &1,
-        &String::from_str(&env, "Old Passkey"),
-    );
+    let contract_id = env.register(SmartAccountContract, (kp_old.public_key_bytes.clone(), 1u32, String::from_str(&env, "Old Passkey")));
+    let client = SmartAccountContractClient::new(&env, &contract_id);
 
     env.mock_all_auths();
 
@@ -577,41 +545,16 @@ fn test_t51_signer_rotation_and_safety() {
         Err(Ok(AccError::SignerNotFound))
     );
 
-    // Uninitialized checks
-    let uninit_id = env.register(SmartAccountContract, ());
-    let uninit_client = SmartAccountContractClient::new(&env, &uninit_id);
-    assert_eq!(
-        uninit_client.try_add_signer(&updated_signer),
-        Err(Ok(AccError::NotInitialized))
-    );
-    assert_eq!(
-        uninit_client.try_remove_signer(&kp_new.public_key_bytes),
-        Err(Ok(AccError::NotInitialized))
-    );
-    assert_eq!(
-        uninit_client.try_update_threshold(&1),
-        Err(Ok(AccError::NotInitialized))
-    );
-    assert_eq!(
-        uninit_client.try_update_signer(&updated_signer),
-        Err(Ok(AccError::NotInitialized))
-    );
-    assert_eq!(uninit_client.get_threshold(), 0);
-    assert_eq!(uninit_client.get_signers().len(), 0);
+    // (Audit M3: an uninitialized account can no longer exist.)
 }
 
 #[test]
 fn test_smart_account_unauthorized_self_auth_enforcement() {
     let env = Env::default();
-    let contract_id = env.register(SmartAccountContract, ());
-    let client = SmartAccountContractClient::new(&env, &contract_id);
 
     let admin_kp = generate_keypair(&env);
-    client.initialize(
-        &admin_kp.public_key_bytes,
-        &1,
-        &String::from_str(&env, "Owner Passkey"),
-    );
+    let contract_id = env.register(SmartAccountContract, (admin_kp.public_key_bytes.clone(), 1u32, String::from_str(&env, "Owner Passkey")));
+    let client = SmartAccountContractClient::new(&env, &contract_id);
 
     let new_kp = generate_keypair(&env);
     let new_signer = Signer {
@@ -739,21 +682,14 @@ fn test_t55_sponsored_passkey_vault_deposit() {
     let vault_client = constella_vault_strategy::StrategyVaultClient::new(&env, &vault_id);
 
     // 6. Deploy Fee Sponsor Engine
-    let sponsor_id = env.register(constella_fee_sponsor::FeeSponsorContract, ());
+    let sponsor_id = env.register(constella_fee_sponsor::FeeSponsorContract, (admin.clone(), 10u32, 50u32, 500_000u64));
     let sponsor_client = constella_fee_sponsor::FeeSponsorContractClient::new(&env, &sponsor_id);
-    sponsor_client.initialize(&admin, &10, &50, &500_000);
     // Whitelist vault for zero-gas sponsorship
     sponsor_client.whitelist_contract(&vault_id);
 
     // 7. Deploy & Initialize User Passkey Smart Account
-    let user_account_id = env.register(SmartAccountContract, ());
-    let smart_account_client = SmartAccountContractClient::new(&env, &user_account_id);
     let user_passkey = generate_keypair(&env);
-    smart_account_client.initialize(
-        &user_passkey.public_key_bytes,
-        &1,
-        &String::from_str(&env, "Bob iPhone Passkey"),
-    );
+    let user_account_id = env.register(SmartAccountContract, (user_passkey.public_key_bytes.clone(), 1u32, String::from_str(&env, "Bob iPhone Passkey")));
 
     // Mint USDC deposit funds to the user smart account (e.g. 1000 USDC)
     numeraire_admin.mint(&user_account_id, &1000_0000000);
@@ -794,10 +730,14 @@ fn test_t55_sponsored_passkey_vault_deposit() {
 fn m3_fresh_account_cannot_be_claimed_by_a_stranger() {
     use soroban_sdk::IntoVal;
     let env = Env::default();
-    let account = env.register(SmartAccountContract, ());
+    let owner = generate_keypair(&env);
+    let account = env.register(SmartAccountContract, (owner.public_key_bytes.clone(), 1u32, String::from_str(&env, "owner")));
     let mut attacker_key = [7u8; 65];
     attacker_key[0] = 0x04;
     let args = (BytesN::from_array(&env, &attacker_key), 1u32, String::from_str(&env, "attacker")).into_val(&env);
     let r = env.try_invoke_contract::<(), soroban_sdk::Error>(&account, &Symbol::new(&env, "initialize"), args);
     assert!(!matches!(r, Ok(Ok(()))), "a stranger must not be able to install their key");
+    let signers = SmartAccountContractClient::new(&env, &account).get_signers();
+    assert_eq!(signers.len(), 1);
+    assert_eq!(signers.get(0).unwrap().public_key, owner.public_key_bytes);
 }

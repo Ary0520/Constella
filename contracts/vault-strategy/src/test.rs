@@ -1449,7 +1449,7 @@ mod w3 {
     }
 
     #[test]
-    fn initialize_requires_sane_caps() {
+    fn deployment_requires_sane_caps() {
         let ctx = setup_test_context();
         let mut cfg = ctx.vault_client.get_config();
         for (tvl, user) in [(0, 0), (100, 0), (0, 100), (100, 101)] {

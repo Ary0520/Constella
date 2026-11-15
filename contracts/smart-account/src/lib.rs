@@ -145,24 +145,17 @@ impl CustomAccountInterface for SmartAccountContract {
 
 #[contractimpl]
 impl SmartAccountContract {
-    /// Initialize the passkey smart account with the primary owner passkey
-    pub fn initialize(
-        env: Env,
-        admin_public_key: BytesN<65>,
-        threshold: u32,
-        name: String,
-    ) -> Result<(), AccError> {
-        if env.storage().instance().has(&DataKey::Initialized) {
-            return Err(AccError::AlreadyInitialized);
-        }
-
+    /// Install the primary owner passkey at deployment (atomic, so no one can
+    /// claim a fresh account by installing their own key - audit M3). There is
+    /// no `initialize` entrypoint.
+    pub fn __constructor(env: Env, admin_public_key: BytesN<65>, threshold: u32, name: String) {
         if threshold == 0 {
-            return Err(AccError::InvalidThreshold);
+            soroban_sdk::panic_with_error!(&env, AccError::InvalidThreshold);
         }
 
         let pk_arr = admin_public_key.to_array();
         if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
-            return Err(AccError::InvalidSignature);
+            soroban_sdk::panic_with_error!(&env, AccError::InvalidSignature);
         }
 
         // The primary owner signer is given weight equal to threshold to be immediately operational
@@ -193,7 +186,6 @@ impl SmartAccountContract {
             admin_public_key,
         );
 
-        Ok(())
     }
 
     /// Add a new signer (requires self-authorization by the smart account)
