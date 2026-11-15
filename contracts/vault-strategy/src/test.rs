@@ -79,12 +79,12 @@ fn setup_test_context() -> TestContext<'static> {
     // Deploy Policy
     let policy_id = env.register(PolicyContract, ());
     let policy_client = PolicyContractClient::new(&env, &policy_id);
-    policy_client.initialize(&admin);
 
     // Deploy Oracle
     let oracle_id = env.register(NavOracle, ());
     let oracle_client = NavOracleClient::new(&env, &oracle_id);
     oracle_client.initialize(&admin, &numeraire_address, &7, &300);
+    policy_client.initialize(&admin, &oracle_id);
 
     // Deploy Vault
     let vault_id = env.register(StrategyVault, ());

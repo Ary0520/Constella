@@ -84,11 +84,11 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
 
     let policy_id = env.register(PolicyContract, ());
     let policy = PolicyContractClient::new(&env, &policy_id);
-    policy.initialize(&admin);
 
     let oracle_id = env.register(NavOracle, ());
     let oracle = NavOracleClient::new(&env, &oracle_id);
     oracle.initialize(&admin, &usdc_addr, &7, &300);
+    policy.initialize(&admin, &oracle_id);
     if vault_nav_feeds {
         oracle.configure_sleeve(&Symbol::new(&env, "VAULT"), &200, &2);
         oracle.register_source(&oracle_source(&env, "USDC_A", &usdc_addr, ONE));

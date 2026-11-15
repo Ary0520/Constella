@@ -14,3 +14,4 @@ soroban-sdk = { workspace = true }
 [dev-dependencies]
 soroban-sdk = { workspace = true, features = ["testutils"] }
 constella-registry = { path = "../registry" }
+constella-nav-oracle = { path = "../nav-oracle" }

@@ -4,6 +4,7 @@
 extern crate std;
 
 use super::*;
+use constella_nav_oracle::{NavOracle, NavOracleClient, OracleSource};
 use constella_registry::{AssetEntry, AssetRegistry, AssetRegistryClient, SleeveType};
 use soroban_sdk::{
     testutils::{Address as _, Events, Ledger},
@@ -27,6 +28,7 @@ struct TestContext {
     usdf_addr: Address,
     deactivated_addr: Address,
     unregistered_addr: Address,
+    oracle_address: Address,
 }
 
 fn register_registry_asset(
@@ -67,14 +69,16 @@ fn setup_test_context() -> TestContext {
     let reg_client = AssetRegistryClient::new(&env, &reg_id);
     reg_client.initialize(&admin);
 
-    let usdc_addr = Address::generate(&env);
-    let eurc_addr = Address::generate(&env);
-    let benji_addr = Address::generate(&env);
-    let eustbl_addr = Address::generate(&env);
-    let blend_addr = Address::generate(&env);
-    let usdf_addr = Address::generate(&env);
-    let deactivated_addr = Address::generate(&env);
-    let unregistered_addr = Address::generate(&env);
+    // Real token contracts (SACs, 7 decimals): slippage valuation reads decimals.
+    let token = |env: &Env| env.register_stellar_asset_contract_v2(Address::generate(env)).address();
+    let usdc_addr = token(&env);
+    let eurc_addr = token(&env);
+    let benji_addr = token(&env);
+    let eustbl_addr = token(&env);
+    let blend_addr = token(&env);
+    let usdf_addr = token(&env);
+    let deactivated_addr = token(&env);
+    let unregistered_addr = token(&env);
 
     register_registry_asset(&env, &reg_client, &usdc_addr, "CIRCLE_USDC", SleeveType::Cash);
     register_registry_asset(&env, &reg_client, &eurc_addr, "CIRCLE_EURC", SleeveType::Cash);
@@ -87,10 +91,26 @@ fn setup_test_context() -> TestContext {
     // Deactivate the deactivated asset
     reg_client.deactivate_asset(&Symbol::new(&env, "RISKY_TOKEN"));
 
+    // NAV oracle with USDC as numéraire. FIXTURE: every other asset is priced
+    // at exactly 1.0 by two independent feeds (each under its own key), so the
+    // legacy tests keep their meaning. P1 tests use a realistic EUR/USD rate.
+    let oracle_id = env.register(NavOracle, ());
+    let oracle = NavOracleClient::new(&env, &oracle_id);
+    oracle.initialize(&admin, &usdc_addr, &7, &300);
+    for (addr, key) in [
+        (&eurc_addr, "P_EURC"),
+        (&benji_addr, "P_BENJI"),
+        (&eustbl_addr, "P_EUSTBL"),
+        (&blend_addr, "P_BLEND"),
+        (&usdf_addr, "P_USDF"),
+    ] {
+        price_asset(&env, &oracle, addr, key, 10_000_000);
+    }
+
     // Register policy contract
     let policy_id = env.register(PolicyContract, ());
     let policy_client = PolicyContractClient::new(&env, &policy_id);
-    policy_client.initialize(&admin);
+    policy_client.initialize(&admin, &oracle_id);
 
     TestContext {
         env,
@@ -108,6 +128,28 @@ fn setup_test_context() -> TestContext {
         usdf_addr,
         deactivated_addr,
         unregistered_addr,
+        oracle_address: oracle_id,
+    }
+}
+
+/// Two independent, deep, fresh feeds for `asset` at `price` (7 decimals).
+fn price_asset(env: &Env, oracle: &NavOracleClient, asset: &Address, key: &str, price: i128) {
+    let sleeve = Symbol::new(env, key);
+    oracle.configure_sleeve(&sleeve, &200, &2);
+    for suffix in ["_A", "_B"] {
+        let mut id = std::string::String::from(key);
+        id.push_str(suffix);
+        oracle.register_source(&OracleSource {
+            source_id: Symbol::new(env, &id),
+            asset: asset.clone(),
+            sleeve: sleeve.clone(),
+            price,
+            timestamp: env.ledger().timestamp(),
+            staleness_limit_seconds: 14_400,
+            min_liquidity_depth_usd: 100_000,
+            current_liquidity_depth_usd: 200_000,
+            is_active: true,
+        });
     }
 }
 
@@ -289,10 +331,11 @@ fn test_t26_uninitialized_and_unauthorized_checks() {
 
     // Initialize with admin
     let admin = Address::generate(&env);
-    policy.initialize(&admin);
+    let oracle_addr = Address::generate(&env); // never called in this test
+    policy.initialize(&admin, &oracle_addr);
 
     // Double initialization must fail
-    let double_init = policy.try_initialize(&admin);
+    let double_init = policy.try_initialize(&admin, &oracle_addr);
     assert_eq!(
         double_init,
         Err(Ok(soroban_sdk::Error::from_contract_error(
@@ -1602,3 +1645,4 @@ mod p3 {
         assert!(!try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1000));
     }
 }
+

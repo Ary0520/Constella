@@ -2,8 +2,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, Address, BytesN, Env,
-    FromVal, Symbol, SymbolStr, Vec,
+    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error, token, Address, BytesN,
+    Env, FromVal, Symbol, SymbolStr, Vec,
 };
 use soroban_sdk::xdr::ToXdr;
 
@@ -36,6 +36,20 @@ pub struct RegistryAssetEntry {
     pub added_at: u64,
 }
 
+/// Mirror of `constella_nav_oracle::PriceData` (decoupled to avoid WASM symbol clashes).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OraclePriceRef {
+    pub price: i128,
+    pub timestamp: u64,
+    pub source: Symbol,
+}
+
+#[contractclient(name = "OraclePriceClient")]
+pub trait OraclePriceInterface {
+    fn asset_price(env: Env, asset: Address) -> Option<OraclePriceRef>;
+}
+
 #[contractclient(name = "AssetRegistryClient")]
 pub trait AssetRegistryInterface {
     fn is_registered(env: Env, contract_address: Address) -> bool;
@@ -60,6 +74,8 @@ pub enum PolicyError {
     SlippageLimitExceeded = 12,
     /// A vault's policy can be registered once; afterwards only the owner may amend it.
     PolicyAlreadyRegistered = 13,
+    /// A traded asset has no valid oracle price, so slippage cannot be measured.
+    PriceUnavailable = 14,
 }
 
 #[contracttype]
@@ -135,6 +151,7 @@ pub struct ValidationResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
     Admin,
+    Oracle,
     PolicyConfig(Address),
     SleeveTargets(Address),
 }
@@ -143,8 +160,13 @@ pub enum DataKey {
 mod test;
 
 pub trait PolicyContractTrait {
-    /// Initialize the policy contract with a governance admin
-    fn initialize(env: Env, admin: Address);
+    /// Initialize with a governance admin and the NAV oracle used to value
+    /// both legs of every trade (audit P1). The oracle is fixed for the life
+    /// of this contract: there is deliberately no setter.
+    fn initialize(env: Env, admin: Address, oracle: Address);
+
+    /// The NAV oracle used for slippage valuation.
+    fn get_oracle(env: Env) -> Address;
 
     /// Register the signed policy for a vault. Requires authorization from BOTH
     /// the policy `owner` (who signs the hash and every term) and the `vault`
@@ -286,11 +308,19 @@ pub fn compute_terms_hash(
 
 #[contractimpl]
 impl PolicyContractTrait for PolicyContract {
-    fn initialize(env: Env, admin: Address) {
+    fn initialize(env: Env, admin: Address, oracle: Address) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic_with_error!(&env, PolicyError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Oracle, &oracle);
+    }
+
+    fn get_oracle(env: Env) -> Address {
+        match env.storage().instance().get(&DataKey::Oracle) {
+            Some(o) => o,
+            None => panic_with_error!(&env, PolicyError::NotInitialized),
+        }
     }
 
     fn register_policy(
@@ -683,7 +713,7 @@ impl PolicyContractTrait for PolicyContract {
             return res;
         }
 
-        // 7. Verify each trade operation slippage: if amount_in > 0, calculate if min_amount_out respects max_slippage_bps
+        // 7. Structural checks on every trade operation
         for i in 0..proposal.operations.len() {
             let op = proposal.operations.get(i).unwrap();
             if op.amount_in <= 0 || op.min_amount_out <= 0 {
@@ -711,34 +741,6 @@ impl PolicyContractTrait for PolicyContract {
                 return res;
             }
 
-            let slippage_factor = 10000u32.saturating_sub(config.max_slippage_bps) as i128;
-            let min_required_out = match op.amount_in.checked_mul(slippage_factor) {
-                Some(product) => product / 10000,
-                None => {
-                    let res = ValidationResult {
-                        is_valid: false,
-                        code: PolicyError::SlippageLimitExceeded as u32,
-                        message: Symbol::new(&env, "SLIPPAGE_OVERFLOW"),
-                    };
-                    env.events().publish(
-                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                        (res.is_valid, res.code),
-                    );
-                    return res;
-                }
-            };
-            if op.min_amount_out < min_required_out {
-                let res = ValidationResult {
-                    is_valid: false,
-                    code: PolicyError::SlippageLimitExceeded as u32,
-                    message: Symbol::new(&env, "SLIPPAGE_EXCEEDED"),
-                };
-                env.events().publish(
-                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                    (res.is_valid, res.code),
-                );
-                return res;
-            }
         }
 
         // 8. Cross-contract call to constella-registry
@@ -776,6 +778,56 @@ impl PolicyContractTrait for PolicyContract {
                     is_valid: false,
                     code: PolicyError::AssetNotRegistered as u32,
                     message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
+                };
+                env.events().publish(
+                    (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                    (res.is_valid, res.code),
+                );
+                return res;
+            }
+        }
+
+        // 9. Slippage measured in VALUE (audit P1). Both legs are priced by the
+        // NAV oracle (median of each asset's valid sources, numéraire = 1.0) and
+        // normalised by each token's decimals:
+        //   value = amount * price / 10^token_decimals
+        //   require  min_value_out >= value_in * (1 - max_slippage)
+        let oracle = OraclePriceClient::new(&env, &Self::get_oracle(env.clone()));
+        let keep_bps = 10000i128 - config.max_slippage_bps as i128;
+        for i in 0..proposal.operations.len() {
+            let op = proposal.operations.get(i).unwrap();
+            let (p_in, p_out) = match (oracle.asset_price(&op.asset_in), oracle.asset_price(&op.asset_out)) {
+                (Some(a), Some(b)) if a.price > 0 && b.price > 0 => (a.price, b.price),
+                _ => {
+                    let res = ValidationResult {
+                        is_valid: false,
+                        code: PolicyError::PriceUnavailable as u32,
+                        message: Symbol::new(&env, "PRICE_UNAVAILABLE"),
+                    };
+                    env.events().publish(
+                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                        (res.is_valid, res.code),
+                    );
+                    return res;
+                }
+            };
+            let dec_in = token::Client::new(&env, &op.asset_in).decimals();
+            let dec_out = token::Client::new(&env, &op.asset_out).decimals();
+            let checked = (|| -> Option<bool> {
+                let value_in = op.amount_in.checked_mul(p_in)? / 10i128.checked_pow(dec_in)?;
+                let min_value_out = op.min_amount_out.checked_mul(p_out)? / 10i128.checked_pow(dec_out)?;
+                Some(min_value_out.checked_mul(10000)? >= value_in.checked_mul(keep_bps)?)
+            })();
+            let (ok, msg) = match checked {
+                Some(true) => (true, ""),
+                Some(false) => (false, "SLIPPAGE_EXCEEDED"),
+                None => (false, "SLIPPAGE_OVERFLOW"),
+            };
+            if !ok {
+                let res = ValidationResult {
+                    is_valid: false,
+                    code: PolicyError::SlippageLimitExceeded as u32,
+                    message: Symbol::new(&env, msg),
                 };
                 env.events().publish(
                     (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
