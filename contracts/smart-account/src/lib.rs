@@ -10,9 +10,11 @@
 //!   never lose its last signer.
 //! * **Recovery rule** (added by the owner): scoped to `CallContract(self)` -
 //!   the account's own management functions only - with M-of-N backup /
-//!   guardian passkeys under the threshold policy. Recovery signers can rotate
-//!   the owner key but can NOT authorize transfers, deposits or any other
-//!   contract call.
+//!   guardian passkeys under the threshold policy. Guardians can only
+//!   *propose* a new owner key; it takes effect after a 48-hour delay unless
+//!   the owner cancels (decision D-F, audit S4). They can NOT authorize
+//!   transfers, deposits, any other contract call, or any other management
+//!   call: only the owner rule may manage the account.
 //!
 //! Passkeys are `Signer::External(webauthn_verifier, public_key)`; each one
 //! signs a WebAuthn assertion over SHA-256(account, signature_payload,
@@ -23,10 +25,10 @@
 #![no_std]
 
 use soroban_sdk::{
-    auth::{Context, CustomAccountInterface},
+    auth::{Context, ContractContext, CustomAccountInterface},
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
     crypto::Hash,
-    panic_with_error, vec, Address, Bytes, BytesN, Env, Map, String, Val, Vec,
+    panic_with_error, vec, Address, Bytes, BytesN, Env, Map, String, Symbol, Val, Vec,
 };
 use stellar_accounts::smart_account::{
     self as oz, AuthDigestPreimage, AuthPayload, ContextRule, ContextRuleType, Signer, SmartAccount, SmartAccountError,
@@ -42,6 +44,41 @@ pub struct AccountInitialized {
     pub public_key: BytesN<65>,
 }
 
+/// Guardians proposed `new_owner`; executable at `executable_at` (audit S4).
+#[contractevent(topics = ["RECOVERY_PROPOSED"], data_format = "vec")]
+pub struct RecoveryProposed {
+    #[topic]
+    pub account: Address,
+    pub new_owner: Signer,
+    pub executable_at: u64,
+}
+
+#[contractevent(topics = ["RECOVERY_CANCELLED"], data_format = "single-value")]
+pub struct RecoveryCancelled {
+    #[topic]
+    pub account: Address,
+    pub new_owner: Signer,
+}
+
+#[contractevent(topics = ["RECOVERY_EXECUTED"], data_format = "single-value")]
+pub struct RecoveryExecuted {
+    #[topic]
+    pub account: Address,
+    pub new_owner: Signer,
+}
+
+/// Delay before a guardian-proposed recovery can take effect (decision D-F):
+/// 48 h, the same window as the vault upgrade timelock and the policy
+/// amendment notice period.
+pub const RECOVERY_DELAY_SECONDS: u64 = 48 * 3600;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRecovery {
+    pub new_owner: Signer,
+    pub executable_at: u64,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
@@ -54,12 +91,22 @@ pub enum AccError {
     OwnerRuleNeedsSigner = 3,
     /// A threshold policy on the rule would require more signers than remain.
     ThresholdUnreachable = 4,
+    /// Only the owner rule may authorize account management; other rules may
+    /// only propose a recovery (audit S4).
+    ManagementRequiresOwner = 5,
+    /// No recovery is pending.
+    NoPendingRecovery = 6,
+    /// The 48-hour recovery delay has not elapsed.
+    RecoveryNotReady = 7,
+    /// The proposed key already belongs to the owner rule.
+    AlreadyOwner = 8,
 }
 
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
     OwnerRule,
+    PendingRecovery,
 }
 
 /// Read-only view implemented by `constella-threshold-policy`; used to keep a
@@ -115,7 +162,22 @@ impl CustomAccountInterface for SmartAccountContract {
         signatures: AuthPayload,
         auth_contexts: Vec<Context>,
     ) -> Result<(), SmartAccountError> {
-        oz::do_check_auth(&e, &signature_payload, &signatures, &auth_contexts)
+        oz::do_check_auth(&e, &signature_payload, &signatures, &auth_contexts)?;
+        // Audit S4: a call to this account's own functions authorized under
+        // any rule other than the owner rule may only propose a recovery.
+        // (do_check_auth has already checked one rule id per context.)
+        let me = e.current_contract_address();
+        let owner = owner_rule_id(&e);
+        let propose = Symbol::new(&e, "propose_recovery");
+        for (i, context) in auth_contexts.iter().enumerate() {
+            if let Context::Contract(ContractContext { contract, fn_name, .. }) = context {
+                let rule_id = signatures.context_rule_ids.get_unchecked(i as u32);
+                if contract == me && rule_id != owner && fn_name != propose {
+                    panic_with_error!(&e, AccError::ManagementRequiresOwner);
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -165,6 +227,53 @@ impl SmartAccountContract {
     /// ID of the protected owner rule.
     pub fn get_owner_rule(e: Env) -> u32 {
         owner_rule_id(&e)
+    }
+
+    /// Guardians propose a new owner key (audit S4). It can be executed after
+    /// `RECOVERY_DELAY_SECONDS`; a new proposal replaces the pending one and
+    /// restarts the clock. Authorized through `__check_auth` (recovery rule).
+    pub fn propose_recovery(e: Env, new_owner: Signer) {
+        e.current_contract_address().require_auth();
+        oz::validate_signer_key_size(&e, &new_owner);
+        if oz::get_context_rule(&e, owner_rule_id(&e)).signers.contains(&new_owner) {
+            panic_with_error!(&e, AccError::AlreadyOwner);
+        }
+        let executable_at = e.ledger().timestamp().saturating_add(RECOVERY_DELAY_SECONDS);
+        e.storage().instance().set(&DataKey::PendingRecovery, &PendingRecovery { new_owner: new_owner.clone(), executable_at });
+        RecoveryProposed { account: e.current_contract_address(), new_owner, executable_at }.publish(&e);
+    }
+
+    /// The owner cancels a pending recovery (owner rule only, see __check_auth).
+    pub fn cancel_recovery(e: Env) {
+        e.current_contract_address().require_auth();
+        let pending: PendingRecovery = e.storage().instance().get(&DataKey::PendingRecovery)
+            .unwrap_or_else(|| panic_with_error!(&e, AccError::NoPendingRecovery));
+        e.storage().instance().remove(&DataKey::PendingRecovery);
+        RecoveryCancelled { account: e.current_contract_address(), new_owner: pending.new_owner }.publish(&e);
+    }
+
+    /// After the delay, anyone may execute the recovery: the owner rule's
+    /// signers are replaced by the proposed key (added first, so the owner
+    /// rule is never empty). No authorization: the guardians' threshold and
+    /// the owner's 48-hour chance to cancel already happened.
+    pub fn execute_recovery(e: Env) {
+        let pending: PendingRecovery = e.storage().instance().get(&DataKey::PendingRecovery)
+            .unwrap_or_else(|| panic_with_error!(&e, AccError::NoPendingRecovery));
+        if e.ledger().timestamp() < pending.executable_at {
+            panic_with_error!(&e, AccError::RecoveryNotReady);
+        }
+        let owner = owner_rule_id(&e);
+        let old_ids = oz::get_context_rule(&e, owner).signer_ids;
+        oz::add_signer(&e, owner, &pending.new_owner);
+        for id in old_ids.iter() {
+            oz::remove_signer(&e, owner, id);
+        }
+        e.storage().instance().remove(&DataKey::PendingRecovery);
+        RecoveryExecuted { account: e.current_contract_address(), new_owner: pending.new_owner }.publish(&e);
+    }
+
+    pub fn get_pending_recovery(e: Env) -> Option<PendingRecovery> {
+        e.storage().instance().get(&DataKey::PendingRecovery)
     }
 }
 

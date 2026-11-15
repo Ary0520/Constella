@@ -677,8 +677,19 @@ fn golden_events_smart_account() {
     g.capture(&env, "update_context_rule_name");
     client.remove_context_rule(&rule.id);
     g.capture(&env, "remove_context_rule");
+    // Audit S4: delayed recovery events.
+    let new_owner = Signer::External(verifier.clone(), fixed(&env, 5));
+    client.propose_recovery(&new_owner);
+    g.capture(&env, "propose_recovery");
+    client.cancel_recovery();
+    g.capture(&env, "cancel_recovery");
+    client.propose_recovery(&new_owner);
+    env.ledger().set_timestamp(env.ledger().timestamp() + RECOVERY_DELAY_SECONDS);
+    client.execute_recovery();
+    g.capture(&env, "execute_recovery");
     g.finish(&["ACCOUNT_INITIALIZED", "context_rule_added", "signer_registered", "policy_registered", "signer_added",
-        "signer_removed", "signer_deregistered", "context_rule_meta_updated", "context_rule_removed"]);
+        "signer_removed", "signer_deregistered", "context_rule_meta_updated", "context_rule_removed",
+        "RECOVERY_PROPOSED", "RECOVERY_CANCELLED", "RECOVERY_EXECUTED"]);
 }
 
 // -------------------------------------------------------------------------
