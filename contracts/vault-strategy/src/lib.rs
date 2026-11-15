@@ -151,11 +151,29 @@ pub trait NavOracleInterface {
     fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
     fn price(env: Env, asset: Address) -> Option<PriceData>;
     fn get_source(env: Env, source_id: Symbol) -> Option<OracleSource>;
+    fn get_sleeve_sources(env: Env, sleeve_id: Symbol) -> Vec<Symbol>;
+}
+
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct RegistryAssetEntryRef {
+    pub contract_address: Address,
+    pub asset_id: Symbol,
+    pub sleeve_type: u32,
+    pub liquidity_tier: u32,
+    pub permissionless: bool,
+    pub oracle_sources: Vec<Symbol>,
+    pub eligible_jurisdictions: Vec<Symbol>,
+    pub blocked_jurisdictions: Vec<Symbol>,
+    pub investor_classes_required: Vec<Symbol>,
+    pub is_active: bool,
+    pub added_at: u64,
 }
 
 #[contractclient(name = "AssetRegistryClient")]
 pub trait AssetRegistryInterface {
     fn is_registered(env: Env, contract_address: Address) -> bool;
+    fn get_asset_by_address(env: Env, contract_address: Address) -> Option<RegistryAssetEntryRef>;
 }
 
 #[contracttype]
@@ -504,12 +522,15 @@ fn burn_shares_internal(env: &Env, owner: &Address, shares: i128) {
         .get(&DataKey::Balance(owner.clone()))
         .unwrap_or(0);
 
-    env.storage()
-        .instance()
-        .set(&DataKey::TotalShares, &(total_shares - shares));
-    env.storage()
-        .instance()
-        .set(&DataKey::Balance(owner.clone()), &(bal - shares));
+    let new_total = total_shares - shares;
+    let new_bal = bal - shares;
+
+    env.storage().instance().set(&DataKey::TotalShares, &new_total);
+    if new_bal == 0 {
+        env.storage().instance().remove(&DataKey::Balance(owner.clone()));
+    } else {
+        env.storage().instance().set(&DataKey::Balance(owner.clone()), &new_bal);
+    }
 
     env.events().publish(
         (Symbol::new(env, "burn"), owner.clone()),
@@ -532,7 +553,7 @@ impl StrategyVault {
         if env.storage().instance().has(&DataKey::Config) {
             panic_with_error!(&env, VaultError::AlreadyInitialized);
         }
-        if config.management_fee_bps > 10000 {
+        if config.management_fee_bps > 10000 || decimals > 18 {
             panic_with_error!(&env, VaultError::InvalidBps);
         }
 
@@ -634,7 +655,7 @@ impl StrategyVault {
         let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
         let scale = 10i128.pow(decimals);
 
-        let assets = (shares.checked_mul(deposit_nav).unwrap()) / scale;
+        let assets = (shares.checked_mul(deposit_nav).unwrap() + scale - 1) / scale;
         if assets <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
@@ -809,7 +830,10 @@ impl StrategyVault {
 
         for sleeve in sleeves.iter() {
             if sleeve.sleeve_type == SleeveType::CashStable {
-                total += sleeve.current_balance;
+                total = match total.checked_add(sleeve.current_balance) {
+                    Some(v) => v,
+                    None => panic_with_error!(&env, VaultError::MathOverflow),
+                };
             } else {
                 let sym = compute_sleeve_symbol(&env, sleeve.sleeve_type);
                 let price = if let Some(pd) = oracle.get_collateral_nav(&sym) {
@@ -817,7 +841,14 @@ impl StrategyVault {
                 } else {
                     scale
                 };
-                total += (sleeve.current_balance * price) / scale;
+                let val = match sleeve.current_balance.checked_mul(price) {
+                    Some(product) => product / scale,
+                    None => panic_with_error!(&env, VaultError::MathOverflow),
+                };
+                total = match total.checked_add(val) {
+                    Some(v) => v,
+                    None => panic_with_error!(&env, VaultError::MathOverflow),
+                };
             }
         }
         total
@@ -912,7 +943,20 @@ impl StrategyVault {
             .get(&DataKey::Balance(owner))
             .unwrap_or(0);
         let cap = Self::get_redemption_capacity(env.clone());
-        let cap_shares = Self::convert_to_shares(env, cap.instant);
+        let config = get_config(&env);
+        let conservative_nav = match compute_conservative_nav(&env, &config) {
+            Some(pd) => pd.price,
+            None => return 0,
+        };
+        if conservative_nav <= 0 {
+            return 0;
+        }
+        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
+        let scale = 10i128.pow(decimals);
+        let cap_shares = match cap.instant.checked_mul(scale) {
+            Some(v) => v / conservative_nav,
+            None => 0,
+        };
         if owner_bal < cap_shares {
             owner_bal
         } else {
@@ -953,9 +997,14 @@ impl StrategyVault {
             .get(&DataKey::Balance(to.clone()))
             .unwrap_or(0);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(from.clone()), &(from_bal - amount));
+        let new_from_bal = from_bal - amount;
+        if new_from_bal == 0 {
+            env.storage().instance().remove(&DataKey::Balance(from.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::Balance(from.clone()), &new_from_bal);
+        }
         env.storage()
             .instance()
             .set(&DataKey::Balance(to.clone()), &(to_bal + amount));
@@ -979,11 +1028,15 @@ impl StrategyVault {
             from: from.clone(),
             spender: spender.clone(),
         });
-        let val = AllowanceValue {
-            amount,
-            expiration_ledger,
-        };
-        env.storage().instance().set(&key, &val);
+        if amount == 0 {
+            env.storage().instance().remove(&key);
+        } else {
+            let val = AllowanceValue {
+                amount,
+                expiration_ledger,
+            };
+            env.storage().instance().set(&key, &val);
+        }
 
         env.events().publish(
             (Symbol::new(&env, "approve"), from, spender),
@@ -1027,7 +1080,11 @@ impl StrategyVault {
             panic_with_error!(&env, VaultError::InsufficientAllowance);
         }
         val.amount -= amount;
-        env.storage().instance().set(&key, &val);
+        if val.amount == 0 {
+            env.storage().instance().remove(&key);
+        } else {
+            env.storage().instance().set(&key, &val);
+        }
 
         let from_bal: i128 = env
             .storage()
@@ -1043,9 +1100,14 @@ impl StrategyVault {
             .get(&DataKey::Balance(to.clone()))
             .unwrap_or(0);
 
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(from.clone()), &(from_bal - amount));
+        let new_from_bal = from_bal - amount;
+        if new_from_bal == 0 {
+            env.storage().instance().remove(&DataKey::Balance(from.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::Balance(from.clone()), &new_from_bal);
+        }
         env.storage()
             .instance()
             .set(&DataKey::Balance(to.clone()), &(to_bal + amount));
@@ -1115,17 +1177,14 @@ impl StrategyVault {
             };
             let value = (sleeve.current_balance * price) / scale;
 
-            match sleeve.liquidity_tier {
-                0 => {
-                    if sleeve.sleeve_type == SleeveType::CashStable {
-                        cash_balance += sleeve.current_balance;
-                    } else {
-                        cash_balance += value;
-                    }
+            if sleeve.sleeve_type == SleeveType::CashStable {
+                cash_balance += sleeve.current_balance;
+            } else {
+                match sleeve.liquidity_tier {
+                    0 | 1 => in_24h += value,
+                    2 => in_1w += value,
+                    _ => longer += value,
                 }
-                1 => in_24h += value,
-                2 => in_1w += value,
-                _ => longer += value,
             }
         }
 
@@ -1143,12 +1202,16 @@ impl StrategyVault {
     }
 
     pub fn get_risk_sheet(env: Env) -> RiskSheet {
+        let config = get_config(&env);
         let sleeves: Vec<SleeveState> = env
             .storage()
             .instance()
             .get(&DataKey::Sleeves)
             .unwrap_or_else(|| Vec::new(&env));
         let total_a = Self::total_assets(env.clone());
+        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
+        let scale = 10i128.pow(decimals);
+        let oracle = NavOracleClient::new(&env, &config.oracle_contract);
 
         let mut weighted_hours = 0u64;
         if total_a > 0 {
@@ -1160,7 +1223,18 @@ impl StrategyVault {
                     2 => 168,
                     _ => 720,
                 };
-                total_val_hours += sleeve.current_balance * tier_hours;
+                let price = if sleeve.sleeve_type == SleeveType::CashStable {
+                    scale
+                } else {
+                    let sym = compute_sleeve_symbol(&env, sleeve.sleeve_type);
+                    if let Some(pd) = oracle.get_collateral_nav(&sym) {
+                        pd.price
+                    } else {
+                        scale
+                    }
+                };
+                let val = (sleeve.current_balance * price) / scale;
+                total_val_hours += val * tier_hours;
             }
             weighted_hours = (total_val_hours / total_a) as u64;
         }
@@ -1200,15 +1274,87 @@ impl StrategyVault {
             .instance()
             .get(&DataKey::Sleeves)
             .unwrap_or_else(|| Vec::new(&env));
-        let mut sources = Vec::new(&env);
+        let mut sources: Vec<OracleSource> = Vec::new(&env);
         let oracle = NavOracleClient::new(&env, &config.oracle_contract);
+        let registry = AssetRegistryClient::new(&env, &config.registry_contract);
 
         for sleeve in sleeves.iter() {
             let sym = compute_sleeve_symbol(&env, sleeve.sleeve_type);
+            let sleeve_src_ids = oracle.get_sleeve_sources(&sym);
+            for src_id in sleeve_src_ids.iter() {
+                if let Some(src) = oracle.get_source(&src_id) {
+                    let mut exists = false;
+                    for s in sources.iter() {
+                        if s.source_id == src.source_id {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if !exists {
+                        sources.push_back(src);
+                    }
+                }
+            }
             if let Some(src) = oracle.get_source(&sym) {
+                let mut exists = false;
+                for s in sources.iter() {
+                    if s.source_id == src.source_id {
+                        exists = true;
+                        break;
+                    }
+                }
+                if !exists {
+                    sources.push_back(src);
+                }
+            }
+
+            if let Some(entry) = registry.get_asset_by_address(&sleeve.contract_address) {
+                for src_id in entry.oracle_sources.iter() {
+                    if let Some(src) = oracle.get_source(&src_id) {
+                        let mut exists = false;
+                        for s in sources.iter() {
+                            if s.source_id == src.source_id {
+                                exists = true;
+                                break;
+                            }
+                        }
+                        if !exists {
+                            sources.push_back(src);
+                        }
+                    }
+                }
+            }
+        }
+
+        let vault_sym = Symbol::new(&env, "VAULT");
+        let vault_src_ids = oracle.get_sleeve_sources(&vault_sym);
+        for src_id in vault_src_ids.iter() {
+            if let Some(src) = oracle.get_source(&src_id) {
+                let mut exists = false;
+                for s in sources.iter() {
+                    if s.source_id == src.source_id {
+                        exists = true;
+                        break;
+                    }
+                }
+                if !exists {
+                    sources.push_back(src);
+                }
+            }
+        }
+        if let Some(src) = oracle.get_source(&vault_sym) {
+            let mut exists = false;
+            for s in sources.iter() {
+                if s.source_id == src.source_id {
+                    exists = true;
+                    break;
+                }
+            }
+            if !exists {
                 sources.push_back(src);
             }
         }
+
         sources
     }
 
@@ -1229,6 +1375,9 @@ impl StrategyVault {
         let registry = AssetRegistryClient::new(&env, &config.registry_contract);
 
         for s in sleeves.iter() {
+            if s.liquidity_tier > 3 || s.band_bps > 10000 {
+                panic_with_error!(&env, VaultError::InvalidBps);
+            }
             sum_weights = sum_weights.saturating_add(s.target_weight_bps);
             if s.sleeve_type == SleeveType::CashStable {
                 has_cash = true;
@@ -1335,6 +1484,32 @@ impl StrategyVault {
             (Symbol::new(&env, "vault_upgraded"), config.admin),
             env.ledger().timestamp(),
         );
+    }
+
+    pub fn admin_pause(env: Env) {
+        let config = get_config(&env);
+        config.admin.require_auth();
+
+        env.storage().instance().set(&DataKey::IsPaused, &true);
+        env.events().publish(
+            (Symbol::new(&env, "vault_paused"), config.admin),
+            env.ledger().timestamp(),
+        );
+    }
+
+    pub fn set_pause_authority(env: Env, new_pause_authority: Address) {
+        let mut config = get_config(&env);
+        config.admin.require_auth();
+        config.pause_authority = new_pause_authority;
+        env.storage().instance().set(&DataKey::Config, &config);
+    }
+
+    pub fn get_policy_hash(env: Env) -> Option<BytesN<32>> {
+        let config = get_config(&env);
+        let policy = PolicyClient::new(&env, &config.policy_contract);
+        policy
+            .get_policy_config(&env.current_contract_address())
+            .map(|c| c.policy_hash)
     }
 }
 
