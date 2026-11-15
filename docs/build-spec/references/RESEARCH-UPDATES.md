@@ -1,7 +1,7 @@
 # Living Research & Ecosystem Updates Log
 
 > Tracked intelligence and ecosystem changes occurring after the foundational research document (dated 30 October 2026). All agents must check here for current figures.  
-> **Last Verified:** 14 November 2026
+> **Last Verified:** 15 November 2026
 
 ---
 
@@ -24,8 +24,8 @@
 
 | Metric | Source Doc (Oct 30) | Verified (Nov 14) | Variance / Analysis |
 |---|---|---|---|
-| **Stellar Total DeFi TVL** | ~$265M–$273M | **~$195M–$199M** | -27% (Correction following August AMM liquidity spike; Blend remains dominant) |
-| **Blend Protocol TVL** | ~$165M | **~$140M–$145M** | Primary lending venue on Stellar |
+| **Stellar Total DeFi TVL** | ~$265M–$273M | **~$198M (15 Nov)** | -27% (Correction following August AMM liquidity spike; Blend remains dominant) |
+| **Blend Protocol TVL** | ~$165M | **~$105M (Blend Pools V2, DefiLlama, 15 Nov)** | Primary lending venue on Stellar; ~$113M on 9 Nov, ATH $173M on 1 Oct |
 | **DeFindex TVL** | ~$20M | **~$18.5M** | Stable yield aggregator volume |
 | **Soroswap 24h Volume** | ~$1.2M TVL | **~$1.6M Daily Vol** | Consistent AMM activity |
 
@@ -67,5 +67,21 @@ In late October 2026, OpenZeppelin released `stellar-contracts` **v0.8.0**, intr
 ## 5. Stellar Community Fund (SCF) Status
 
 - **SCF Round #45:** Concluded 2 October 2026; distributed ~$4.04M in XLM across 40 projects (including Liqvid's RWA lending protocol).
-- **SCF Round #46:** Applications closed 9 November 2026; currently under community review.
-- **SCF Round #47:** Opening target late November / early December 2026. Constella application dossier is being prepared for Round #47.
+- **SCF Round #46:** Build submissions closed 8 Nov 2026; panel review 11–18 Nov; community vote 23 Nov – 3 Dec 2026 (communityfund.stellar.org/awards).
+- **SCF Round #47:** No official dates published as of 15 Nov 2026 (unverified). Constella application dossier is being prepared for Round #47.
+
+---
+
+## 6. Verification Pass — 15 November 2026
+
+| Topic | Verified fact | Source |
+|---|---|---|
+| `soroban-sdk` | Latest stable **29.0.1**; **30.0.0-rc.1** (21 Oct) is the only Protocol 30 build — do not pin an RC before the Bell vote passes. 28.0.0 released 18 Sep for Protocol 28. | crates.io/crates/soroban-sdk |
+| OpenZeppelin `stellar-contracts` | **v0.8.0 released 20 Oct 2026**, audit report in repo. Crates: `stellar-tokens` (fungible, vault, rwa), `stellar-accounts`, `stellar-access`, `stellar-contract-utils`, `stellar-macros`, `stellar-confidential`. Workspace pins **`soroban-sdk = 28.0.0`**. v0.7.3 is a security fix for smart-account delegated signers (GHSA-jpg9-m7w4-c7wc). | github.com/OpenZeppelin/stellar-contracts/releases/tag/v0.8.0 |
+| SEP status | SEP-40 Draft v0.1.0, SEP-41 Draft v0.5.2, SEP-56 Draft v0.1.2, SEP-57 Draft v0.4.0. | github.com/stellar/stellar-protocol/tree/master/ecosystem |
+| CAP-85 | "Externally managed contract executables" — shipped in **Protocol 28** (Final). No `stellar contract deploy --upgrade-fleet` flag exists in stellar-cli (latest v30.0.1, 3 Nov). | stellar-protocol/core/cap-0085.md; github.com/stellar/stellar-cli |
+| Protocol 29 | No official name, date, or CAPs found; stellar-cli jumped v28.1.0 → v30.0.1. Treat as **unverified**. | stellar.org/protocol-upgrades |
+| Bell mainnet vote | 23 Nov 2026, 17:00 UTC (subject to change). CAP-84 (`W` muxed contract strkey), CAP-87 (ML-DSA), CAP-88 (ms close time) are real. | stellar.org/protocol-upgrades |
+| YieldBlox | 22 Feb 2026; USTRY pushed ~$1.05 → ~$106.7 on SDEX, reported via Reflector into a Blend V2 community pool; loss ≈ $10.2–10.97M; pool/oracle configuration, not a Blend core bug. | blocksec.com; rekt.news/yieldblox-rekt |
+| RedStone | Mainnet feeds live 4 Mar 2026; SEP-40 compatible. | blog.redstone.finance |
+| Blend oracle usage | Blend v2 calls only `lastprice(Asset::Stellar(addr))` via the `sep-40-oracle` crate; rejects price ≤ 0 or timestamps older than 24h. | github.com/blend-capital/blend-contracts-v2 |
