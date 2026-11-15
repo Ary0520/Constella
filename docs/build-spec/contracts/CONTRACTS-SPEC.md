@@ -158,7 +158,12 @@ fn get_listing_kit(env: Env) -> ListingKit
 // Admin
 fn pause(env: Env)             // pause authority (single key — fast)
 fn unpause(env: Env)           // admin multisig required
-fn upgrade(env: Env, new_wasm: BytesN<32>)  // admin multisig + 48h timelock
+fn propose_upgrade(env: Env, new_wasm: BytesN<32>)  // admin; executable after 48h (audit W3)
+fn execute_upgrade(env: Env)                         // admin; fails before the timelock
+fn cancel_upgrade(env: Env)                          // admin
+fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade>
+fn lower_caps(env: Env, tvl_cap: i128, per_user_cap: i128)  // admin; decrease only
+fn max_deposit(env: Env, receiver: Address) -> i128  // real remaining room under both caps
 ```
 
 **VaultState struct:**
@@ -174,6 +179,8 @@ pub struct VaultState {
     is_paused: bool,
     last_fee_accrual: u64,
     management_fee_bps: u32,
+    tvl_cap: i128,        // required, > 0; total vault value cap (Rule 6; $1M in beta)
+    per_user_cap: i128,   // required, > 0, <= tvl_cap; per-receiver cap on deposit/mint
 }
 
 pub struct SleeveState {
@@ -317,7 +324,8 @@ pub trait IssuerAdapter {
 | Admin cannot move user funds | `redeem()` checks `owner == caller` or allowance; no admin bypass |
 | Policy cannot be exceeded | Policy contract validates every proposal; rejects if any check fails |
 | Oracle cannot be gamed by thin markets | Min-liquidity-depth check in NAV oracle (Rule 2) |
-| Upgrade requires multisig + timelock | `upgrade()` gated by admin multisig and 48h timelock |
+| Upgrade requires multisig + timelock | `propose_upgrade` → 48h → `execute_upgrade` (admin multisig), cancellable; events `UPGRADE_PROPOSED` / `UPGRADE` / `UPGRADE_CANCELLED` |
+| Deposits are capped | `tvl_cap` and `per_user_cap` enforced on deposit/mint; caps can be lowered in place, raised only via a timelocked upgrade |
 | Pause is fast | Single-sig pause authority; multi-sig required to unpause |
 | Circuit breakers are per-sleeve | One bad oracle/issuer does not halt the whole vault |
 | Fee accrual is transparent | On-chain, visible at all times as share dilution |
