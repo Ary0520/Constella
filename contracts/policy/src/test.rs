@@ -271,8 +271,11 @@ fn test_t26_policy_registration_and_hash_storage() {
     // 5. Update policy
     let new_hash = sample_hash(&ctx.env, 0xBB);
     policy.update_policy(&ctx.vault, &new_hash, &1000, &2500, &3000, &50, &500, &sleeves);
+    // Audit P4: amendments apply only after the notice period.
+    ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+    PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
 
-    // Verify update event IMMEDIATELY after update_policy
+    // Verify POLICY_UPDATED event IMMEDIATELY after activation
     let events_after_upd = ctx.env.events().all();
     let upd_event_found = events_after_upd.iter().any(|e| {
         e.1.len() >= 2
@@ -1652,6 +1655,9 @@ mod p3 {
 
         assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1500));
         assert_eq!(ctx.env.auths()[0].0, ctx.owner);
+        // Audit P4: amendments apply only after the notice period.
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
         let cfg = policy.get_policy_config(&ctx.vault).unwrap();
         assert_eq!((cfg.version, cfg.min_liquidity_sleeve_bps), (2, 1500));
         assert_eq!(cfg.policy_hash, sample_hash(&ctx.env, 0x33));
@@ -1668,6 +1674,9 @@ mod p3 {
         assert_eq!(before, expected);
 
         assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1500));
+        // Audit P4: amendments apply only after the notice period.
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
         let after = policy.get_policy_config(&ctx.vault).unwrap().terms_hash;
         assert_ne!(after, before);
         assert_eq!(after, compute_terms_hash(&ctx.env, &ctx.registry_address, 1500, 2500, 3000, 50, 500, &sleeves));
@@ -1900,6 +1909,9 @@ mod m1 {
         let cfg = policy.get_policy_config(&ctx.vault).unwrap();
         policy.update_policy(&ctx.vault, &new, &cfg.min_liquidity_sleeve_bps, &cfg.max_single_asset_bps,
             &cfg.max_issuer_bps, &cfg.max_slippage_bps, &cfg.rebalance_band_bps, &policy.get_sleeve_targets(&ctx.vault));
+        // Audit P4: amendments apply only after the notice period.
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
 
         let stale = policy.validate_rebalance(&ctx.vault, &proposal(&ctx, old, vec![&ctx.env]));
         assert_eq!((stale.is_valid, stale.code), (false, PolicyError::PolicyHashMismatch as u32));
@@ -1930,3 +1942,4 @@ mod m1 {
         assert!(r.is_valid, "selling into a declared asset must be allowed (code {})", r.code);
     }
 }
+

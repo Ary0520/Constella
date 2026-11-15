@@ -314,6 +314,9 @@ fn p3_admin_alone_cannot_replace_a_signed_policy() {
     }]);
     s.policy.update_policy(&s.vault_id, &amended, &1500, &10_000, &10_000, &50, &500, &targets);
     assert_eq!(s.env.auths()[0].0, owner);
+    // Audit P4: the amendment applies only after the notice period.
+    s.env.ledger().set_timestamp(T0 + constella_policy::PROTOCOL_MIN_NOTICE_SECONDS);
+    s.policy.activate_policy_update(&s.vault_id);
     assert_eq!(s.policy.get_policy_hash(&s.vault_id), amended);
 }
 
@@ -704,4 +707,20 @@ fn p4_amendment_does_not_take_effect_before_the_notice_period() {
     // Depositors are still protected by the terms they joined under.
     assert_eq!(s.policy.get_policy_hash(&s.vault_id), signed, "amendment must not apply immediately");
     assert_eq!(s.policy.get_policy_config(&s.vault_id).unwrap().min_liquidity_sleeve_bps, 1000);
+
+    // Holders can still exit under the old terms during the notice period.
+    let holder = Address::generate(&s.env);
+    s.usdc_admin.mint(&holder, &(100 * ONE));
+    s.vault.deposit(&(100 * ONE), &holder);
+    s.env.ledger().set_timestamp(T0 + constella_policy::PROTOCOL_MIN_NOTICE_SECONDS - 1);
+    assert!(s.policy.try_activate_policy_update(&s.vault_id).is_err(), "one second early");
+    let out = s.vault.redeem(&(100 * ONE), &holder, &holder);
+    assert_eq!(out, 100 * ONE, "holder exits in full under the old terms during the notice period");
+
+    // After the notice period anyone may finalize it - no signatures needed.
+    s.env.ledger().set_timestamp(T0 + constella_policy::PROTOCOL_MIN_NOTICE_SECONDS);
+    s.env.set_auths(&[]);
+    s.policy.activate_policy_update(&s.vault_id);
+    assert_eq!(s.policy.get_policy_hash(&s.vault_id), amended);
+    assert_eq!(s.policy.get_policy_config(&s.vault_id).unwrap().min_liquidity_sleeve_bps, 0);
 }

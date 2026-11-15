@@ -82,6 +82,33 @@ pub enum PolicyError {
     AssetNotInPolicy = 15,
     /// The proposal was built against a different policy hash than the vault's current one.
     PolicyHashMismatch = 16,
+    /// Notice period below the protocol minimum or shorter than the current one.
+    NoticeTooShort = 17,
+    /// No amendment is pending for this vault.
+    NoPendingUpdate = 18,
+    /// The pending amendment's notice period has not elapsed yet.
+    NoticeNotElapsed = 19,
+}
+
+/// Protocol minimum notice before a policy amendment takes effect (audit P4,
+/// owner decision D-E). Matches the 48h depositor notice used for upgrades in
+/// CONTRACTS-SPEC. Owners may lengthen it per vault, never shorten it.
+pub const PROTOCOL_MIN_NOTICE_SECONDS: u64 = 172_800;
+
+/// An owner-signed amendment waiting out its notice period.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingPolicyUpdate {
+    pub new_hash: BytesN<32>,
+    pub min_liquidity_sleeve_bps: u32,
+    pub max_single_asset_bps: u32,
+    pub max_issuer_bps: u32,
+    pub max_slippage_bps: u32,
+    pub rebalance_band_bps: u32,
+    pub sleeves: Vec<SleeveTarget>,
+    pub terms_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub effective_at: u64,
 }
 
 #[contracttype]
@@ -163,6 +190,8 @@ pub enum DataKey {
     Oracle,
     PolicyConfig(Address),
     SleeveTargets(Address),
+    PendingUpdate(Address),
+    NoticePeriod(Address),
 }
 
 #[cfg(test)]
@@ -194,8 +223,10 @@ pub trait PolicyContractTrait {
         sleeves: Vec<SleeveTarget>,
     );
 
-    /// Amend a vault's policy. Requires a fresh signature from the stored
-    /// policy owner; the protocol admin cannot amend (audit P3).
+    /// Propose an amendment. Requires a fresh signature from the stored policy
+    /// owner (audit P3). The current terms stay in force until the notice
+    /// period has elapsed and `activate_policy_update` is called (audit P4).
+    /// A new proposal replaces any pending one and restarts the clock.
     fn update_policy(
         env: Env,
         vault: Address,
@@ -207,6 +238,23 @@ pub trait PolicyContractTrait {
         rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     );
+
+    /// Apply a pending amendment once its notice period has elapsed.
+    /// Permissionless: anyone (keeper, UI, holder) may finalize it.
+    fn activate_policy_update(env: Env, vault: Address);
+
+    /// Withdraw a pending amendment. Policy owner only.
+    fn cancel_policy_update(env: Env, vault: Address);
+
+    /// The amendment waiting out its notice period, if any.
+    fn get_pending_policy_update(env: Env, vault: Address) -> Option<PendingPolicyUpdate>;
+
+    /// Lengthen this vault's amendment notice period. Owner only; can never be
+    /// shortened and never below PROTOCOL_MIN_NOTICE_SECONDS.
+    fn set_notice_period(env: Env, vault: Address, seconds: u64);
+
+    /// Current amendment notice period for this vault.
+    fn get_notice_period(env: Env, vault: Address) -> u64;
 
     /// Get registered policy hash for a vault
     fn get_policy_hash(env: Env, vault: Address) -> BytesN<32>;
@@ -399,7 +447,7 @@ impl PolicyContractTrait for PolicyContract {
         rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     ) {
-        let mut config: PolicyConfig = match env
+        let config: PolicyConfig = match env
             .storage()
             .instance()
             .get(&DataKey::PolicyConfig(vault.clone()))
@@ -418,15 +466,7 @@ impl PolicyContractTrait for PolicyContract {
             max_slippage_bps,
             &new_sleeves,
         );
-
-        config.policy_hash = new_hash.clone();
-        config.version += 1;
-        config.min_liquidity_sleeve_bps = min_liquidity_sleeve_bps;
-        config.max_single_asset_bps = max_single_asset_bps;
-        config.max_issuer_bps = max_issuer_bps;
-        config.max_slippage_bps = max_slippage_bps;
-        config.rebalance_band_bps = rebalance_band_bps;
-        config.terms_hash = compute_terms_hash(
+        let terms_hash = compute_terms_hash(
             &env,
             &config.registry_address,
             min_liquidity_sleeve_bps,
@@ -437,17 +477,146 @@ impl PolicyContractTrait for PolicyContract {
             &new_sleeves,
         );
 
+        // Audit P4: schedule, do not apply. Holders keep the current terms for
+        // the full notice period and can exit before the change lands.
+        let now = env.ledger().timestamp();
+        let effective_at = match now.checked_add(Self::get_notice_period(env.clone(), vault.clone())) {
+            Some(t) => t,
+            None => panic_with_error!(&env, PolicyError::NoticeTooShort),
+        };
+        let pending = PendingPolicyUpdate {
+            new_hash: new_hash.clone(),
+            min_liquidity_sleeve_bps,
+            max_single_asset_bps,
+            max_issuer_bps,
+            max_slippage_bps,
+            rebalance_band_bps,
+            sleeves: new_sleeves,
+            terms_hash: terms_hash.clone(),
+            proposed_at: now,
+            effective_at,
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingUpdate(vault.clone()), &pending);
+
+        env.events().publish(
+            (Symbol::new(&env, "POLICY_UPDATE_PROPOSED"), vault),
+            (new_hash, effective_at, terms_hash),
+        );
+    }
+
+    fn activate_policy_update(env: Env, vault: Address) {
+        let pending: PendingPolicyUpdate = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpdate(vault.clone()))
+        {
+            Some(p) => p,
+            None => panic_with_error!(&env, PolicyError::NoPendingUpdate),
+        };
+        if env.ledger().timestamp() < pending.effective_at {
+            panic_with_error!(&env, PolicyError::NoticeNotElapsed);
+        }
+        let mut config: PolicyConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyConfig(vault.clone()))
+        {
+            Some(cfg) => cfg,
+            None => panic_with_error!(&env, PolicyError::PolicyNotFound),
+        };
+
+        config.policy_hash = pending.new_hash.clone();
+        config.version += 1;
+        config.min_liquidity_sleeve_bps = pending.min_liquidity_sleeve_bps;
+        config.max_single_asset_bps = pending.max_single_asset_bps;
+        config.max_issuer_bps = pending.max_issuer_bps;
+        config.max_slippage_bps = pending.max_slippage_bps;
+        config.rebalance_band_bps = pending.rebalance_band_bps;
+        config.terms_hash = pending.terms_hash.clone();
+
         env.storage()
             .instance()
             .set(&DataKey::PolicyConfig(vault.clone()), &config);
         env.storage()
             .instance()
-            .set(&DataKey::SleeveTargets(vault.clone()), &new_sleeves);
+            .set(&DataKey::SleeveTargets(vault.clone()), &pending.sleeves);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingUpdate(vault.clone()));
 
         env.events().publish(
             (Symbol::new(&env, "POLICY_UPDATED"), vault),
-            (new_hash, config.version, config.terms_hash),
+            (pending.new_hash, config.version, config.terms_hash),
         );
+    }
+
+    fn cancel_policy_update(env: Env, vault: Address) {
+        let config: PolicyConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyConfig(vault.clone()))
+        {
+            Some(cfg) => cfg,
+            None => panic_with_error!(&env, PolicyError::PolicyNotFound),
+        };
+        config.owner.require_auth();
+        let pending: PendingPolicyUpdate = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingUpdate(vault.clone()))
+        {
+            Some(p) => p,
+            None => panic_with_error!(&env, PolicyError::NoPendingUpdate),
+        };
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingUpdate(vault.clone()));
+        env.events().publish(
+            (Symbol::new(&env, "POLICY_UPDATE_CANCELLED"), vault),
+            pending.new_hash,
+        );
+    }
+
+    fn get_pending_policy_update(env: Env, vault: Address) -> Option<PendingPolicyUpdate> {
+        env.storage().instance().get(&DataKey::PendingUpdate(vault))
+    }
+
+    fn set_notice_period(env: Env, vault: Address, seconds: u64) {
+        let config: PolicyConfig = match env
+            .storage()
+            .instance()
+            .get(&DataKey::PolicyConfig(vault.clone()))
+        {
+            Some(cfg) => cfg,
+            None => panic_with_error!(&env, PolicyError::PolicyNotFound),
+        };
+        config.owner.require_auth();
+        let current = Self::get_notice_period(env.clone(), vault.clone());
+        if seconds < current {
+            panic_with_error!(&env, PolicyError::NoticeTooShort);
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::NoticePeriod(vault.clone()), &seconds);
+        env.events().publish(
+            (Symbol::new(&env, "POLICY_NOTICE_SET"), vault),
+            (current, seconds),
+        );
+    }
+
+    fn get_notice_period(env: Env, vault: Address) -> u64 {
+        let stored: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NoticePeriod(vault))
+            .unwrap_or(PROTOCOL_MIN_NOTICE_SECONDS);
+        if stored < PROTOCOL_MIN_NOTICE_SECONDS {
+            PROTOCOL_MIN_NOTICE_SECONDS
+        } else {
+            stored
+        }
     }
 
     fn get_policy_hash(env: Env, vault: Address) -> BytesN<32> {
