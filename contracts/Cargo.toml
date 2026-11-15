@@ -6,7 +6,7 @@ members = [
     "registry",
     "policy",
     "nav-oracle",
-    # "vault-strategy",
+    "vault-strategy",
 ]
 
 [workspace.package]

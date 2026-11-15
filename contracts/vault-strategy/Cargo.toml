@@ -1,0 +1,18 @@
+[package]
+name = "constella-vault-strategy"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+constella-registry = { path = "../registry" }
+constella-policy = { path = "../policy" }
+constella-nav-oracle = { path = "../nav-oracle" }
