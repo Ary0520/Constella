@@ -80,7 +80,7 @@ fn register_policy(env: Env, vault: Address, owner: Address, policy_hash: BytesN
                    registry_address: Address, min_liquidity_sleeve_bps: u32, max_single_asset_bps: u32,
                    max_issuer_bps: u32, max_slippage_bps: u32, rebalance_band_bps: u32,
                    sleeves: Vec<SleeveTarget>)
-// Requires the stored owner's fresh signature; may amend every cap and sleeve.
+// Requires the stored owner's fresh signature; SCHEDULES the amendment (audit P4).
 fn update_policy(env: Env, vault: Address, new_hash: BytesN<32>, min_liquidity_sleeve_bps: u32,
                  max_single_asset_bps: u32, max_issuer_bps: u32, max_slippage_bps: u32,
                  rebalance_band_bps: u32, new_sleeves: Vec<SleeveTarget>)
@@ -92,6 +92,7 @@ fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfig> // includ
 **Signing model (audit P3, 15 Nov 2026):**
 - The **policy owner** (user passkey smart account or treasury multisig) signs `register_policy` / `update_policy`. Soroban authorization covers every argument, so one signature binds the canonical-JSON `policy_hash` to the exact on-chain caps and sleeves.
 - The **vault** consents by invoking registration itself through `vault.bind_policy(...)`, which also requires the vault admin (who selects the owner). Neither the admin nor the owner can bind alone.
+- **Amendments wait a notice period** (audit P4, owner decision D-E): `update_policy` only schedules; the current terms govern until `activate_policy_update` (permissionless) is called after `max(per-vault notice, 48h protocol minimum)`. The owner may `cancel_policy_update`, and may lengthen — never shorten — the notice with `set_notice_period`. Holders can redeem under the old terms throughout.
 - The **protocol admin cannot register, replace, or amend** a policy. Registration is one-time per vault (`PolicyAlreadyRegistered`), preventing squatting.
 - `terms_hash = SHA-256(XDR(registry_address, min_liquidity_sleeve_bps, max_single_asset_bps, max_issuer_bps, max_slippage_bps, rebalance_band_bps, sleeves))` is stored on every write so anyone can verify the enforced terms.
 
