@@ -179,6 +179,10 @@ pub trait NavOracleTrait {
 
 /// A source is fresh only if its timestamp is not in the future and is within
 /// its staleness limit (audit O2: future-dated data must never count as fresh).
+/// NAV-ORACLE Rule 5 / AGENT-RULES Rule 3: fewer than 2 valid sources is a
+/// hard stop, so no sleeve may be configured to accept fewer (audit O3).
+pub const MIN_VALID_SOURCES_FLOOR: u32 = 2;
+
 fn is_fresh(now: u64, source: &OracleSource) -> bool {
     source.timestamp <= now && now - source.timestamp <= source.staleness_limit_seconds
 }
@@ -311,7 +315,7 @@ fn latch_deviation_on_write(env: &Env, sleeve_id: &Symbol) {
         .unwrap_or(SleeveOracleConfig {
             sleeve_id: sleeve_id.clone(),
             deviation_threshold_bps: 200,
-            min_valid_sources: 2,
+            min_valid_sources: MIN_VALID_SOURCES_FLOOR,
             is_paused: false,
             pause_reason: Symbol::new(env, ""),
         });
@@ -360,7 +364,7 @@ impl NavOracleTrait for NavOracle {
 
         if deviation_threshold_bps == 0
             || deviation_threshold_bps > 10000
-            || min_valid_sources == 0
+            || min_valid_sources < MIN_VALID_SOURCES_FLOOR
         {
             panic_with_error!(&env, OracleError::InvalidThreshold);
         }
@@ -536,7 +540,7 @@ impl NavOracleTrait for NavOracle {
             .unwrap_or(SleeveOracleConfig {
                 sleeve_id: sleeve_id.clone(),
                 deviation_threshold_bps: 200,
-                min_valid_sources: 2,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
                 is_paused: false,
                 pause_reason: Symbol::new(&env, ""),
             });
@@ -577,7 +581,7 @@ impl NavOracleTrait for NavOracle {
             .unwrap_or(SleeveOracleConfig {
                 sleeve_id: sleeve_id.clone(),
                 deviation_threshold_bps: 200,
-                min_valid_sources: 2,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
                 is_paused: false,
                 pause_reason: Symbol::new(&env, ""),
             });
@@ -629,7 +633,7 @@ impl NavOracleTrait for NavOracle {
             .unwrap_or(SleeveOracleConfig {
                 sleeve_id: sleeve_id.clone(),
                 deviation_threshold_bps: 200,
-                min_valid_sources: 2,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
                 is_paused: false,
                 pause_reason: Symbol::new(&env, ""),
             });
@@ -787,7 +791,7 @@ impl NavOracleTrait for NavOracle {
             .unwrap_or(SleeveOracleConfig {
                 sleeve_id: sleeve_id.clone(),
                 deviation_threshold_bps: 200,
-                min_valid_sources: 2,
+                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
                 is_paused: false,
                 pause_reason: Symbol::new(&env, ""),
             });
