@@ -38,6 +38,7 @@ For users who don't own XLM and don't want to think about blockchain, this is a 
 - Built on OpenZeppelin `stellar-accounts` context rules (W4.3b). Passkey signatures are WebAuthn assertions, requiring user presence **and** user verification; a shared `webauthn-verifier` contract checks them.
 - **Owner rule:** the owner passkey has full control. This rule cannot be removed, cannot expire, and always keeps a signer.
 - **Recovery rule:** M-of-N guardians under the shared `threshold-policy`, scoped to the account. Guardians can only **propose** a new owner passkey. It takes effect after **48 hours**, and the current owner can cancel it during that window (decision D-F). After 48 hours anyone can execute it, so a user who lost their phone needs no extra step. Guardians can never move funds or change anything else; only the owner rule manages the account.
+- **Known limitation:** recovery protects against a **lost** passkey, not a **stolen** one. Whoever holds the owner passkey can cancel recoveries and already has full control, so a stolen owner key must be treated like a stolen card: move funds or rotate keys at once. Planned mitigations to consider: an owner-rule daily spending limit (OZ `spending_limit` policy), or a guardian-majority freeze (audit S4).
 
 **User experience:** "Create account with Face ID" → deposit → done. No XLM, no seed phrase.
 
