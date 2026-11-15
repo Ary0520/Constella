@@ -1165,8 +1165,10 @@ fn w6_transfer_accepts_a_muxed_destination_and_reports_its_id() {
     s.usdc_admin.mint(&alice, &(100 * ONE));
     s.vault.deposit(&(100 * ONE), &alice);
 
-    let custodian = Address::generate(&s.env);
-    let muxed = soroban_sdk::MuxedAddress::new(&custodian, 42);
+    // Only accounts (G...) can be muxed; generate an account-based M... address.
+    let muxed = soroban_sdk::MuxedAddress::new(soroban_sdk::MuxedAddress::generate(&s.env), 42);
+    let custodian = muxed.address();
+    assert_eq!(muxed.id(), Some(42));
     authorize(&s, &alice, "transfer", (alice.clone(), muxed.clone(), 10 * ONE).into_val(&s.env));
     s.vault.transfer(&alice, &muxed, &(10 * ONE));
     assert_eq!(s.env.auths()[0].0, alice);
