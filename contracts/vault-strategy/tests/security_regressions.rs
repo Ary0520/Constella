@@ -1328,3 +1328,204 @@ fn sep56_previews_equal_execution_even_with_pending_fees() {
     assert_eq!(s.vault.withdraw(&(300 * ONE), &a, &a, &a), p, "preview_withdraw");
     assert!(s.vault.balance(&s.treasury) > 0, "fees must actually have accrued");
 }
+
+// ---------------------------------------------------------------------------
+// W1a — policy-validated rebalancing through a REAL DEX. Soroswap router,
+// factory and pair WASMs were fetched read-only from Stellar mainnet on
+// 15 Nov 2026 (router CAG5LRYQ..., factory CA4HEQTL..., pair CC7CDFY2...;
+// pair sha256 18051456... equals Soroswap's published pair_wasm_hash).
+// ---------------------------------------------------------------------------
+mod soroswap_router {
+    soroban_sdk::contractimport!(file = "testdata/soroswap_router_mainnet.wasm");
+}
+mod soroswap_factory {
+    soroban_sdk::contractimport!(file = "testdata/soroswap_factory_mainnet.wasm");
+}
+const SOROSWAP_PAIR_WASM: &[u8] = include_bytes!("../testdata/soroswap_pair_mainnet.wasm");
+
+mod w1 {
+    use super::*;
+    use constella_vault_strategy::{
+        RebalanceProposal as VaultProposal, TradeOperation as VaultTrade, TradeRoute as VaultRoute,
+    };
+
+    const DELAY: u64 = 48 * 3600;
+
+    struct R {
+        s: Stack<'static>,
+        eurc: Address,
+        eurc_admin: token::StellarAssetClient<'static>,
+        router: soroswap_router::Client<'static>,
+        keeper: Address,
+        now: u64,
+    }
+
+    /// Full stack + EURC sleeve + a real Soroswap USDC/EURC pool at 1.08 with
+    /// 1.08M / 1M liquidity, the router configured through the 48h delay,
+    /// oracle feeds refreshed, a keeper, and 10_000 USDC deposited.
+    fn setup() -> R {
+        let s = deploy_stack();
+        let env = &s.env;
+        let eurc = usdc_eurc_policy(&s);
+        let eurc_admin = token::StellarAssetClient::new(env, &eurc);
+
+        // Vault sleeves: USDC (cash, numéraire) + EURC.
+        let mut sleeves = Vec::new(env);
+        sleeves.push_back(SleeveState { asset_id: String::from_str(env, "USDC"), contract_address: s.usdc_addr.clone(),
+            target_weight_bps: 5000, band_bps: 5000, current_balance: 0, sleeve_type: SleeveType::CashStable, liquidity_tier: 0 });
+        sleeves.push_back(SleeveState { asset_id: String::from_str(env, "EURC"), contract_address: eurc.clone(),
+            target_weight_bps: 5000, band_bps: 5000, current_balance: 0, sleeve_type: SleeveType::EurSovereign, liquidity_tier: 0 });
+        s.vault.set_sleeves(&sleeves);
+
+        // Real Soroswap: upload the pair code, deploy factory + router.
+        let pair_hash = env.deployer().upload_contract_wasm(SOROSWAP_PAIR_WASM);
+        let factory = soroswap_factory::Client::new(env, &env.register(soroswap_factory::WASM, ()));
+        factory.initialize(&Address::generate(env), &pair_hash);
+        let router = soroswap_router::Client::new(env, &env.register(soroswap_router::WASM, ()));
+        router.initialize(&factory.address);
+        let lp = Address::generate(env);
+        s.usdc_admin.mint(&lp, &(1_080_000 * ONE));
+        eurc_admin.mint(&lp, &(1_000_000 * ONE));
+        router.add_liquidity(&s.usdc_addr, &eurc, &(1_080_000 * ONE), &(1_000_000 * ONE), &0, &0, &lp, &(T0 + 10_000));
+
+        // Router through the 48h delay (a router can move vault funds).
+        s.vault.propose_router(&VaultRoute::Soroswap, &router.address);
+        let now = T0 + DELAY;
+        env.ledger().set_timestamp(now);
+        s.vault.activate_router(&VaultRoute::Soroswap);
+        // Feeds refreshed after the wait (their feeders push).
+        for (id, px) in [("USDC_A", ONE), ("USDC_B", ONE), ("EURC_A", ONE * 108 / 100), ("EURC_B", ONE * 108 / 100)] {
+            s.oracle.update_price(&Symbol::new(env, id), &px, &200_000, &now);
+        }
+        let keeper = Address::generate(env);
+        s.vault.set_keeper(&keeper);
+        let alice = Address::generate(env);
+        s.usdc_admin.mint(&alice, &(10_000 * ONE));
+        s.vault.deposit(&(10_000 * ONE), &alice, &alice, &alice);
+        let r = R { s, eurc, eurc_admin, router, keeper, now };
+        let _ = &r.eurc_admin;
+        r
+    }
+
+    fn proposal(r: &R, amount_in: i128, min_out: i128) -> VaultProposal {
+        let env = &r.s.env;
+        let mut w = Vec::new(env);
+        w.push_back((Symbol::new(env, "USDC"), 9000u32));
+        w.push_back((Symbol::new(env, "EURC"), 1000u32));
+        VaultProposal {
+            vault: r.s.vault_id.clone(),
+            policy_hash: r.s.policy.get_policy_hash(&r.s.vault_id),
+            operations: Vec::from_array(env, [VaultTrade {
+                asset_in: r.s.usdc_addr.clone(), asset_out: r.eurc.clone(), amount_in, min_amount_out: min_out, route: VaultRoute::Soroswap,
+            }]),
+            weights_after: w,
+            deadline: r.now + 600,
+            proposer: r.keeper.clone(),
+        }
+    }
+
+    fn quote(r: &R, amount_in: i128) -> i128 {
+        let path = Vec::from_array(&r.s.env, [r.s.usdc_addr.clone(), r.eurc.clone()]);
+        r.router.router_get_amounts_out(&amount_in, &path).get(1).unwrap()
+    }
+
+    fn as_keeper(r: &R, p: &VaultProposal) {
+        authorize(&r.s, &r.keeper, "rebalance", (p.clone(),).into_val(&r.s.env));
+    }
+
+    fn holdings(r: &R) -> (i128, i128) {
+        let sl = r.s.vault.get_sleeves();
+        (sl.get(0).unwrap().current_balance, sl.get(1).unwrap().current_balance)
+    }
+
+    #[test]
+    fn a_policy_validated_swap_executes_through_real_soroswap() {
+        let r = setup();
+        let out = quote(&r, 1_000 * ONE);
+        let p = proposal(&r, 1_000 * ONE, out);
+        as_keeper(&r, &p);
+        r.s.vault.rebalance(&p);
+        assert!(r.s.env.auths().iter().all(|(a, _)| *a == r.keeper), "only the keeper signs");
+        // Booked from measured token deltas, equal to the real balances.
+        assert_eq!(holdings(&r), (9_000 * ONE, out));
+        assert_eq!(r.s.usdc.balance(&r.s.vault_id), 9_000 * ONE);
+        assert_eq!(token::Client::new(&r.s.env, &r.eurc).balance(&r.s.vault_id), out);
+        // The funded EURC sleeve is priced per asset (1.08): the vault keeps working.
+        let expected_total = 9_000 * ONE + out * 108 / 100;
+        assert_eq!(r.s.vault.total_assets(), expected_total);
+        r.s.env.mock_all_auths();
+        let bob = Address::generate(&r.s.env);
+        r.s.usdc_admin.mint(&bob, &(100 * ONE));
+        assert!(r.s.vault.deposit(&(100 * ONE), &bob, &bob, &bob) > 0);
+    }
+
+    #[test]
+    fn a_proposal_the_policy_rejects_changes_nothing() {
+        let r = setup();
+        // 2% below fair value: beyond the signed 0.5% slippage cap.
+        let p = proposal(&r, 1_000 * ONE, 1_000 * ONE * 100 / 108 * 98 / 100);
+        as_keeper(&r, &p);
+        assert!(r.s.vault.try_rebalance(&p).is_err());
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+        assert_eq!(r.s.usdc.balance(&r.s.vault_id), 10_000 * ONE);
+    }
+
+    #[test]
+    fn only_the_designated_keeper_may_rebalance() {
+        let r = setup();
+        let mut p = proposal(&r, 1_000 * ONE, quote(&r, 1_000 * ONE));
+        let stranger = Address::generate(&r.s.env);
+        p.proposer = stranger.clone();
+        authorize(&r.s, &stranger, "rebalance", (p.clone(),).into_val(&r.s.env));
+        assert!(r.s.vault.try_rebalance(&p).is_err());
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+    }
+
+    #[test]
+    fn router_changes_wait_48_hours() {
+        let r = setup();
+        r.s.env.mock_all_auths();
+        let evil = Address::generate(&r.s.env);
+        r.s.vault.propose_router(&VaultRoute::Soroswap, &evil);
+        assert!(r.s.vault.try_activate_router(&VaultRoute::Soroswap).is_err(), "not before 48h");
+        assert_eq!(r.s.vault.get_router(&VaultRoute::Soroswap), Some(r.router.address.clone()), "old router stays");
+        // A stranger cannot propose a router.
+        let stranger = Address::generate(&r.s.env);
+        authorize(&r.s, &stranger, "propose_router", (VaultRoute::Soroswap, evil.clone()).into_val(&r.s.env));
+        assert!(r.s.vault.try_propose_router(&VaultRoute::Soroswap, &evil).is_err());
+    }
+
+    #[test]
+    fn a_front_run_that_moves_the_pool_reverts_the_whole_rebalance() {
+        let r = setup();
+        let p = proposal(&r, 1_000 * ONE, quote(&r, 1_000 * ONE));
+        // Someone else buys EURC first (sandwich / price move).
+        r.s.env.mock_all_auths();
+        let whale = Address::generate(&r.s.env);
+        r.s.usdc_admin.mint(&whale, &(50_000 * ONE));
+        let path = Vec::from_array(&r.s.env, [r.s.usdc_addr.clone(), r.eurc.clone()]);
+        r.router.swap_exact_tokens_for_tokens(&(50_000 * ONE), &0, &path, &whale, &(r.now + 600));
+        as_keeper(&r, &p);
+        assert!(r.s.vault.try_rebalance(&p).is_err(), "min_amount_out no longer reachable");
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+    }
+
+    #[test]
+    fn a_trade_larger_than_the_sleeve_is_refused() {
+        let r = setup();
+        let p = proposal(&r, 10_001 * ONE, quote(&r, 10_001 * ONE));
+        as_keeper(&r, &p);
+        assert!(r.s.vault.try_rebalance(&p).is_err());
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+    }
+
+    #[test]
+    fn a_paused_vault_cannot_rebalance() {
+        let r = setup();
+        r.s.env.mock_all_auths();
+        r.s.vault.pause();
+        let p = proposal(&r, 1_000 * ONE, quote(&r, 1_000 * ONE));
+        as_keeper(&r, &p);
+        assert!(r.s.vault.try_rebalance(&p).is_err());
+    }
+}
