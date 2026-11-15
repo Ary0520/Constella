@@ -133,7 +133,7 @@ pub struct TradeOperation {
 
 **Purpose:** Shared vault for multiple holders. Core of Constella for most users.
 
-**Base:** OpenZeppelin stellar-contracts v0.8.0 SEP-56 vault module.
+**Base:** OpenZeppelin stellar-contracts v0.8.0. The share ledger (balances, allowances, total supply) uses `stellar-tokens` fungible storage (audit W4.2a): one **persistent** entry per holder and a persistent total supply, TTL extended on access; allowances are **temporary** entries whose `live_until_ledger` is validated; the instance entry's TTL is extended on use, and per-holder state never lives in instance storage. Routing the SEP-56 entry points through the OZ vault module is W4.2b. Events are the vault's own golden-pinned SEP-41/SEP-56 shapes (OZ 0.8.0 emits mint/burn/approve data as maps, which is not SEP-41).
 
 **Key functions:**
 ```rust
@@ -145,6 +145,19 @@ fn total_supply(env: Env) -> i128
 fn convert_to_shares(env: Env, assets: i128) -> i128
 fn convert_to_assets(env: Env, shares: i128) -> i128
 fn asset(env: Env) -> Address   // the numéraire
+
+// SEP-41 share token
+fn balance(env: Env, id: Address) -> i128
+fn transfer(env: Env, from: Address, to: Address, amount: i128)        // muxed `to` in W4.2b
+fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128)
+fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32)
+    // expired (amount > 0) or beyond the network max TTL -> error #102 InvalidLiveUntilLedger
+fn allowance(env: Env, from: Address, spender: Address) -> i128      // 0 once expired
+fn burn(env: Env, from: Address, amount: i128)                       // no assets leave; NAV/share rises
+fn burn_from(env: Env, spender: Address, from: Address, amount: i128)
+fn decimals(env: Env) -> u32
+fn name(env: Env) -> String
+fn symbol(env: Env) -> String
 
 // Collateral Passport (view-only)
 fn get_nav_conservative(env: Env) -> Option<PriceData>
@@ -361,7 +374,7 @@ Data: { relevant fields, timestamp }
 |---|---|
 | `deposit` | SEP-56 event (name defined by the standard): topics `[deposit, operator, from, receiver]`, data `(assets, shares)`; emitted by `deposit` and `mint` |
 | `withdraw` | SEP-56 event: topics `[withdraw, operator, receiver, owner]`, data `(assets, shares)`; emitted by `withdraw` and `redeem` |
-| `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard) |
+| `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard): `transfer` `[transfer, from, to]` data `amount`; `approve` `[approve, from, spender]` data `[amount, live_until_ledger]`; `mint` `[mint, to]` data `amount` (deposits, mints **and accrued fee shares** to the treasury); `burn` `[burn, from]` data `amount` (redeem, withdraw, `burn`, `burn_from`) |
 | `REBALANCE_STEP` | Each trade in a rebalance |
 | `REBALANCE_COMPLETE` | Full rebalance completed |
 | `NAV_PAUSE` | Circuit breaker triggered |

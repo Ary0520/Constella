@@ -22,6 +22,8 @@ Every Constella basket token (vault share token) **must** implement SEP-41 so th
 - AMMs (Soroswap, Aquarius) and DEX orderbooks can list the basket token.
 - Lending markets (Blend, Liqvid) can accept the basket token as collateral.
 
+**Status (15 Nov 2026, audit W6 fixed):** all core operations and events above are implemented on the vault share token, including `burn`/`burn_from`, validated `live_until_ledger`, and `mint` events for accrued fee shares. One gap remains: `transfer` takes `to: Address`, not `MuxedAddress` (W4.2b).
+
 ---
 
 ## 2. SEP-56: Tokenized Vault Standard
@@ -60,7 +62,7 @@ While classic SEP-56 targets a single underlying asset, Constella achieves SEP-5
 1. **Single Numéraire Settlement:** All deposits and redemptions enter and exit in a single base currency (USDC or EURC).
 2. **Internal Multi-Asset Accounting:** Internally, the vault allocates numéraire across multiple sleeve constituents.
 3. **NAV-Based Conversion:** `convert_to_shares` and `convert_to_assets` evaluate the aggregate basket NAV against the numéraire.
-4. **Base Module:** Implemented directly using OpenZeppelin's audited `stellar-contracts` v0.8.0 SEP-56 implementation.
+4. **Base Module:** OpenZeppelin `stellar-contracts` v0.8.0. Status (15 Nov 2026): the share ledger runs on OZ `stellar-tokens` fungible storage (audit W4.2a); routing the SEP-56 entry points through the OZ vault module, where it can carry dual NAV, caps, fees and the liquidity floor, is W4.2b.
 
 ---
 
