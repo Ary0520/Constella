@@ -146,7 +146,7 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 4. User (or multisig) — the policy *owner* — signs the policy hash together with every enforced term
    (Soroban authorization of `register_policy`, invoked by the vault through `vault.bind_policy`)
 5. Policy contract on-chain stores the hash, the terms, and terms_hash = SHA-256(XDR(terms))
-6. Vault is bound to this policy; only the owner can amend it later (re-sign `update_policy`)
+6. Vault is bound to this policy; only the owner can amend it later (re-sign `update_policy`), and an amendment takes effect only after a notice period of at least 48h so holders can exit first
 7. The on-chain vault enforces only operations consistent with the signed policy
 ```
 
