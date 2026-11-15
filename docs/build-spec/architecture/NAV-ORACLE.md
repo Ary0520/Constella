@@ -40,6 +40,13 @@ The fix is not complex: never price from a single thin source, enforce multi-sou
 
 This means collateral NAV is always conservative (protects lenders). Deposit NAV is fair (protects depositors from being diluted).
 
+### Per-asset evaluation (audit O6, 15 Nov 2026)
+- Every rule below is evaluated **per asset**, among that asset's own sources. A sleeve may hold several assets at different prices (USDC and EURC in cash; BENJI and USDY in USD gov funds), and comparing them would be meaningless.
+- The **sleeve** is the configuration and pause domain: deviation threshold, minimum valid sources, and the pause flag / `NAV_PAUSE` event.
+- An asset belongs to exactly one sleeve, and a source ID cannot be re-registered for another asset or sleeve (`AssetSleeveMismatch`).
+- Per-asset reads: `asset_price(asset)` (median, deposit/fair) and `price(asset)` (minimum, collateral).
+- Sleeve-level `get_deposit_nav` / `get_collateral_nav` return a price only for a single-asset sleeve, and return `None` otherwise. Reads never pause a sleeve because of other assets.
+
 ### Rule 4: Deviation circuit breaker
 - If two or more valid sources exist and their values differ by **>2–3%** (threshold per asset, set in registry):
   - **Deposits paused** for the affected sleeve
