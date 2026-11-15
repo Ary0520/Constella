@@ -22,3 +22,5 @@ constella-policy = { path = "../policy" }
 constella-nav-oracle = { path = "../nav-oracle" }
 constella-vault-strategy = { path = "../vault-strategy" }
 constella-fee-sponsor = { path = "../fee-sponsor" }
+constella-webauthn-verifier = { path = "../webauthn-verifier" }
+constella-threshold-policy = { path = "../threshold-policy" }
