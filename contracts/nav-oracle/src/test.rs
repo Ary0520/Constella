@@ -949,3 +949,57 @@ mod o2 {
         assert!(client.get_deposit_nav(&sleeve).is_none());
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit O3 (2026-11-15): single-source configurations are refused.
+// -------------------------------------------------------------------------
+mod o3 {
+    use super::*;
+
+    #[test]
+    fn min_valid_sources_below_two_rejected() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        let sleeve = Symbol::new(&env, "XLM");
+        for n in [0u32, 1] {
+            assert_eq!(
+                client.try_configure_sleeve(&sleeve, &200, &n),
+                Err(Ok(soroban_sdk::Error::from_contract_error(OracleError::InvalidThreshold as u32)))
+            );
+        }
+        assert!(client.get_sleeve_config(&sleeve).is_none());
+    }
+
+    #[test]
+    fn two_or_more_accepted() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        let sleeve = Symbol::new(&env, "XLM");
+        client.configure_sleeve(&sleeve, &200, &2);
+        assert_eq!(client.get_sleeve_config(&sleeve).unwrap().min_valid_sources, 2);
+        client.configure_sleeve(&sleeve, &200, &3);
+        assert_eq!(client.get_sleeve_config(&sleeve).unwrap().min_valid_sources, 3);
+    }
+
+    #[test]
+    fn cannot_lower_an_existing_sleeve_to_one() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        let sleeve = Symbol::new(&env, "XLM");
+        client.configure_sleeve(&sleeve, &200, &3);
+        assert!(client.try_configure_sleeve(&sleeve, &200, &1).is_err());
+        assert_eq!(client.get_sleeve_config(&sleeve).unwrap().min_valid_sources, 3);
+    }
+
+    #[test]
+    fn one_valid_source_never_prices() {
+        let env = Env::default();
+        let (client, _admin, _base) = setup_oracle(&env);
+        env.ledger().set_timestamp(1000);
+        let asset = Address::generate(&env);
+        client.register_source(&create_source(&env, "ONLY", &asset, "XLM", 107_000_000, 200_000, 1000));
+        assert!(client.price(&asset).is_none());
+        assert!(client.get_collateral_nav(&Symbol::new(&env, "XLM")).is_none());
+        assert!(client.get_deposit_nav(&Symbol::new(&env, "XLM")).is_none());
+    }
+}
