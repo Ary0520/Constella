@@ -1088,3 +1088,158 @@ fn test_transfer_conserves_total_supply() {
     assert_eq!(ctx.vault_client.balance(&ctx.bob), 25_0000000);
     assert_eq!(sum_of_balances(&ctx, &[&ctx.alice, &ctx.bob, &ctx.treasury]), supply);
 }
+
+// -------------------------------------------------------------------------
+// Audit V2 (2026-11-15): admin must not be able to write sleeve holdings.
+// Holdings are recorded only by value-moving flows (deposit/redeem) and are
+// valued at min(recorded, real token balance held by the vault).
+// -------------------------------------------------------------------------
+fn register_gov_fund(ctx: &TestContext) -> Address {
+    let gov_sac = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env));
+    let gov = gov_sac.address();
+    let mut sources = SdkVec::new(&ctx.env);
+    sources.push_back(Symbol::new(&ctx.env, "GOV_NAV"));
+    sources.push_back(Symbol::new(&ctx.env, "GOV_REFLECTOR"));
+    ctx.registry_client.add_asset(&AssetEntry {
+        contract_address: gov.clone(),
+        asset_id: Symbol::new(&ctx.env, "SPIKO_USD"),
+        sleeve_type: RegSleeveType::UsdGovFund,
+        liquidity_tier: 1,
+        permissionless: true,
+        oracle_sources: sources,
+        eligible_jurisdictions: SdkVec::new(&ctx.env),
+        blocked_jurisdictions: SdkVec::new(&ctx.env),
+        investor_classes_required: SdkVec::new(&ctx.env),
+        is_active: true,
+        added_at: 1_000_000,
+    });
+    let gov_sym = Symbol::new(&ctx.env, "USD_GOV_FUNDS");
+    ctx.oracle_client.configure_sleeve(&gov_sym, &200, &2);
+    for id in ["GOV_NAV", "GOV_REFLECTOR"] {
+        ctx.oracle_client.register_source(&ExtOracleSource {
+            source_id: Symbol::new(&ctx.env, id),
+            asset: gov.clone(),
+            sleeve: gov_sym.clone(),
+            price: 10_000_000,
+            timestamp: 1_000_000,
+            staleness_limit_seconds: 14400,
+            min_liquidity_depth_usd: 100_000,
+            current_liquidity_depth_usd: 200_000,
+            is_active: true,
+        });
+    }
+    gov
+}
+
+fn sleeve(ctx: &TestContext, id: &str, addr: &Address, st: SleeveType, bps: u32, bal: i128) -> SleeveState {
+    SleeveState {
+        asset_id: String::from_str(&ctx.env, id),
+        contract_address: addr.clone(),
+        target_weight_bps: bps,
+        band_bps: 500,
+        current_balance: bal,
+        sleeve_type: st,
+        liquidity_tier: if st == SleeveType::CashStable { 0 } else { 1 },
+    }
+}
+
+#[test]
+fn test_v2_set_sleeves_rejects_balance_injection() {
+    let ctx = setup_test_context();
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    let gov = register_gov_fund(&ctx);
+
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 1_000_000_0000000));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+    let res = ctx.vault_client.try_set_sleeves(&sleeves);
+    assert_eq!(res.unwrap_err().unwrap(), VaultError::BalanceNotSettable.into());
+
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 100_0000000));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 50_0000000));
+    let res = ctx.vault_client.try_set_sleeves(&sleeves);
+    assert_eq!(res.unwrap_err().unwrap(), VaultError::BalanceNotSettable.into());
+
+    assert_eq!(ctx.vault_client.total_assets(), 100_0000000);
+}
+
+#[test]
+fn test_v2_set_sleeves_preserves_recorded_balances() {
+    let ctx = setup_test_context();
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    let gov = register_gov_fund(&ctx);
+
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 3000, 100_0000000));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 7000, 0));
+    ctx.vault_client.set_sleeves(&sleeves);
+
+    let stored = ctx.vault_client.get_sleeves();
+    assert_eq!(stored.len(), 2);
+    assert_eq!(stored.get(0).unwrap().current_balance, 100_0000000);
+    assert_eq!(stored.get(0).unwrap().target_weight_bps, 3000);
+    assert_eq!(ctx.vault_client.total_assets(), 100_0000000);
+}
+
+#[test]
+fn test_v2_cash_sleeve_must_be_the_numeraire() {
+    let ctx = setup_test_context();
+    let gov = register_gov_fund(&ctx);
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(sleeve(&ctx, "FAKE_CASH", &gov, SleeveType::CashStable, 10000, 0));
+    let res = ctx.vault_client.try_set_sleeves(&sleeves);
+    assert_eq!(res.unwrap_err().unwrap(), VaultError::InvalidSleeveConfig.into());
+}
+
+#[test]
+fn test_v2_duplicate_sleeve_rejected() {
+    let ctx = setup_test_context();
+    let gov = register_gov_fund(&ctx);
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 4000, 0));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 3000, 0));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 3000, 0));
+    let res = ctx.vault_client.try_set_sleeves(&sleeves);
+    assert_eq!(res.unwrap_err().unwrap(), VaultError::InvalidSleeveConfig.into());
+}
+
+#[test]
+fn test_v2_cannot_remove_sleeve_that_holds_tokens() {
+    let ctx = setup_test_context();
+    let gov = register_gov_fund(&ctx);
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 0));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+    ctx.vault_client.set_sleeves(&sleeves);
+
+    // The vault really holds gov-fund tokens (e.g. sent to it on-chain).
+    soroban_sdk::token::StellarAssetClient::new(&ctx.env, &gov).mint(&ctx.vault_id, &10_0000000);
+
+    let mut cash_only = SdkVec::new(&ctx.env);
+    cash_only.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 10000, 0));
+    let res = ctx.vault_client.try_set_sleeves(&cash_only);
+    assert_eq!(res.unwrap_err().unwrap(), VaultError::SleeveHasHoldings.into());
+}
+
+#[test]
+fn test_v2_unsolicited_transfers_do_not_move_nav() {
+    let ctx = setup_test_context();
+    ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    let gov = register_gov_fund(&ctx);
+    let mut sleeves = SdkVec::new(&ctx.env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 100_0000000));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+    ctx.vault_client.set_sleeves(&sleeves);
+    let nav_before = ctx.vault_client.get_nav_deposit().unwrap().price;
+
+    // Donations of numéraire and of a sleeve asset straight to the vault.
+    ctx.numeraire_admin.mint(&ctx.vault_id, &1_000_0000000);
+    soroban_sdk::token::StellarAssetClient::new(&ctx.env, &gov).mint(&ctx.vault_id, &1_000_0000000);
+
+    assert_eq!(ctx.vault_client.total_assets(), 100_0000000);
+    assert_eq!(ctx.vault_client.get_nav_deposit().unwrap().price, nav_before);
+}
