@@ -742,3 +742,62 @@ fn w3_deposits_are_capped() {
     assert!(s.vault.try_deposit(&huge, &whale).is_err(), "a $10M deposit must exceed the caps");
     assert_eq!(s.usdc.balance(&whale), huge, "rejected deposit moves no funds");
 }
+
+// ---------------------------------------------------------------------------
+// W7 — the Collateral Passport hard-coded a 2% haircut (98% LTV) for every
+// basket and reported every address as an eligible liquidator.
+// COLLATERAL-PASSPORT Pillar 3 (haircut from composition) and Pillar 4 /
+// VAULT-DESIGN (permissioned constituents need compliant liquidators).
+// ---------------------------------------------------------------------------
+#[test]
+fn w7_passport_is_derived_from_the_basket_not_hard_coded() {
+    let s = deploy_stack_with(false);
+    let alice = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(1000 * ONE));
+    s.vault.deposit(&(1000 * ONE), &alice);
+
+    // A 100% USDC basket is a "High-Cash Basket": 10% haircut, 90% LTV.
+    let sheet = s.vault.get_risk_sheet();
+    assert_eq!(sheet.recommended_haircut_bps, 1000, "cash basket haircut per Pillar 3");
+    assert_eq!(sheet.recommended_ltv_bps, 9000);
+
+    // Add a permissioned constituent (KYC'd fund token): random addresses are
+    // no longer eligible liquidators.
+    let registry = AssetRegistryClient::new(&s.env, &s.registry_id);
+    let benji = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+    registry.add_asset(&AssetEntry {
+        contract_address: benji.clone(),
+        asset_id: Symbol::new(&s.env, "FRANKLIN_BENJI"),
+        issuer: Symbol::new(&s.env, "FRANKLIN_TEMPLETON"),
+        sleeve_type: RegSleeve::UsdGovFund,
+        liquidity_tier: 1,
+        permissionless: false,
+        oracle_sources: Vec::from_array(&s.env, [Symbol::new(&s.env, "BENJI_A"), Symbol::new(&s.env, "BENJI_B")]),
+        eligible_jurisdictions: Vec::new(&s.env),
+        blocked_jurisdictions: Vec::new(&s.env),
+        investor_classes_required: Vec::new(&s.env),
+        is_active: true,
+        added_at: T0,
+    });
+    let mut sleeves = Vec::new(&s.env);
+    sleeves.push_back(SleeveState {
+        asset_id: String::from_str(&s.env, "USDC"),
+        contract_address: s.usdc_addr.clone(),
+        target_weight_bps: 5000,
+        band_bps: 500,
+        current_balance: 1000 * ONE,
+        sleeve_type: SleeveType::CashStable,
+        liquidity_tier: 0,
+    });
+    sleeves.push_back(SleeveState {
+        asset_id: String::from_str(&s.env, "FRANKLIN_BENJI"),
+        contract_address: benji,
+        target_weight_bps: 5000,
+        band_bps: 500,
+        current_balance: 0,
+        sleeve_type: SleeveType::UsdGovFunds,
+        liquidity_tier: 1,
+    });
+    s.vault.set_sleeves(&sleeves);
+    assert!(!s.vault.is_eligible_liquidator(&Address::generate(&s.env)), "gated basket: no unverified liquidators");
+}
