@@ -1,13 +1,75 @@
 #![no_std]
-// TEMPORARY (audit W4.1, 15 Nov 2026): `Events::publish` is deprecated since
-// soroban-sdk 23 in favour of `#[contractevent]`. Publishing behaves exactly as
-// before; the migration to `#[contractevent]` (with byte-for-byte event
-// encoding tests) is sub-step W4.1b, which removes this allowance.
-#![allow(deprecated)]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec,
 };
+
+// Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
+// Events::publish encodings; pinned by golden/events.txt).
+
+/// Topics: [SPONSOR_INITIALIZED, admin]. Data: daily budget (stroops).
+#[contractevent(topics = ["SPONSOR_INITIALIZED"], data_format = "single-value")]
+pub struct SponsorInitialized {
+    #[topic]
+    pub admin: Address,
+    pub daily_budget_stroops: u64,
+}
+
+/// Topics: [CONTRACT_WHITELISTED, admin]. Data: target contract.
+#[contractevent(topics = ["CONTRACT_WHITELISTED"], data_format = "single-value")]
+pub struct ContractWhitelisted {
+    #[topic]
+    pub admin: Address,
+    pub target: Address,
+}
+
+/// Topics: [CONTRACT_UNWHITELISTED, admin]. Data: target contract.
+#[contractevent(topics = ["CONTRACT_UNWHITELISTED"], data_format = "single-value")]
+pub struct ContractUnwhitelisted {
+    #[topic]
+    pub admin: Address,
+    pub target: Address,
+}
+
+/// Topics: [SPONSORED_OP, user, target_contract]. Data: fee spent (stroops).
+#[contractevent(topics = ["SPONSORED_OP"], data_format = "single-value")]
+pub struct SponsoredOp {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub target_contract: Address,
+    pub fee_spent_stroops: u64,
+}
+
+/// Topics: [LIMITS_UPDATED, admin]. Data: daily budget (stroops).
+#[contractevent(topics = ["LIMITS_UPDATED"], data_format = "single-value")]
+pub struct LimitsUpdated {
+    #[topic]
+    pub admin: Address,
+    pub daily_budget_stroops: u64,
+}
+
+/// Topics: [SPONSOR_ADMIN_TRANSFERRED, old_admin]. Data: new admin.
+#[contractevent(topics = ["SPONSOR_ADMIN_TRANSFERRED"], data_format = "single-value")]
+pub struct SponsorAdminTransferred {
+    #[topic]
+    pub old_admin: Address,
+    pub new_admin: Address,
+}
+
+/// Topics: [SPONSOR_PAUSED, admin]. Data: void.
+#[contractevent(topics = ["SPONSOR_PAUSED"], data_format = "single-value")]
+pub struct SponsorPaused {
+    #[topic]
+    pub admin: Address,
+}
+
+/// Topics: [SPONSOR_UNPAUSED, admin]. Data: void.
+#[contractevent(topics = ["SPONSOR_UNPAUSED"], data_format = "single-value")]
+pub struct SponsorUnpaused {
+    #[topic]
+    pub admin: Address,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -107,10 +169,7 @@ impl FeeSponsorContract {
             .instance()
             .set(&DataKey::WhitelistList, &empty_list);
 
-        env.events().publish(
-            (Symbol::new(&env, "SPONSOR_INITIALIZED"), admin),
-            daily_budget_stroops,
-        );
+        SponsorInitialized { admin, daily_budget_stroops }.publish(&env);
 
     }
 
@@ -138,10 +197,7 @@ impl FeeSponsorContract {
         list.push_back(target.clone());
         env.storage().instance().set(&DataKey::WhitelistList, &list);
 
-        env.events().publish(
-            (Symbol::new(&env, "CONTRACT_WHITELISTED"), config.admin),
-            target,
-        );
+        ContractWhitelisted { admin: config.admin, target }.publish(&env);
 
         Ok(())
     }
@@ -179,10 +235,7 @@ impl FeeSponsorContract {
             .instance()
             .set(&DataKey::WhitelistList, &new_list);
 
-        env.events().publish(
-            (Symbol::new(&env, "CONTRACT_UNWHITELISTED"), config.admin),
-            target,
-        );
+        ContractUnwhitelisted { admin: config.admin, target }.publish(&env);
 
         Ok(())
     }
@@ -284,14 +337,7 @@ impl FeeSponsorContract {
             .instance()
             .set(&DataKey::UserStats(user.clone()), &updated_user_stats);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "SPONSORED_OP"),
-                user,
-                target_contract,
-            ),
-            fee_spent_stroops,
-        );
+        SponsoredOp { user, target_contract, fee_spent_stroops }.publish(&env);
 
         Ok(())
     }
@@ -318,10 +364,7 @@ impl FeeSponsorContract {
 
         env.storage().instance().set(&DataKey::Config, &config);
 
-        env.events().publish(
-            (Symbol::new(&env, "LIMITS_UPDATED"), config.admin),
-            daily_budget_stroops,
-        );
+        LimitsUpdated { admin: config.admin, daily_budget_stroops }.publish(&env);
 
         Ok(())
     }
@@ -333,10 +376,7 @@ impl FeeSponsorContract {
         config.admin = new_admin.clone();
         env.storage().instance().set(&DataKey::Config, &config);
 
-        env.events().publish(
-            (Symbol::new(&env, "SPONSOR_ADMIN_TRANSFERRED"), old_admin),
-            new_admin,
-        );
+        SponsorAdminTransferred { old_admin, new_admin }.publish(&env);
 
         Ok(())
     }
@@ -347,8 +387,7 @@ impl FeeSponsorContract {
         config.is_paused = true;
         env.storage().instance().set(&DataKey::Config, &config);
 
-        env.events()
-            .publish((Symbol::new(&env, "SPONSOR_PAUSED"), config.admin), ());
+        SponsorPaused { admin: config.admin }.publish(&env);
 
         Ok(())
     }
@@ -359,8 +398,7 @@ impl FeeSponsorContract {
         config.is_paused = false;
         env.storage().instance().set(&DataKey::Config, &config);
 
-        env.events()
-            .publish((Symbol::new(&env, "SPONSOR_UNPAUSED"), config.admin), ());
+        SponsorUnpaused { admin: config.admin }.publish(&env);
 
         Ok(())
     }

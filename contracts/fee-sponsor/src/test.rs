@@ -5,7 +5,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    Address, Env,
+    Address, Env, Symbol,
 };
 
 /// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
