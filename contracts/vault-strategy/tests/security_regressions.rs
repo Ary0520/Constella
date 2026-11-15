@@ -444,3 +444,24 @@ fn o4_deviation_pause_latches_when_the_price_is_pushed() {
     assert!(s.oracle.is_sleeve_paused(&vault_sleeve));
     assert!(s.oracle.get_deposit_nav(&vault_sleeve).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// O2 — update_price accepted any timestamp; a feed stamped in the future
+// never became stale (NAV-ORACLE Rule 5: "a 24-hour-old price is not a price").
+// ---------------------------------------------------------------------------
+#[test]
+fn o2_future_dated_price_is_rejected_and_cannot_dodge_staleness() {
+    let s = deploy_stack(); // VAULT sleeve: USDC_A, USDC_B, 1h staleness limit
+    let vault_sleeve = Symbol::new(&s.env, "VAULT");
+    let far_future = T0 + 10_000_000;
+
+    for id in ["USDC_A", "USDC_B"] {
+        let res = s.oracle.try_update_price(&Symbol::new(&s.env, id), &ONE, &200_000, &far_future);
+        assert!(res.is_err(), "future-dated price must be rejected");
+    }
+
+    // ~58 days later the original T0 prices are stale: pricing must hard-stop.
+    s.env.ledger().set_timestamp(T0 + 5_000_000);
+    assert!(s.oracle.get_deposit_nav(&vault_sleeve).is_none(), "stale feeds must not price the vault");
+    assert!(s.oracle.get_collateral_nav(&vault_sleeve).is_none());
+}
