@@ -16,7 +16,7 @@ use constella_registry::{AssetEntry, AssetRegistry, AssetRegistryClient, SleeveT
 use constella_vault_strategy::{SleeveState, SleeveType, StrategyVault, StrategyVaultClient, VaultConfig};
 use soroban_sdk::{
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
-    token, Address, Env, IntoVal, String, Symbol, Vec,
+    token, Address, Env, IntoVal, String, Symbol, TryFromVal, Vec,
 };
 
 const ONE: i128 = 10_000_000; // 7 decimals
@@ -56,6 +56,10 @@ fn oracle_source(env: &Env, id: &str, asset: &Address, price: i128) -> OracleSou
 /// audit V5 the vault never reads that key: share prices always come from
 /// holdings.
 fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
+    deploy_stack_cfg(vault_nav_feeds, 0)
+}
+
+fn deploy_stack_cfg(vault_nav_feeds: bool, management_fee_bps: u32) -> Stack<'static> {
     let env = Env::default();
     env.mock_all_auths(); // setup only
     env.ledger().set_timestamp(T0);
@@ -105,7 +109,7 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
             oracle_contract: oracle_id.clone(),
             registry_contract: registry_id.clone(),
             treasury: treasury.clone(),
-            management_fee_bps: 0,
+            management_fee_bps,
             tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
             per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
         },
@@ -955,4 +959,192 @@ fn m4_cash_sleeve_is_named_from_the_registry_and_numeraire_must_be_registered() 
         env.register(StrategyVault, (cfg, String::from_str(&env, "Rogue"), String::from_str(&env, "R"), 7u32))
     }));
     assert!(deployed.is_err(), "an unregistered numéraire must make deployment fail");
+}
+
+// ---------------------------------------------------------------------------
+// W2 — share ledger lived in instance storage with no TTL management: one
+// ever-growing entry loaded on every call, archived after the default TTL.
+// W6 — share token was not SEP-41 complete.
+// ---------------------------------------------------------------------------
+const DAY_LEDGERS: u32 = 17_280;
+
+/// (topics, data) of every event the vault emitted in the last invocation.
+fn vault_events(s: &Stack) -> std::vec::Vec<(std::vec::Vec<soroban_sdk::xdr::ScVal>, soroban_sdk::xdr::ScVal)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::xdr::ContractEventBody;
+    let mut out = std::vec::Vec::new();
+    for e in s.env.events().all().filter_by_contract(&s.vault_id).events() {
+        let ContractEventBody::V0(body) = &e.body;
+        out.push((body.topics.iter().cloned().collect(), body.data.clone()));
+    }
+    out
+}
+
+fn sym(name: &str) -> soroban_sdk::xdr::ScVal {
+    soroban_sdk::xdr::ScVal::Symbol(name.try_into().unwrap())
+}
+
+fn sc(env: &Env, a: &Address) -> soroban_sdk::xdr::ScVal {
+    soroban_sdk::xdr::ScVal::try_from_val(env, &a.to_val()).unwrap()
+}
+
+fn i128_val(v: i128) -> soroban_sdk::xdr::ScVal {
+    soroban_sdk::xdr::ScVal::I128(soroban_sdk::xdr::Int128Parts { hi: (v >> 64) as i64, lo: v as u64 })
+}
+
+fn contract_error(code: u32) -> soroban_sdk::Error {
+    soroban_sdk::Error::from_contract_error(code)
+}
+
+#[test]
+fn w2_share_ledger_is_persistent_per_holder_with_ttl() {
+    use stellar_tokens::fungible::{total_supply::TotalSupplyStorageKey, FungibleStorageKey, BALANCE_TTL_THRESHOLD};
+    use soroban_sdk::testutils::storage::Persistent as _;
+    let s = deploy_stack();
+    let alice = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(100 * ONE));
+    s.vault.deposit(&(100 * ONE), &alice);
+
+    s.env.as_contract(&s.vault_id, || {
+        let bal_key = FungibleStorageKey::Balance(alice.clone());
+        let p = s.env.storage().persistent();
+        assert_eq!(p.get::<_, i128>(&bal_key), Some(100 * ONE), "balance must be a persistent per-holder entry");
+        assert!(p.get_ttl(&bal_key) >= BALANCE_TTL_THRESHOLD, "balance TTL not extended");
+        assert_eq!(p.get::<_, i128>(&TotalSupplyStorageKey::TotalSupply), Some(100 * ONE));
+    });
+}
+
+#[test]
+fn w2_instance_storage_does_not_grow_with_the_number_of_holders() {
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+    let s = deploy_stack();
+    let instance_len = |s: &Stack| s.env.as_contract(&s.vault_id, || s.env.storage().instance().all().len());
+    let first = Address::generate(&s.env);
+    s.usdc_admin.mint(&first, &(10 * ONE));
+    s.vault.deposit(&(10 * ONE), &first);
+    let baseline = instance_len(&s);
+
+    // Every call loads the whole instance entry, and entries are size-capped:
+    // per-holder state must not live there.
+    for _ in 0..20 {
+        let holder = Address::generate(&s.env);
+        s.usdc_admin.mint(&holder, &(10 * ONE));
+        s.vault.deposit(&(10 * ONE), &holder);
+        let until = s.env.ledger().sequence() + 1_000;
+        s.vault.approve(&holder, &first, &ONE, &until);
+    }
+    assert_eq!(instance_len(&s), baseline, "per-holder state leaked into instance storage");
+    assert!(s.env.as_contract(&s.vault_id, || s.env.storage().instance().get_ttl()) > 0);
+    let persisted = s.env.as_contract(&s.vault_id, || s.env.storage().persistent().all().len());
+    assert!(persisted >= 21, "each holder balance must be its own persistent entry");
+}
+
+#[test]
+fn w6_approve_validates_live_until_ledger_and_reports_it() {
+    let s = deploy_stack();
+    let owner = Address::generate(&s.env);
+    let spender = Address::generate(&s.env);
+    let seq = s.env.ledger().sequence();
+
+    // Already expired.
+    authorize(&s, &owner, "approve", (owner.clone(), spender.clone(), 10 * ONE, seq - 1).into_val(&s.env));
+    assert!(s.vault.try_approve(&owner, &spender, &(10 * ONE), &(seq - 1)).is_err());
+    // Beyond the network's maximum entry lifetime.
+    let too_far = s.env.ledger().max_live_until_ledger() + 1;
+    authorize(&s, &owner, "approve", (owner.clone(), spender.clone(), 10 * ONE, too_far).into_val(&s.env));
+    assert!(s.vault.try_approve(&owner, &spender, &(10 * ONE), &too_far).is_err());
+    assert_eq!(s.vault.allowance(&owner, &spender), 0);
+
+    // Valid approval: SEP-41 event data is [amount, live_until_ledger].
+    let until = seq + 1_000;
+    authorize(&s, &owner, "approve", (owner.clone(), spender.clone(), 10 * ONE, until).into_val(&s.env));
+    s.vault.approve(&owner, &spender, &(10 * ONE), &until);
+    assert_eq!(s.env.auths()[0].0, owner);
+    let data = soroban_sdk::xdr::ScVal::Vec(Some(
+        std::vec![i128_val(10 * ONE), soroban_sdk::xdr::ScVal::U32(until)].try_into().unwrap(),
+    ));
+    assert_eq!(
+        vault_events(&s),
+        std::vec![(std::vec![sym("approve"), sc(&s.env, &owner), sc(&s.env, &spender)], data)]
+    );
+    assert_eq!(s.vault.allowance(&owner, &spender), 10 * ONE);
+
+    // The allowance lapses after live_until_ledger.
+    s.env.ledger().set_sequence_number(until + 1);
+    assert_eq!(s.vault.allowance(&owner, &spender), 0);
+}
+
+#[test]
+fn w6_holder_can_burn_and_spender_can_burn_from_within_allowance() {
+    let s = deploy_stack();
+    let alice = Address::generate(&s.env);
+    let spender = Address::generate(&s.env);
+    let stranger = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(100 * ONE));
+    s.vault.deposit(&(100 * ONE), &alice);
+
+    // A stranger cannot burn someone else's shares.
+    authorize(&s, &stranger, "burn", (alice.clone(), 1 * ONE).into_val(&s.env));
+    assert!(s.vault.try_burn(&alice, &(1 * ONE)).is_err());
+
+    authorize(&s, &alice, "burn", (alice.clone(), 10 * ONE).into_val(&s.env));
+    s.vault.burn(&alice, &(10 * ONE));
+    assert_eq!(s.env.auths()[0].0, alice);
+    assert_eq!(
+        vault_events(&s),
+        std::vec![(std::vec![sym("burn"), sc(&s.env, &alice)], i128_val(10 * ONE))]
+    );
+    assert_eq!(s.vault.balance(&alice), 90 * ONE);
+    assert_eq!(s.vault.total_supply(), 90 * ONE);
+
+    // Cannot burn more than held.
+    authorize(&s, &alice, "burn", (alice.clone(), 91 * ONE).into_val(&s.env));
+    assert_eq!(s.vault.try_burn(&alice, &(91 * ONE)).err().unwrap().unwrap(), contract_error(6));
+
+    let until = s.env.ledger().sequence() + 1_000;
+    s.env.mock_all_auths();
+    s.vault.approve(&alice, &spender, &(20 * ONE), &until);
+
+    authorize(&s, &spender, "burn_from", (spender.clone(), alice.clone(), 15 * ONE).into_val(&s.env));
+    s.vault.burn_from(&spender, &alice, &(15 * ONE));
+    assert_eq!(s.env.auths()[0].0, spender);
+    assert_eq!(
+        vault_events(&s),
+        std::vec![(std::vec![sym("burn"), sc(&s.env, &alice)], i128_val(15 * ONE))]
+    );
+    assert_eq!(s.vault.allowance(&alice, &spender), 5 * ONE);
+    assert_eq!(s.vault.balance(&alice), 75 * ONE);
+    assert_eq!(s.vault.total_supply(), 75 * ONE);
+
+    // Cannot exceed the remaining allowance.
+    authorize(&s, &spender, "burn_from", (spender.clone(), alice.clone(), 6 * ONE).into_val(&s.env));
+    assert_eq!(
+        s.vault.try_burn_from(&spender, &alice, &(6 * ONE)).err().unwrap().unwrap(),
+        contract_error(7)
+    );
+}
+
+#[test]
+fn w6_fee_shares_are_announced_with_a_mint_event() {
+    // FIXTURE: 25 bps/year, the ceiling in docs/build-spec/README.md ("0.05%-0.25%/year").
+    let s = deploy_stack_cfg(true, 25);
+    let alice = Address::generate(&s.env);
+    let bob = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(1_000 * ONE));
+    s.vault.deposit(&(1_000 * ONE), &alice);
+    assert_eq!(s.vault.balance(&s.treasury), 0);
+
+    s.env.ledger().set_timestamp(T0 + 30 * 86_400);
+    authorize(&s, &alice, "transfer", (alice.clone(), bob.clone(), 1 * ONE).into_val(&s.env));
+    s.vault.transfer(&alice, &bob, &(1 * ONE));
+
+    let fee = s.vault.balance(&s.treasury);
+    assert!(fee > 0, "fee must have accrued");
+    let mints: std::vec::Vec<_> = vault_events(&s).into_iter().filter(|(t, _)| t[0] == sym("mint")).collect();
+    assert_eq!(mints, std::vec![(std::vec![sym("mint"), sc(&s.env, &s.treasury)], i128_val(fee))]);
+    assert_eq!(
+        s.vault.balance(&alice) + s.vault.balance(&bob) + fee,
+        s.vault.total_supply(),
+        "sum of balances must equal total supply"
+    );
 }
