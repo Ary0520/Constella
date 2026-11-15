@@ -168,6 +168,7 @@ fn price_asset(env: &Env, oracle: &NavOracleClient, asset: &Address, key: &str, 
             min_liquidity_depth_usd: 100_000,
             current_liquidity_depth_usd: 200_000,
             is_active: true,
+            feeder: Address::generate(env),
         });
     }
 }

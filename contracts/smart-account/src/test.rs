@@ -426,6 +426,7 @@ fn test_t55_sponsored_passkey_vault_deposit() {
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(&env),
     };
     let s2 = constella_nav_oracle::OracleSource {
         source_id: Symbol::new(&env, "CONS_SRC"),
@@ -437,6 +438,7 @@ fn test_t55_sponsored_passkey_vault_deposit() {
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(&env),
     };
     let s3 = constella_nav_oracle::OracleSource {
         source_id: Symbol::new(&env, "HIGH_SRC"),
@@ -448,6 +450,7 @@ fn test_t55_sponsored_passkey_vault_deposit() {
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(&env),
     };
     oracle_client.register_source(&s1);
     oracle_client.register_source(&s2);

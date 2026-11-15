@@ -476,6 +476,7 @@ fn test_t46_liquidity_sleeve_floor_protection() {
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(&ctx.env),
     };
     let s2 = ExtOracleSource {
         source_id: Symbol::new(&ctx.env, "BENJI_MIN"),
@@ -487,6 +488,7 @@ fn test_t46_liquidity_sleeve_floor_protection() {
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(&ctx.env),
     };
     ctx.oracle_client.register_source(&s1);
     ctx.oracle_client.register_source(&s2);
@@ -706,6 +708,7 @@ fn test_exact_liquidity_floor_boundary() {
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(&ctx.env),
     });
 
     // 10% liquidity floor (1000 bps)
@@ -818,6 +821,7 @@ fn test_dual_nav_asymmetric_max_redeem() {
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(&ctx.env),
     });
     ctx.oracle_client.register_source(&ExtOracleSource {
         source_id: Symbol::new(&ctx.env, "BENJI_LOW"),
@@ -829,6 +833,7 @@ fn test_dual_nav_asymmetric_max_redeem() {
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(&ctx.env),
     });
 
     // Policy: 0% floor to isolate capacity check
@@ -1114,6 +1119,7 @@ fn register_gov_fund(ctx: &TestContext) -> Address {
             min_liquidity_depth_usd: 100_000,
             current_liquidity_depth_usd: 200_000,
             is_active: true,
+            feeder: Address::generate(&ctx.env),
         });
     }
     gov

@@ -47,6 +47,7 @@ fn oracle_source(env: &Env, id: &str, asset: &Address, price: i128) -> OracleSou
         min_liquidity_depth_usd: 100_000,
         current_liquidity_depth_usd: 200_000,
         is_active: true,
+        feeder: Address::generate(env),
     }
 }
 

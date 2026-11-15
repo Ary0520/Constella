@@ -28,6 +28,10 @@ pub enum OracleError {
     /// An asset's sources must all belong to one sleeve, and a source id
     /// cannot be re-registered for another asset or sleeve (audit O6).
     AssetSleeveMismatch = 14,
+    /// No source change is pending for this id.
+    NoPendingSourceChange = 15,
+    /// The 48-hour source-change delay has not elapsed.
+    SourceChangeNotReady = 16,
 }
 
 /// SEP-40 asset identifier (identical to script3/sep-40-oracle and Reflector).
@@ -73,6 +77,16 @@ pub struct OracleSource {
     pub min_liquidity_depth_usd: i128,
     pub current_liquidity_depth_usd: i128,
     pub is_active: bool,
+    /// The only key allowed to push this source's price (audit O7a).
+    pub feeder: Address,
+}
+
+/// A source change waiting out `SOURCE_CHANGE_DELAY_SECONDS` (audit O7a).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSource {
+    pub source: OracleSource,
+    pub effective_at: u64,
 }
 
 #[contracttype]
@@ -160,6 +174,38 @@ pub struct PriceUpdatedData {
     pub timestamp: u64,
 }
 
+/// Topics: [SOURCE_CHANGE_PROPOSED, source_id]. Data: effective_at (audit O7a).
+#[contractevent(topics = ["SOURCE_CHANGE_PROPOSED"], data_format = "single-value")]
+pub struct SourceChangeProposed {
+    #[topic]
+    pub source_id: Symbol,
+    pub effective_at: u64,
+}
+
+/// Topics: [SOURCE_ACTIVATED, source_id]. Data: feeder.
+#[contractevent(topics = ["SOURCE_ACTIVATED"], data_format = "single-value")]
+pub struct SourceActivated {
+    #[topic]
+    pub source_id: Symbol,
+    pub feeder: Address,
+}
+
+/// Topics: [SOURCE_CHANGE_CANCELLED, source_id]. Data: effective_at.
+#[contractevent(topics = ["SOURCE_CHANGE_CANCELLED"], data_format = "single-value")]
+pub struct SourceChangeCancelled {
+    #[topic]
+    pub source_id: Symbol,
+    pub effective_at: u64,
+}
+
+/// Topics: [SOURCE_DEACTIVATED, source_id]. Data: ledger timestamp.
+#[contractevent(topics = ["SOURCE_DEACTIVATED"], data_format = "single-value")]
+pub struct SourceDeactivated {
+    #[topic]
+    pub source_id: Symbol,
+    pub timestamp: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -175,6 +221,8 @@ pub enum DataKey {
     AllAssets,
     /// SEP-40 history: conservative price snapshots, newest first (W5).
     History(Address),
+    /// Source change waiting for its delay (audit O7a).
+    PendingSource(Symbol),
     PauseAuthority,
 }
 
@@ -257,6 +305,15 @@ pub trait NavOracleTrait {
 
     /// Inspect all sources across all registered assets
     fn get_sources(env: Env) -> Vec<OracleSource>;
+
+    /// Activate a pending source change once its 48h delay has passed (anyone).
+    fn activate_source(env: Env, source_id: Symbol);
+    /// Cancel a pending source change (admin).
+    fn cancel_source_change(env: Env, source_id: Symbol);
+    /// Deactivate a source immediately (admin). Fails safe: can only halt.
+    fn deactivate_source(env: Env, source_id: Symbol);
+    /// Pending change for a source id, if any.
+    fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource>;
 }
 
 /// A source is fresh only if its timestamp is not in the future and is within
@@ -314,6 +371,7 @@ fn evaluate_sources(
     source_ids: &Vec<Symbol>,
     sleeve_id: &Symbol,
     config: &mut SleeveOracleConfig,
+    persist_pause: bool,
 ) -> Result<Vec<OracleSource>, OracleError> {
     if config.is_paused {
         return Err(OracleError::SleevePaused);
@@ -376,6 +434,9 @@ fn evaluate_sources(
     };
 
     if dev_bps > config.deviation_threshold_bps as i128 {
+        if !persist_pause {
+            return Err(OracleError::DeviationExceeded);
+        }
         config.is_paused = true;
         config.pause_reason = Symbol::new(env, "DEVIATION");
         env.storage()
@@ -433,7 +494,7 @@ fn evaluate_asset(env: &Env, asset: &Address) -> Result<Vec<OracleSource>, Oracl
         .instance()
         .get(&DataKey::AssetSources(asset.clone()))
         .unwrap_or_else(|| Vec::new(env));
-    evaluate_sources(env, &source_ids, &sleeve_id, &mut config)
+    evaluate_sources(env, &source_ids, &sleeve_id, &mut config, true)
 }
 
 /// The sleeve's only asset, or None when it has no sources or more than one
@@ -543,6 +604,101 @@ fn record_snapshot(env: &Env, asset: &Address) {
     env.storage().persistent().extend_ttl(&key, HISTORY_TTL_THRESHOLD, HISTORY_EXTEND_AMOUNT);
 }
 
+/// Delay before a change to an already-priced asset's sources takes effect
+/// (audit O7a): 48 h, the same window as upgrades, policy amendments and
+/// account recovery, so watchers can react before prices can be affected.
+pub const SOURCE_CHANGE_DELAY_SECONDS: u64 = 48 * 3600;
+
+/// Whether `asset` has a valid price right now (no side effects).
+fn asset_is_priced(env: &Env, asset: &Address) -> bool {
+    let Some(sleeve_id) = env.storage().instance().get::<_, Symbol>(&DataKey::AssetSleeve(asset.clone())) else {
+        return false;
+    };
+    let mut config = sleeve_config(env, &sleeve_id);
+    let ids: Vec<Symbol> = env.storage().instance().get(&DataKey::AssetSources(asset.clone())).unwrap_or_else(|| Vec::new(env));
+    evaluate_sources(env, &ids, &sleeve_id, &mut config, false).is_ok()
+}
+
+fn admin_of(env: &Env) -> Address {
+    match env.storage().instance().get(&DataKey::Admin) {
+        Some(a) => a,
+        None => panic_with_error!(env, OracleError::NotInitialized),
+    }
+}
+
+/// Install a source (indexes, deviation latch, history snapshot).
+fn apply_source(env: &Env, source: &OracleSource) {
+    env.storage()
+        .instance()
+        .set(&DataKey::Source(source.source_id.clone()), source);
+
+    // Sleeve sources index
+    let mut sleeve_sources: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::SleeveSources(source.sleeve.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    let mut found_sleeve_source = false;
+    for s in sleeve_sources.iter() {
+        if s == source.source_id {
+            found_sleeve_source = true;
+            break;
+        }
+    }
+    if !found_sleeve_source {
+        sleeve_sources.push_back(source.source_id.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::SleeveSources(source.sleeve.clone()), &sleeve_sources);
+    }
+
+    // Asset sources index
+    let mut asset_sources: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::AssetSources(source.asset.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    let mut found_asset_source = false;
+    for s in asset_sources.iter() {
+        if s == source.source_id {
+            found_asset_source = true;
+            break;
+        }
+    }
+    if !found_asset_source {
+        asset_sources.push_back(source.source_id.clone());
+        env.storage()
+            .instance()
+            .set(&DataKey::AssetSources(source.asset.clone()), &asset_sources);
+    }
+
+    // Asset sleeve mapping
+    env.storage()
+        .instance()
+        .set(&DataKey::AssetSleeve(source.asset.clone()), &source.sleeve);
+
+    // All assets list
+    let mut all_assets: Vec<Address> = env
+        .storage()
+        .instance()
+        .get(&DataKey::AllAssets)
+        .unwrap_or_else(|| Vec::new(env));
+    let mut found_asset = false;
+    for a in all_assets.iter() {
+        if a == source.asset {
+            found_asset = true;
+            break;
+        }
+    }
+    if !found_asset {
+        all_assets.push_back(source.asset.clone());
+        env.storage().instance().set(&DataKey::AllAssets, &all_assets);
+    }
+
+    latch_deviation_on_write(env, &source.asset);
+    record_snapshot(env, &source.asset);
+}
+
 #[contract]
 pub struct NavOracle;
 
@@ -629,75 +785,19 @@ impl NavOracleTrait for NavOracle {
                 panic_with_error!(&env, OracleError::AssetSleeveMismatch);
             }
         }
-        env.storage()
-            .instance()
-            .set(&DataKey::Source(source.source_id.clone()), &source);
-
-        // Sleeve sources index
-        let mut sleeve_sources: Vec<Symbol> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SleeveSources(source.sleeve.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut found_sleeve_source = false;
-        for s in sleeve_sources.iter() {
-            if s == source.source_id {
-                found_sleeve_source = true;
-                break;
-            }
+        // Audit O7a: changes to an asset that is already priced, and any change
+        // to an existing source (feeder rotation, looser limits), wait 48 h.
+        // Bootstrapping an unpriced asset takes effect at once: nothing can
+        // consume a price that does not exist yet.
+        let exists = env.storage().instance().has(&DataKey::Source(source.source_id.clone()));
+        if exists || asset_is_priced(&env, &source.asset) {
+            let effective_at = env.ledger().timestamp().saturating_add(SOURCE_CHANGE_DELAY_SECONDS);
+            let id = source.source_id.clone();
+            env.storage().instance().set(&DataKey::PendingSource(id.clone()), &PendingSource { source, effective_at });
+            SourceChangeProposed { source_id: id, effective_at }.publish(&env);
+            return;
         }
-        if !found_sleeve_source {
-            sleeve_sources.push_back(source.source_id.clone());
-            env.storage()
-                .instance()
-                .set(&DataKey::SleeveSources(source.sleeve.clone()), &sleeve_sources);
-        }
-
-        // Asset sources index
-        let mut asset_sources: Vec<Symbol> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AssetSources(source.asset.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut found_asset_source = false;
-        for s in asset_sources.iter() {
-            if s == source.source_id {
-                found_asset_source = true;
-                break;
-            }
-        }
-        if !found_asset_source {
-            asset_sources.push_back(source.source_id.clone());
-            env.storage()
-                .instance()
-                .set(&DataKey::AssetSources(source.asset.clone()), &asset_sources);
-        }
-
-        // Asset sleeve mapping
-        env.storage()
-            .instance()
-            .set(&DataKey::AssetSleeve(source.asset.clone()), &source.sleeve);
-
-        // All assets list
-        let mut all_assets: Vec<Address> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AllAssets)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut found_asset = false;
-        for a in all_assets.iter() {
-            if a == source.asset {
-                found_asset = true;
-                break;
-            }
-        }
-        if !found_asset {
-            all_assets.push_back(source.asset.clone());
-            env.storage().instance().set(&DataKey::AllAssets, &all_assets);
-        }
-
-        latch_deviation_on_write(&env, &source.asset);
-        record_snapshot(&env, &source.asset);
+        apply_source(&env, &source);
     }
 
     fn update_price(
@@ -707,11 +807,6 @@ impl NavOracleTrait for NavOracle {
         liquidity_depth_usd: i128,
         timestamp: u64,
     ) {
-        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
-            Some(a) => a,
-            None => panic_with_error!(&env, OracleError::NotInitialized),
-        };
-        admin.require_auth();
 
         let mut source: OracleSource = match env
             .storage()
@@ -721,6 +816,8 @@ impl NavOracleTrait for NavOracle {
             Some(s) => s,
             None => panic_with_error!(&env, OracleError::AssetNotFound),
         };
+        // Audit O7a: only this source's own feeder may push its price.
+        source.feeder.require_auth();
 
         if price <= 0 {
             panic_with_error!(&env, OracleError::PriceStale);
@@ -1071,6 +1168,47 @@ impl NavOracleTrait for NavOracle {
             .instance()
             .get(&DataKey::SleeveSources(sleeve_id))
             .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn activate_source(env: Env, source_id: Symbol) {
+        let pending: PendingSource = env.storage().instance().get(&DataKey::PendingSource(source_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingSourceChange));
+        if env.ledger().timestamp() < pending.effective_at {
+            panic_with_error!(&env, OracleError::SourceChangeNotReady);
+        }
+        env.storage().instance().remove(&DataKey::PendingSource(source_id.clone()));
+        let mut source = pending.source;
+        // An existing source keeps its current price data: registration may
+        // change configuration (feeder, limits, active flag), never a price.
+        if let Some(current) = env.storage().instance().get::<_, OracleSource>(&DataKey::Source(source_id.clone())) {
+            source.price = current.price;
+            source.timestamp = current.timestamp;
+            source.current_liquidity_depth_usd = current.current_liquidity_depth_usd;
+        }
+        let feeder = source.feeder.clone();
+        apply_source(&env, &source);
+        SourceActivated { source_id, feeder }.publish(&env);
+    }
+
+    fn cancel_source_change(env: Env, source_id: Symbol) {
+        admin_of(&env).require_auth();
+        let pending: PendingSource = env.storage().instance().get(&DataKey::PendingSource(source_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingSourceChange));
+        env.storage().instance().remove(&DataKey::PendingSource(source_id.clone()));
+        SourceChangeCancelled { source_id, effective_at: pending.effective_at }.publish(&env);
+    }
+
+    fn deactivate_source(env: Env, source_id: Symbol) {
+        admin_of(&env).require_auth();
+        let mut source: OracleSource = env.storage().instance().get(&DataKey::Source(source_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, OracleError::AssetNotFound));
+        source.is_active = false;
+        env.storage().instance().set(&DataKey::Source(source_id.clone()), &source);
+        SourceDeactivated { source_id, timestamp: env.ledger().timestamp() }.publish(&env);
+    }
+
+    fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource> {
+        env.storage().instance().get(&DataKey::PendingSource(source_id))
     }
 
     fn get_sources(env: Env) -> Vec<OracleSource> {

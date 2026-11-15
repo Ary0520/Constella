@@ -329,6 +329,8 @@ pub struct OracleSource {
     pub min_liquidity_depth_usd: i128,
     pub current_liquidity_depth_usd: i128,
     pub is_active: bool,
+    /// Mirror of the oracle's OracleSource (audit O7a): the source's feeder.
+    pub feeder: Address,
 }
 
 #[derive(Clone, Debug, PartialEq)]

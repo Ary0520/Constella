@@ -63,6 +63,22 @@ fn create_source(
     }
 }
 
+/// Audit O7a: a source added to (or changed on) an already-priced asset waits
+/// SOURCE_CHANGE_DELAY_SECONDS. This mirrors production: wait out the delay,
+/// activate `ids`, then every feeder of `asset` refreshes its price at the new
+/// time (a newly activated source counts only once its feeder has pushed).
+fn settle(env: &Env, client: &NavOracleClient, asset: &Address, ids: &[&str]) {
+    env.mock_all_auths();
+    let t = env.ledger().timestamp() + SOURCE_CHANGE_DELAY_SECONDS;
+    env.ledger().set_timestamp(t);
+    for id in ids {
+        client.activate_source(&Symbol::new(env, id));
+    }
+    for src in client.get_sources().iter().filter(|s| s.asset == *asset) {
+        client.update_price(&src.source_id, &src.price, &src.current_liquidity_depth_usd, &t);
+    }
+}
+
 #[test]
 fn test_t33_dual_nav_and_pricing_invariant() {
     let env = Env::default();
@@ -81,7 +97,8 @@ fn test_t33_dual_nav_and_pricing_invariant() {
 
     client.register_source(&s1);
     client.register_source(&s2);
-    client.register_source(&s3);
+    client.register_source(&s3); // asset already priced by s1+s2: waits 48h (O7a)
+    settle(&env, &client, &benji_asset, &["REDSTONE_BENJI"]);
 
     let collateral_nav = client.get_collateral_nav(&sleeve).expect("collateral nav should exist");
     let deposit_nav = client.get_deposit_nav(&sleeve).expect("deposit nav should exist");
@@ -118,16 +135,19 @@ fn test_t34_thin_liquidity_depth_exclusion() {
 
     client.register_source(&s1);
     client.register_source(&s2);
-    client.register_source(&s3);
+    client.register_source(&s3); // waits 48h (O7a)
+    settle(&env, &client, &benji_asset, &["MANIPULATED_SDEX"]);
 
     // The thin feed is completely ignored. NAV is computed only from s1 and s2.
     let collateral_nav = client.get_collateral_nav(&sleeve).expect("nav should succeed");
     assert_eq!(collateral_nav.price, 1_000_000);
     assert_eq!(collateral_nav.source, Symbol::new(&env, "BENJI_NAV"));
 
-    // If s2 is also thin, leaving only 1 valid deep feed:
-    let s2_thin = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 40_000, 1000);
-    client.register_source(&s2_thin);
+    // If s2's feeder reports thin depth, only 1 valid deep feed remains.
+    // (O7a: depth is reported by the feeder; re-registering a source can no
+    // longer change its price data.)
+    let now = env.ledger().timestamp();
+    client.update_price(&Symbol::new(&env, "REFLECTOR_BENJI"), &1_010_000, &40_000, &now);
 
     // Only 1 valid deep feed remains (< min_valid_sources 2), hard stop triggers!
     assert!(client.get_collateral_nav(&sleeve).is_none());
@@ -193,9 +213,10 @@ fn test_t36_hard_stop_on_insufficient_sources() {
     // Still only 1 active valid source -> returns None
     assert!(client.get_collateral_nav(&sleeve).is_none());
 
-    // Activate second source
+    // Activate second source: a change to an existing source waits 48h (O7a)
     s2.is_active = true;
     client.register_source(&s2);
+    settle(&env, &client, &benji_asset, &["REFLECTOR_BENJI"]);
 
     // Now 2 valid sources -> returns valid NAV
     assert!(client.get_collateral_nav(&sleeve).is_some());
@@ -515,10 +536,12 @@ fn test_thin_feed_cannot_poison_lastprice() {
 
     // YieldBlox exploit attempt: A thin market feed ($107.00, but only $50k depth < $100k min)
     let s3_thin = create_source(&env, "MANIPULATED_SDEX", &benji_asset, "USD_GOV_FUNDS", 107_000_000, 50_000, 1000);
-    client.register_source(&s3_thin);
+    client.register_source(&s3_thin); // waits 48h (O7a)
+    settle(&env, &client, &benji_asset, &["MANIPULATED_SDEX"]);
 
     // Also update a thin source via update_price
-    client.update_price(&Symbol::new(&env, "MANIPULATED_SDEX"), &108_000_000, &40_000, &1000);
+    let now = env.ledger().timestamp();
+    client.update_price(&Symbol::new(&env, "MANIPULATED_SDEX"), &108_000_000, &40_000, &now);
 
     // CRITICAL SECURITY ASSERTION: lastprice MUST NOT be poisoned by thin feeds!
     let lp = client.lastprice(&benji).expect("lastprice returns the valid conservative price");
@@ -844,11 +867,15 @@ mod o4 {
     }
 
     #[test]
-    fn registering_a_deviating_source_latches_pause() {
+    fn a_deviating_new_source_latches_pause_on_its_first_feed() {
+        // O7a: a new source for a priced asset waits 48h, then counts once its
+        // feeder pushes; that write latches the deviation (O4).
         let env = Env::default();
         let (client, _admin, sleeve) = two_feed_sleeve(&env);
         let asset = client.get_source(&Symbol::new(&env, "NAV")).unwrap().asset;
         client.register_source(&create_source(&env, "THIRD", &asset, "USD_GOV_FUNDS", 1_050_000, 200_000, 1000));
+        assert!(!client.is_sleeve_paused(&sleeve), "pending source has no effect");
+        settle(&env, &client, &asset, &["THIRD"]);
         assert_eq!(deviation_event_bps(&env, &sleeve), Some(500));
         assert!(client.is_sleeve_paused(&sleeve));
     }
@@ -1522,6 +1549,23 @@ mod o7a {
         f.client.activate_source(&Symbol::new(&env, "NAV"));
         assert!(push(&f, &rotated.feeder, "NAV", 1_001_000));
         assert!(!push(&f, &f.nav.feeder, "NAV", 1_001_000), "old feeder revoked");
+    }
+
+    #[test]
+    fn re_registering_a_source_can_never_set_its_price() {
+        // Registration carries price fields; letting them through would give
+        // the admin a price-writing path. Only the feeder sets prices.
+        let env = Env::default();
+        let f = feed(&env);
+        let mut forged = f.nav.clone();
+        forged.price = 9_999_999;
+        forged.current_liquidity_depth_usd = 9_000_000;
+        only(&f, &f.admin, "register_source", (forged.clone(),).into_val(&env));
+        f.client.register_source(&forged);
+        env.ledger().set_timestamp(T0 + DELAY);
+        f.client.activate_source(&Symbol::new(&env, "NAV"));
+        let after = f.client.get_source(&Symbol::new(&env, "NAV")).unwrap();
+        assert_eq!((after.price, after.current_liquidity_depth_usd, after.timestamp), (1_000_000, 200_000, T0));
     }
 
     #[test]
