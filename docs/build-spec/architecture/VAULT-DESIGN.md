@@ -80,6 +80,8 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 | Large exits | Queued redemption; where issuer allows, redemption in kind |
 | Collateral liquidations | Liquidator draws from liquidity sleeve; policy contract validates |
 
+**Valuation rule (audit V4, 15 Nov 2026):** every valuation — deposit NAV, conservative NAV, `total_assets`, redemption capacity, risk sheet — uses one function. Cash counts at face value; an empty sleeve counts as 0; a funded non-cash sleeve must have a valid oracle price or the call fails with `OracleUnavailable`. There is never a par (1.0) fallback.
+
 **Rule:** The policy contract MUST enforce the liquidity floor at all times. Any rebalance that would bring the liquidity sleeve below the floor is rejected.
 
 ---
