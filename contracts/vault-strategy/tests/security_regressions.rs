@@ -9,7 +9,7 @@
 extern crate std;
 
 use constella_nav_oracle::{NavOracle, NavOracleClient, OracleSource};
-use constella_policy::{PolicyContract, PolicyContractClient};
+use constella_policy::{PolicyContract, PolicyContractClient, SleeveTarget};
 use constella_registry::{AssetEntry, AssetRegistry, AssetRegistryClient, SleeveType as RegSleeve};
 use constella_vault_strategy::{SleeveState, SleeveType, StrategyVault, StrategyVaultClient, VaultConfig};
 use soroban_sdk::{
@@ -29,6 +29,8 @@ struct Stack<'a> {
     treasury: Address,
     admin: Address,
     usdc_addr: Address,
+    policy: PolicyContractClient<'a>,
+    registry_id: Address,
 }
 
 fn oracle_source(env: &Env, id: &str, asset: &Address, price: i128) -> OracleSource {
@@ -78,7 +80,8 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
     });
 
     let policy_id = env.register(PolicyContract, ());
-    PolicyContractClient::new(&env, &policy_id).initialize(&admin);
+    let policy = PolicyContractClient::new(&env, &policy_id);
+    policy.initialize(&admin);
 
     let oracle_id = env.register(NavOracle, ());
     let oracle = NavOracleClient::new(&env, &oracle_id);
@@ -98,7 +101,7 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
             numeraire: usdc_addr.clone(),
             policy_contract: policy_id,
             oracle_contract: oracle_id,
-            registry_contract: registry_id,
+            registry_contract: registry_id.clone(),
             treasury: treasury.clone(),
             management_fee_bps: 0,
         },
@@ -116,6 +119,8 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
         treasury,
         admin,
         usdc_addr,
+        policy,
+        registry_id,
     }
 }
 
@@ -229,4 +234,49 @@ fn v2_admin_cannot_inject_sleeve_balance_to_drain_depositors() {
     assert!(admin_gain <= ONE, "admin extracted {admin_gain} after depositing {ONE}");
     let alice_out = s.vault.redeem(&s.vault.balance(&alice), &alice, &alice);
     assert_eq!(alice_out, 1000 * ONE);
+}
+
+// ---------------------------------------------------------------------------
+// P3 — the "signed" policy could be registered and replaced by the protocol
+// admin alone; the user never signed. AGENT-RULES Rule 5 / THESIS-ENGINE
+// Step 6: only the policy owner (user / treasury multisig) may sign or amend.
+// ---------------------------------------------------------------------------
+fn cash_only_targets(env: &Env) -> Vec<SleeveTarget> {
+    Vec::from_array(env, [SleeveTarget {
+        asset_id: Symbol::new(env, "USDC"),
+        target_weight_bps: 10_000,
+        min_band_bps: 9_000,
+        max_band_bps: 10_000,
+        sleeve_type: Symbol::new(env, "cash"),
+    }])
+}
+
+#[test]
+fn p3_admin_alone_cannot_replace_a_signed_policy() {
+    let s = deploy_stack();
+    let signed_hash = soroban_sdk::BytesN::from_array(&s.env, &[0x51; 32]);
+    let forged_hash = soroban_sdk::BytesN::from_array(&s.env, &[0xBA; 32]);
+    let empty: Vec<SleeveTarget> = Vec::new(&s.env);
+
+    s.env.mock_all_auths(); // setup: policy exists for the vault
+    s.policy.register_policy(
+        &s.vault_id, &signed_hash, &s.registry_id,
+        &1000, &10_000, &10_000, &50, &500, &cash_only_targets(&s.env),
+    );
+
+    // Attack: ONLY the protocol admin authorizes a replacement that wipes all bands.
+    s.env.mock_auths(&[MockAuth {
+        address: &s.admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.policy.address,
+            fn_name: "update_policy",
+            args: (s.vault_id.clone(), forged_hash.clone(), empty.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = s.policy.try_update_policy(&s.vault_id, &forged_hash, &empty);
+
+    assert!(res.is_err(), "admin alone must not be able to amend a signed policy");
+    assert_eq!(s.policy.get_policy_hash(&s.vault_id), signed_hash);
+    assert_eq!(s.policy.get_sleeve_targets(&s.vault_id).len(), 1);
 }
