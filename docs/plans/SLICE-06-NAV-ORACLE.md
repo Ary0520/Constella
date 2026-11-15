@@ -15,7 +15,7 @@ Implement and verify the on-chain NAV Oracle contract in Soroban Rust:
    - **Rule 3 (Dual NAV):**
      - `collateral_nav` = **Minimum** of valid sources (conservative lender collateral sizing).
      - `deposit_nav` = **Median** of valid sources (equitable share minting/redemption).
-   - **Rule 4 (Circuit Breaker):** Automated sleeve pause if valid sources diverge by > 2%–3% (`deviation_threshold_bps`). Emits `NAV_PAUSE`.
+   - **Rule 4 (Circuit Breaker):** Automated sleeve pause if valid sources diverge by > 2%–3% (`deviation_threshold_bps`). Emits `NAV_PAUSE`. Latched on price writes (`update_price` / `register_source`) so it cannot be rolled back by a reverting reader (audit O4).
    - **Rule 5 (Hard Stop & Staleness):** Feeds exceeding `staleness_limit_seconds` are invalid; if fewer than 2 valid sources remain, trigger hard stop on the sleeve.
 2. **SEP-40 Interface Compliance:** Full compatibility with Stellar's oracle standard (`price`, `lastprice`, `base`, `decimals`, `resolution`, `assets`) for direct lending integration on Blend and Liqvid.
 3. **Per-Sleeve Isolation:** An issue or pause on one sleeve never halts or corrupts unaffected sleeves.
