@@ -4,7 +4,8 @@ use super::*;
 use p256::ecdsa::{signature::hazmat::PrehashSigner, Signature, SigningKey, VerifyingKey};
 use soroban_sdk::{
     auth::Context,
-    vec, Bytes, BytesN, Env, IntoVal, String, Vec,
+    testutils::{Address as _, Ledger as _},
+    vec, Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 struct KeyPair {
@@ -437,4 +438,161 @@ fn test_t51_signer_rotation_and_safety() {
         name: String::from_str(&env, "Zero Weight"),
     });
     assert_eq!(zero_weight_res, Err(Ok(AccError::InvalidSignerWeight)));
+}
+
+#[test]
+fn test_t55_sponsored_passkey_vault_deposit() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_000_000);
+    env.ledger().set_sequence_number(100);
+
+    let admin = Address::generate(&env);
+    let pause_authority = Address::generate(&env);
+    let treasury = Address::generate(&env);
+
+    // 1. Deploy Numéraire (USDC)
+    let token_admin = Address::generate(&env);
+    let numeraire_sac = env.register_stellar_asset_contract_v2(token_admin);
+    let numeraire_address = numeraire_sac.address();
+    let numeraire_admin = soroban_sdk::token::StellarAssetClient::new(&env, &numeraire_address);
+    let numeraire_client = soroban_sdk::token::Client::new(&env, &numeraire_address);
+
+    // 2. Deploy Registry
+    let registry_id = env.register(constella_registry::AssetRegistry, ());
+    let registry_client = constella_registry::AssetRegistryClient::new(&env, &registry_id);
+    registry_client.initialize(&admin);
+
+    let mut usdc_sources = Vec::new(&env);
+    usdc_sources.push_back(Symbol::new(&env, "USDC_SRC"));
+    registry_client.add_asset(&constella_registry::AssetEntry {
+        contract_address: numeraire_address.clone(),
+        asset_id: Symbol::new(&env, "USDC"),
+        sleeve_type: constella_registry::SleeveType::Cash,
+        liquidity_tier: 0,
+        permissionless: true,
+        oracle_sources: usdc_sources,
+        eligible_jurisdictions: Vec::new(&env),
+        blocked_jurisdictions: Vec::new(&env),
+        investor_classes_required: Vec::new(&env),
+        is_active: true,
+        added_at: 1_000_000,
+    });
+
+    // 3. Deploy Policy
+    let policy_id = env.register(constella_policy::PolicyContract, ());
+    let policy_client = constella_policy::PolicyContractClient::new(&env, &policy_id);
+    policy_client.initialize(&admin);
+
+    // 4. Deploy Oracle
+    let oracle_id = env.register(constella_nav_oracle::NavOracle, ());
+    let oracle_client = constella_nav_oracle::NavOracleClient::new(&env, &oracle_id);
+    oracle_client.initialize(&admin, &numeraire_address, &7, &300);
+
+    let sleeve_sym = Symbol::new(&env, "VAULT");
+    oracle_client.configure_sleeve(&sleeve_sym, &300, &2);
+    let dummy_asset = Address::generate(&env);
+    let s1 = constella_nav_oracle::OracleSource {
+        source_id: Symbol::new(&env, "MEDIAN_SRC"),
+        asset: dummy_asset.clone(),
+        sleeve: sleeve_sym.clone(),
+        price: 10_000_000,
+        timestamp: 1_000_000,
+        staleness_limit_seconds: 14400,
+        min_liquidity_depth_usd: 100_000,
+        current_liquidity_depth_usd: 200_000,
+        is_active: true,
+    };
+    let s2 = constella_nav_oracle::OracleSource {
+        source_id: Symbol::new(&env, "CONS_SRC"),
+        asset: dummy_asset.clone(),
+        sleeve: sleeve_sym.clone(),
+        price: 9_900_000,
+        timestamp: 1_000_000,
+        staleness_limit_seconds: 14400,
+        min_liquidity_depth_usd: 100_000,
+        current_liquidity_depth_usd: 200_000,
+        is_active: true,
+    };
+    let s3 = constella_nav_oracle::OracleSource {
+        source_id: Symbol::new(&env, "HIGH_SRC"),
+        asset: dummy_asset.clone(),
+        sleeve: sleeve_sym.clone(),
+        price: 10_100_000,
+        timestamp: 1_000_000,
+        staleness_limit_seconds: 14400,
+        min_liquidity_depth_usd: 100_000,
+        current_liquidity_depth_usd: 200_000,
+        is_active: true,
+    };
+    oracle_client.register_source(&s1);
+    oracle_client.register_source(&s2);
+    oracle_client.register_source(&s3);
+
+    // 5. Deploy Strategy Vault
+    let vault_id = env.register(constella_vault_strategy::StrategyVault, ());
+    let vault_client = constella_vault_strategy::StrategyVaultClient::new(&env, &vault_id);
+    let vault_config = constella_vault_strategy::VaultConfig {
+        admin: admin.clone(),
+        pause_authority: pause_authority.clone(),
+        numeraire: numeraire_address.clone(),
+        policy_contract: policy_id.clone(),
+        oracle_contract: oracle_id.clone(),
+        registry_contract: registry_id.clone(),
+        treasury: treasury.clone(),
+        management_fee_bps: 100,
+    };
+    vault_client.initialize(
+        &vault_config,
+        &String::from_str(&env, "Constella Strategy Vault"),
+        &String::from_str(&env, "CONST"),
+        &7,
+    );
+
+    // 6. Deploy Fee Sponsor Engine
+    let sponsor_id = env.register(constella_fee_sponsor::FeeSponsorContract, ());
+    let sponsor_client = constella_fee_sponsor::FeeSponsorContractClient::new(&env, &sponsor_id);
+    sponsor_client.initialize(&admin, &10, &50, &500_000);
+    // Whitelist vault for zero-gas sponsorship
+    sponsor_client.whitelist_contract(&vault_id);
+
+    // 7. Deploy & Initialize User Passkey Smart Account
+    let user_account_id = env.register(SmartAccountContract, ());
+    let smart_account_client = SmartAccountContractClient::new(&env, &user_account_id);
+    let user_passkey = generate_keypair(&env);
+    smart_account_client.initialize(
+        &user_passkey.public_key_bytes,
+        &1,
+        &String::from_str(&env, "Bob iPhone Passkey"),
+    );
+
+    // Mint USDC deposit funds to the user smart account (e.g. 1000 USDC)
+    numeraire_admin.mint(&user_account_id, &1000_0000000);
+    assert_eq!(numeraire_client.balance(&user_account_id), 1000_0000000);
+
+    // Zero XLM user flow:
+    // A) Sponsor verifies transaction eligibility before signing fee-bump
+    let fee_bid_stroops = 10_000; // 0.001 XLM gas
+    let sponsor_val = sponsor_client.try_validate_sponsorship(&user_account_id, &vault_id, &fee_bid_stroops);
+    assert_eq!(sponsor_val, Ok(Ok(())));
+
+    // B) User executes deposit of 500 USDC into Strategy Vault via smart account
+    let shares_minted = vault_client.deposit(&500_0000000, &user_account_id);
+    assert_eq!(shares_minted, 500_0000000);
+
+    // C) Sponsor records the sponsored transaction
+    sponsor_client.record_sponsored_op(&user_account_id, &vault_id, &fee_bid_stroops);
+
+    // D) Verification of balances & zero-gas sponsorship accounting
+    // Smart account holds 500 vault shares
+    assert_eq!(vault_client.balance(&user_account_id), 500_0000000);
+    // Smart account still has remaining 500 USDC
+    assert_eq!(numeraire_client.balance(&user_account_id), 500_0000000);
+    // User paid 0 XLM for gas; Fee Sponsor tracked the operation & budget
+    let user_stats = sponsor_client.get_user_stats(&user_account_id);
+    assert_eq!(user_stats.hourly_ops, 1);
+    assert_eq!(user_stats.daily_ops, 1);
+    let global_stats = sponsor_client.get_global_stats();
+    assert_eq!(global_stats.total_ops_today, 1);
+    assert_eq!(global_stats.total_fees_today_stroops, fee_bid_stroops);
 }
