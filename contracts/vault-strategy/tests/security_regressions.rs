@@ -465,3 +465,24 @@ fn o2_future_dated_price_is_rejected_and_cannot_dodge_staleness() {
     assert!(s.oracle.get_deposit_nav(&vault_sleeve).is_none(), "stale feeds must not price the vault");
     assert!(s.oracle.get_collateral_nav(&vault_sleeve).is_none());
 }
+
+// ---------------------------------------------------------------------------
+// O3 — a sleeve could be configured with min_valid_sources = 1, so a single
+// thin feed (the YieldBlox pattern: $1 -> $107) could price the vault.
+// NAV-ORACLE Rule 5 / AGENT-RULES Rule 3: fewer than 2 valid sources = hard stop.
+// ---------------------------------------------------------------------------
+#[test]
+fn o3_single_source_configuration_is_refused() {
+    let s = deploy_stack();
+    let xlm_sleeve = Symbol::new(&s.env, "XLM");
+    let res = s.oracle.try_configure_sleeve(&xlm_sleeve, &200, &1);
+    assert!(res.is_err(), "min_valid_sources = 1 must be refused");
+
+    // Even with only one feed registered, that feed alone can never price.
+    let asset = Address::generate(&s.env);
+    let mut src = oracle_source(&s.env, "ONLY_FEED", &asset, 107 * ONE);
+    src.sleeve = xlm_sleeve.clone();
+    s.oracle.register_source(&src);
+    assert!(s.oracle.price(&asset).is_none(), "a single source must not produce a price");
+    assert!(s.oracle.get_collateral_nav(&xlm_sleeve).is_none());
+}
