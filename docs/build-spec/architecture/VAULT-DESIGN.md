@@ -177,6 +177,8 @@ Can liquidity sleeve cover it?
 
 ## Upgrade Strategy
 
+**Timelock (audit W3, 15 Nov 2026):** upgrades are two-step on-chain — `propose_upgrade(hash)` then, no earlier than 48h later, `execute_upgrade()` — so the public notice below is enforced by the contract, not just process. `cancel_upgrade()` drops a proposal.
+
 Using Adapter (Protocol 28, CAP-85):
 - All vault instances share one WASM binary
 - Upgrade is atomic across the fleet — one transaction upgrades all shared-code vaults
