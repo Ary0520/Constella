@@ -234,8 +234,11 @@ fn get_sources(env: Env) -> Vec<OracleSource>
 fn is_halted(env: Env) -> bool
 fn is_sleeve_paused(env: Env, sleeve_id: String) -> bool
 fn update_source(env: Env, source_id: String, price: i128, timestamp: u64)  // oracle feeds only
-fn trigger_circuit_breaker(env: Env, sleeve_id: String, reason: CircuitBreakerReason)
-fn clear_circuit_breaker(env: Env, sleeve_id: String)  // admin only
+// caller must sign AND be the pause authority or the admin (audit O1)
+fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol)
+fn clear_circuit_breaker(env: Env, sleeve_id: Symbol)  // admin (multisig) only
+fn set_pause_authority(env: Env, new_authority: Address)  // admin only; defaults to admin
+fn get_pause_authority(env: Env) -> Address
 ```
 
 **PriceData struct:**
