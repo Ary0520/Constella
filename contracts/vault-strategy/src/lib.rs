@@ -332,14 +332,14 @@ fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
     for sleeve in sleeves.iter() {
         has_sleeves = true;
         if sleeve.sleeve_type == SleeveType::CashStable {
-            total_value = total_value.checked_add(sleeve.current_balance)?;
+            total_value = total_value.checked_add(sleeve_holdings(env, &sleeve))?;
         } else {
             let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
             let pd = oracle.get_deposit_nav(&sym)?;
             if pd.timestamp > latest_ts {
                 latest_ts = pd.timestamp;
             }
-            let val = sleeve.current_balance.checked_mul(pd.price)? / scale;
+            let val = sleeve_holdings(env, &sleeve).checked_mul(pd.price)? / scale;
             total_value = total_value.checked_add(val)?;
         }
     }
@@ -387,14 +387,14 @@ fn compute_conservative_nav(env: &Env, config: &VaultConfig) -> Option<PriceData
     for sleeve in sleeves.iter() {
         has_sleeves = true;
         if sleeve.sleeve_type == SleeveType::CashStable {
-            total_value = total_value.checked_add(sleeve.current_balance)?;
+            total_value = total_value.checked_add(sleeve_holdings(env, &sleeve))?;
         } else {
             let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
             let pd = oracle.get_collateral_nav(&sym)?;
             if pd.timestamp > latest_ts {
                 latest_ts = pd.timestamp;
             }
-            let val = sleeve.current_balance.checked_mul(pd.price)? / scale;
+            let val = sleeve_holdings(env, &sleeve).checked_mul(pd.price)? / scale;
             total_value = total_value.checked_add(val)?;
         }
     }
@@ -412,6 +412,27 @@ fn compute_conservative_nav(env: &Env, config: &VaultConfig) -> Option<PriceData
             timestamp: latest_ts,
             source: Symbol::new(env, "CONSERVATIVE_NAV"),
         })
+    }
+}
+
+/// Tokens of `asset` actually held by this vault right now.
+fn real_balance(env: &Env, asset: &Address) -> i128 {
+    token::Client::new(env, asset).balance(&env.current_contract_address())
+}
+
+/// Holdings used for every valuation: min(recorded, actually held).
+///
+/// Audit V2: recorded balances change only through value-moving flows
+/// (deposit / mint / redeem / withdraw, and future policy-validated
+/// rebalances). Capping by the real token balance means an issuer clawback or
+/// freeze-and-burn lowers NAV immediately, while unsolicited transfers into the
+/// vault never raise it (no donation-based share-price manipulation).
+fn sleeve_holdings(env: &Env, sleeve: &SleeveState) -> i128 {
+    let held = real_balance(env, &sleeve.contract_address);
+    if held < sleeve.current_balance {
+        held
+    } else {
+        sleeve.current_balance
     }
 }
 
@@ -464,7 +485,7 @@ fn get_cash_sleeve_balance(env: &Env) -> i128 {
         .unwrap_or_else(|| Vec::new(env));
     for s in sleeves.iter() {
         if s.sleeve_type == SleeveType::CashStable {
-            return s.current_balance;
+            return sleeve_holdings(env, &s);
         }
     }
     0
@@ -879,7 +900,7 @@ impl StrategyVault {
 
         for sleeve in sleeves.iter() {
             if sleeve.sleeve_type == SleeveType::CashStable {
-                total = match total.checked_add(sleeve.current_balance) {
+                total = match total.checked_add(sleeve_holdings(&env, &sleeve)) {
                     Some(v) => v,
                     None => panic_with_error!(&env, VaultError::MathOverflow),
                 };
@@ -890,7 +911,7 @@ impl StrategyVault {
                 } else {
                     scale
                 };
-                let val = match sleeve.current_balance.checked_mul(price) {
+                let val = match sleeve_holdings(&env, &sleeve).checked_mul(price) {
                     Some(product) => product / scale,
                     None => panic_with_error!(&env, VaultError::MathOverflow),
                 };
@@ -1176,10 +1197,11 @@ impl StrategyVault {
             } else {
                 scale
             };
-            let value = (sleeve.current_balance * price) / scale;
+            let held = sleeve_holdings(&env, &sleeve);
+            let value = (held * price) / scale;
 
             if sleeve.sleeve_type == SleeveType::CashStable {
-                cash_balance += sleeve.current_balance;
+                cash_balance += held;
             } else {
                 match sleeve.liquidity_tier {
                     0 | 1 => in_24h += value,
@@ -1234,7 +1256,7 @@ impl StrategyVault {
                         scale
                     }
                 };
-                let val = (sleeve.current_balance * price) / scale;
+                let val = (sleeve_holdings(&env, &sleeve) * price) / scale;
                 total_val_hours += val * tier_hours;
             }
             weighted_hours = (total_val_hours / total_a) as u64;
@@ -1367,30 +1389,76 @@ impl StrategyVault {
             .unwrap_or_else(|| Vec::new(&env))
     }
 
+    /// Replace the sleeve layout (targets, bands, tiers). Admin only.
+    ///
+    /// Audit V2: `current_balance` is NOT settable. Each entry must carry the
+    /// balance the vault has already recorded for that asset (0 for a new
+    /// sleeve); any other value is rejected with `BalanceNotSettable`. A sleeve
+    /// whose asset the vault still holds (recorded or real) cannot be removed.
     pub fn set_sleeves(env: Env, sleeves: Vec<SleeveState>) {
         let config = get_config(&env);
         config.admin.require_auth();
 
-        let mut sum_weights = 0u32;
-        let mut has_cash = false;
+        let existing: Vec<SleeveState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Sleeves)
+            .unwrap_or_else(|| Vec::new(&env));
         let registry = AssetRegistryClient::new(&env, &config.registry_contract);
 
-        for s in sleeves.iter() {
-            if s.liquidity_tier > 3 || s.band_bps > 10000 {
+        let mut sum_weights = 0u32;
+        let mut cash_count = 0u32;
+        for i in 0..sleeves.len() {
+            let s = sleeves.get(i).unwrap();
+            if s.liquidity_tier > 3 || s.band_bps > 10000 || s.target_weight_bps > 10000 {
                 panic_with_error!(&env, VaultError::InvalidBps);
             }
-            sum_weights = sum_weights.saturating_add(s.target_weight_bps);
-            if s.sleeve_type == SleeveType::CashStable {
-                has_cash = true;
-            } else {
-                if !registry.is_registered(&s.contract_address) {
-                    panic_with_error!(&env, VaultError::AssetNotRegistered);
+            for j in (i + 1)..sleeves.len() {
+                if sleeves.get(j).unwrap().contract_address == s.contract_address {
+                    panic_with_error!(&env, VaultError::InvalidSleeveConfig);
                 }
             }
+            if s.sleeve_type == SleeveType::CashStable {
+                cash_count += 1;
+                if s.contract_address != config.numeraire {
+                    panic_with_error!(&env, VaultError::InvalidSleeveConfig);
+                }
+            } else if !registry.is_registered(&s.contract_address) {
+                panic_with_error!(&env, VaultError::AssetNotRegistered);
+            }
+
+            let mut recorded = 0i128;
+            for e in existing.iter() {
+                if e.contract_address == s.contract_address {
+                    recorded = e.current_balance;
+                    break;
+                }
+            }
+            if s.current_balance != recorded {
+                panic_with_error!(&env, VaultError::BalanceNotSettable);
+            }
+            sum_weights = sum_weights.saturating_add(s.target_weight_bps);
         }
 
-        if sum_weights != 10000 || !has_cash {
+        if cash_count != 1 {
+            panic_with_error!(&env, VaultError::InvalidSleeveConfig);
+        }
+        if sum_weights != 10000 {
             panic_with_error!(&env, VaultError::InvalidBps);
+        }
+
+        // No removal of a sleeve whose asset the vault still holds.
+        for e in existing.iter() {
+            let mut kept = false;
+            for s in sleeves.iter() {
+                if s.contract_address == e.contract_address {
+                    kept = true;
+                    break;
+                }
+            }
+            if !kept && (e.current_balance != 0 || real_balance(&env, &e.contract_address) != 0) {
+                panic_with_error!(&env, VaultError::SleeveHasHoldings);
+            }
         }
 
         env.storage().instance().set(&DataKey::Sleeves, &sleeves);
@@ -1398,38 +1466,6 @@ impl StrategyVault {
             (Symbol::new(&env, "sleeves_updated"), config.admin),
             sleeves.len(),
         );
-    }
-
-    pub fn update_sleeve_balance(env: Env, contract_address: Address, new_balance: i128) {
-        let config = get_config(&env);
-        config.admin.require_auth();
-
-        if new_balance < 0 {
-            panic_with_error!(&env, VaultError::ZeroAmount);
-        }
-
-        let mut sleeves: Vec<SleeveState> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Sleeves)
-            .unwrap_or_else(|| Vec::new(&env));
-        let mut found = false;
-
-        for i in 0..sleeves.len() {
-            let mut s = sleeves.get(i).unwrap();
-            if s.contract_address == contract_address {
-                s.current_balance = new_balance;
-                sleeves.set(i, s);
-                found = true;
-                break;
-            }
-        }
-
-        if !found {
-            panic_with_error!(&env, VaultError::SleeveNotFound);
-        }
-
-        env.storage().instance().set(&DataKey::Sleeves, &sleeves);
     }
 
     pub fn get_config(env: Env) -> VaultConfig {
