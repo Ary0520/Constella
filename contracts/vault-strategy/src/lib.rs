@@ -199,9 +199,33 @@ pub struct PolicyConfigRef {
     pub terms_hash: BytesN<32>,
 }
 
+/// Mirror of `constella_policy::SleeveTarget` (decoupled to avoid WASM symbol clashes).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq)]
+pub struct PolicySleeveTargetRef {
+    pub asset_id: Symbol,
+    pub target_weight_bps: u32,
+    pub min_band_bps: u32,
+    pub max_band_bps: u32,
+    pub sleeve_type: Symbol,
+}
+
 #[contractclient(name = "PolicyClient")]
 pub trait PolicyInterface {
     fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfigRef>;
+    fn register_policy(
+        env: Env,
+        vault: Address,
+        owner: Address,
+        policy_hash: BytesN<32>,
+        registry_address: Address,
+        min_liquidity_sleeve_bps: u32,
+        max_single_asset_bps: u32,
+        max_issuer_bps: u32,
+        max_slippage_bps: u32,
+        rebalance_band_bps: u32,
+        sleeves: Vec<PolicySleeveTargetRef>,
+    );
 }
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
@@ -1540,6 +1564,46 @@ impl StrategyVault {
         config.admin.require_auth();
         config.pause_authority = new_pause_authority;
         env.storage().instance().set(&DataKey::Config, &config);
+    }
+
+    /// Bind this vault to the policy its `owner` signed (audit P3).
+    ///
+    /// Requires the vault admin (who chooses which owner governs the vault)
+    /// AND the policy owner, whose signature on `register_policy` covers the
+    /// policy hash and every enforced term. The vault's own consent is given by
+    /// it being the invoker. Registration is one-time in the policy contract;
+    /// later amendments are signed by the owner directly on the policy contract.
+    pub fn bind_policy(
+        env: Env,
+        owner: Address,
+        policy_hash: BytesN<32>,
+        min_liquidity_sleeve_bps: u32,
+        max_single_asset_bps: u32,
+        max_issuer_bps: u32,
+        max_slippage_bps: u32,
+        rebalance_band_bps: u32,
+        sleeves: Vec<PolicySleeveTargetRef>,
+    ) {
+        let config = get_config(&env);
+        config.admin.require_auth();
+
+        PolicyClient::new(&env, &config.policy_contract).register_policy(
+            &env.current_contract_address(),
+            &owner,
+            &policy_hash,
+            &config.registry_contract,
+            &min_liquidity_sleeve_bps,
+            &max_single_asset_bps,
+            &max_issuer_bps,
+            &max_slippage_bps,
+            &rebalance_band_bps,
+            &sleeves,
+        );
+
+        env.events().publish(
+            (Symbol::new(&env, "POLICY_BOUND"), owner),
+            policy_hash,
+        );
     }
 
     pub fn get_policy_hash(env: Env) -> Option<BytesN<32>> {

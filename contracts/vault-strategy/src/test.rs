@@ -1253,3 +1253,69 @@ fn test_v2_unsolicited_transfers_do_not_move_nav() {
     assert_eq!(ctx.vault_client.total_assets(), 100_0000000);
     assert_eq!(ctx.vault_client.get_nav_deposit().unwrap().price, nav_before);
 }
+
+// -------------------------------------------------------------------------
+// Audit P3 (2026-11-15): the vault binds its policy only with BOTH the vault
+// admin and the policy owner signing; neither can do it alone.
+// -------------------------------------------------------------------------
+mod p3_bind {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::{BytesN, IntoVal};
+
+    fn targets(env: &Env) -> SdkVec<PolicySleeveTargetRef> {
+        let mut v = SdkVec::new(env);
+        v.push_back(PolicySleeveTargetRef {
+            asset_id: Symbol::new(env, "USDC"),
+            target_weight_bps: 10000,
+            min_band_bps: 9000,
+            max_band_bps: 10000,
+            sleeve_type: Symbol::new(env, "cash"),
+        });
+        v
+    }
+
+    fn try_bind(ctx: &TestContext, signers: &[&Address]) -> bool {
+        let hash = BytesN::from_array(&ctx.env, &[0x5A; 32]);
+        let t = targets(&ctx.env);
+        let bind_args = (ctx.policy_owner.clone(), hash.clone(), 1000u32, 10000u32, 10000u32, 50u32, 500u32, t.clone())
+            .into_val(&ctx.env);
+        let reg_args = (
+            ctx.vault_id.clone(), ctx.policy_owner.clone(), hash.clone(), ctx.registry_client.address.clone(),
+            1000u32, 10000u32, 10000u32, 50u32, 500u32, t.clone(),
+        )
+            .into_val(&ctx.env);
+        let bind = MockAuthInvoke { contract: &ctx.vault_id, fn_name: "bind_policy", args: bind_args, sub_invokes: &[] };
+        let reg = MockAuthInvoke { contract: &ctx.policy_client.address, fn_name: "register_policy", args: reg_args, sub_invokes: &[] };
+        let mut auths = std::vec::Vec::new();
+        for s in signers {
+            if **s == ctx.admin {
+                auths.push(MockAuth { address: s, invoke: &bind });
+            } else {
+                auths.push(MockAuth { address: s, invoke: &reg });
+            }
+        }
+        ctx.env.mock_auths(&auths);
+        ctx.vault_client
+            .try_bind_policy(&ctx.policy_owner, &hash, &1000, &10000, &10000, &50, &500, &t)
+            .is_ok()
+    }
+
+    #[test]
+    fn bind_requires_admin_and_owner() {
+        let ctx = setup_test_context();
+        assert!(!try_bind(&ctx, &[&ctx.admin]), "admin alone");
+        assert!(!try_bind(&ctx, &[&ctx.policy_owner]), "owner alone");
+        assert_eq!(ctx.vault_client.get_policy_hash(), None);
+
+        assert!(try_bind(&ctx, &[&ctx.admin, &ctx.policy_owner]));
+        let signers: std::vec::Vec<Address> = ctx.env.auths().iter().map(|a| a.0.clone()).collect();
+        assert!(signers.contains(&ctx.admin) && signers.contains(&ctx.policy_owner));
+
+        assert_eq!(ctx.vault_client.get_policy_hash(), Some(BytesN::from_array(&ctx.env, &[0x5A; 32])));
+        let cfg = ctx.policy_client.get_policy_config(&ctx.vault_id).unwrap();
+        assert_eq!(cfg.owner, ctx.policy_owner);
+        assert_eq!(cfg.registry_address, ctx.registry_client.address);
+    }
+
+}
