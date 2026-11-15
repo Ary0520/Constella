@@ -230,7 +230,7 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
         return 0;
     }
 
-    let numerator = (total_shares as i128)
+    let numerator = total_shares
         .checked_mul(config.management_fee_bps as i128)
         .and_then(|v| v.checked_mul(elapsed as i128));
     let denominator = (10_000i128).checked_mul(SECONDS_PER_YEAR as i128);
@@ -256,7 +256,7 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
 
         if let (Some(den), Some(fee_rate)) = (
             denominator,
-            (total_shares as i128).checked_mul(config.management_fee_bps as i128),
+            total_shares.checked_mul(config.management_fee_bps as i128),
         ) {
             if fee_rate > 0 {
                 let accrued_time = (d_shares * den) / fee_rate;
@@ -315,7 +315,7 @@ fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
             if pd.timestamp > latest_ts {
                 latest_ts = pd.timestamp;
             }
-            let val = (sleeve.current_balance as i128).checked_mul(pd.price)? / scale;
+            let val = sleeve.current_balance.checked_mul(pd.price)? / scale;
             total_value = total_value.checked_add(val)?;
         }
     }
@@ -370,7 +370,7 @@ fn compute_conservative_nav(env: &Env, config: &VaultConfig) -> Option<PriceData
             if pd.timestamp > latest_ts {
                 latest_ts = pd.timestamp;
             }
-            let val = (sleeve.current_balance as i128).checked_mul(pd.price)? / scale;
+            let val = sleeve.current_balance.checked_mul(pd.price)? / scale;
             total_value = total_value.checked_add(val)?;
         }
     }
@@ -1229,9 +1229,7 @@ impl StrategyVault {
         let registry = AssetRegistryClient::new(&env, &config.registry_contract);
 
         for s in sleeves.iter() {
-            sum_weights = sum_weights
-                .checked_add(s.target_weight_bps)
-                .unwrap_or(u32::MAX);
+            sum_weights = sum_weights.saturating_add(s.target_weight_bps);
             if s.sleeve_type == SleeveType::CashStable {
                 has_cash = true;
             } else {
