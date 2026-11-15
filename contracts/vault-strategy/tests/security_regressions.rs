@@ -966,8 +966,6 @@ fn m4_cash_sleeve_is_named_from_the_registry_and_numeraire_must_be_registered() 
 // ever-growing entry loaded on every call, archived after the default TTL.
 // W6 — share token was not SEP-41 complete.
 // ---------------------------------------------------------------------------
-const DAY_LEDGERS: u32 = 17_280;
-
 /// (topics, data) of every event the vault emitted in the last invocation.
 fn vault_events(s: &Stack) -> std::vec::Vec<(std::vec::Vec<soroban_sdk::xdr::ScVal>, soroban_sdk::xdr::ScVal)> {
     use soroban_sdk::testutils::Events as _;
@@ -1004,12 +1002,15 @@ fn w2_share_ledger_is_persistent_per_holder_with_ttl() {
     let alice = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(100 * ONE));
     s.vault.deposit(&(100 * ONE), &alice);
+    // OZ extends a balance entry's TTL whenever it is accessed (a new entry
+    // starts at the network minimum: 4096 ledgers here, ~120 days on mainnet).
+    assert_eq!(s.vault.balance(&alice), 100 * ONE);
 
     s.env.as_contract(&s.vault_id, || {
         let bal_key = FungibleStorageKey::Balance(alice.clone());
         let p = s.env.storage().persistent();
         assert_eq!(p.get::<_, i128>(&bal_key), Some(100 * ONE), "balance must be a persistent per-holder entry");
-        assert!(p.get_ttl(&bal_key) >= BALANCE_TTL_THRESHOLD, "balance TTL not extended");
+        assert!(p.get_ttl(&bal_key) >= BALANCE_TTL_THRESHOLD, "balance TTL not extended on access");
         assert_eq!(p.get::<_, i128>(&TotalSupplyStorageKey::TotalSupply), Some(100 * ONE));
     });
 }
@@ -1084,8 +1085,8 @@ fn w6_holder_can_burn_and_spender_can_burn_from_within_allowance() {
     s.vault.deposit(&(100 * ONE), &alice);
 
     // A stranger cannot burn someone else's shares.
-    authorize(&s, &stranger, "burn", (alice.clone(), 1 * ONE).into_val(&s.env));
-    assert!(s.vault.try_burn(&alice, &(1 * ONE)).is_err());
+    authorize(&s, &stranger, "burn", (alice.clone(), ONE).into_val(&s.env));
+    assert!(s.vault.try_burn(&alice, &ONE).is_err());
 
     authorize(&s, &alice, "burn", (alice.clone(), 10 * ONE).into_val(&s.env));
     s.vault.burn(&alice, &(10 * ONE));
@@ -1135,12 +1136,13 @@ fn w6_fee_shares_are_announced_with_a_mint_event() {
     assert_eq!(s.vault.balance(&s.treasury), 0);
 
     s.env.ledger().set_timestamp(T0 + 30 * 86_400);
-    authorize(&s, &alice, "transfer", (alice.clone(), bob.clone(), 1 * ONE).into_val(&s.env));
-    s.vault.transfer(&alice, &bob, &(1 * ONE));
+    authorize(&s, &alice, "transfer", (alice.clone(), bob.clone(), ONE).into_val(&s.env));
+    s.vault.transfer(&alice, &bob, &ONE);
+    let events = vault_events(&s); // events of the transfer call only
 
     let fee = s.vault.balance(&s.treasury);
     assert!(fee > 0, "fee must have accrued");
-    let mints: std::vec::Vec<_> = vault_events(&s).into_iter().filter(|(t, _)| t[0] == sym("mint")).collect();
+    let mints: std::vec::Vec<_> = events.into_iter().filter(|(t, _)| t[0] == sym("mint")).collect();
     assert_eq!(mints, std::vec![(std::vec![sym("mint"), sc(&s.env, &s.treasury)], i128_val(fee))]);
     assert_eq!(
         s.vault.balance(&alice) + s.vault.balance(&bob) + fee,
