@@ -65,6 +65,8 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 | Choices | USDC or EURC |
 | Why one? | Keeps SEP-56 compatible; simplifies NAV calculation |
 | Currency matching | A euro-currency basket uses EURC as numéraire |
+| Must be registered | The numéraire must be an active **Cash** entry in the registry, or the vault cannot be deployed (audit M4) |
+| Labels | Every sleeve's label is its registry asset ID (e.g. the cash sleeve of a EURC vault is `EURC`); free-text labels are rejected (audit M4) |
 
 ---
 
