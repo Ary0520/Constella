@@ -1338,12 +1338,28 @@ mod v3 {
         gov
     }
 
+    /// The vault must keep pricing, minting and paying out. Exact amounts are
+    /// not hard-coded because the 1%/yr management fee legitimately dilutes
+    /// NAV when ledger time advances; invariants are checked instead.
     fn assert_vault_operates(ctx: &TestContext) {
-        assert_eq!(ctx.vault_client.get_nav_deposit().unwrap().price, 10_000_000);
-        assert_eq!(ctx.vault_client.get_nav_conservative().unwrap().price, 10_000_000);
-        assert_eq!(ctx.vault_client.deposit(&100_0000000, &ctx.alice), 100_0000000);
-        assert_eq!(ctx.vault_client.redeem(&50_0000000, &ctx.alice, &ctx.alice), 50_0000000);
-        assert_eq!(ctx.vault_client.withdraw(&10_0000000, &ctx.alice, &ctx.alice), 10_0000000);
+        let dep_nav = ctx.vault_client.get_nav_deposit().expect("deposit NAV").price;
+        let cons_nav = ctx.vault_client.get_nav_conservative().expect("conservative NAV").price;
+        // Only cash is held, so both NAVs equal total_assets / total_supply.
+        assert_eq!(dep_nav, cons_nav);
+        let expected = ctx.vault_client.total_assets() * 10_000_000 / ctx.vault_client.total_supply();
+        assert!((dep_nav - expected).abs() <= 1, "nav {dep_nav} vs assets/supply {expected}");
+
+        let usdc_before = ctx.numeraire_client.balance(&ctx.alice);
+        let minted = ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+        assert!(minted > 0);
+        let paid = ctx.vault_client.redeem(&50_0000000, &ctx.alice, &ctx.alice);
+        assert!(paid > 0);
+        let burned = ctx.vault_client.withdraw(&10_0000000, &ctx.alice, &ctx.alice);
+        assert!(burned > 0);
+        assert_eq!(
+            ctx.numeraire_client.balance(&ctx.alice),
+            usdc_before - 100_0000000 + paid + 10_0000000
+        );
     }
 
     #[test]
