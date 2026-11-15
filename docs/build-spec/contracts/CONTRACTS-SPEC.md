@@ -1,7 +1,7 @@
 # Contracts Specification
 
 > All contracts are written in **Rust**, compiled to **WASM**, deployed on **Soroban**.  
-> Base: OpenZeppelin stellar-contracts **v0.8.0** (released October 2026).  
+> Base: OpenZeppelin stellar-contracts **v0.8.0** (released 20 October 2026; requires `soroban-sdk` **28.0.0**).  
 > Reference: Product doc §4.3, §4.6, §4.9; `architecture/VAULT-DESIGN.md`
 
 ---
@@ -183,8 +183,8 @@ pub struct RedemptionCapacity {
 **RiskSheet struct:**
 ```rust
 pub struct RiskSheet {
-    recommended_ltv_bps: u32,     // e.g. 9800 = 98% (2% haircut)
-    recommended_haircut_bps: u32, // e.g. 200 = 2%
+    recommended_ltv_bps: u32,     // derived from composition, see references/COLLATERAL-PASSPORT.md Pillar 3
+    recommended_haircut_bps: u32, // e.g. 1000 = 10% for a >50% cash basket; never hard-coded
     weighted_avg_redemption_hours: u32,
     computed_at: u64,
 }
@@ -200,14 +200,20 @@ pub struct RiskSheet {
 
 **Key functions:**
 ```rust
-// SEP-40 compatible
-fn get_price(env: Env) -> Option<PriceData>          // conservative NAV
-fn get_deposit_price(env: Env) -> Option<PriceData>  // median NAV
-fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>
-fn resolution(env: Env) -> u32   // seconds
-fn base(env: Env) -> Address     // numéraire
+// SEP-40 (Draft v0.1.0) — exact interface; Blend v2 calls lastprice(Asset::Stellar(addr))
+// enum Asset { Stellar(Address), Other(Symbol) }
+// struct PriceData { price: i128, timestamp: u64 }
+fn base(env: Env) -> Asset                                         // numéraire
+fn assets(env: Env) -> Vec<Asset>
 fn decimals(env: Env) -> u32
-fn assets(env: Env) -> Vec<Address>
+fn resolution(env: Env) -> u32                                     // seconds
+fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData>
+fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>>
+fn lastprice(env: Env, asset: Asset) -> Option<PriceData>          // conservative NAV; None while sleeve paused/halted
+
+// Constella extensions (non-SEP-40)
+fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>  // minimum of valid sources
+fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>     // median of valid sources
 
 // Oracle management
 fn get_sources(env: Env) -> Vec<OracleSource>
@@ -299,12 +305,7 @@ pub trait IssuerAdapter {
 
 ## Upgrade and Deployment
 
-All strategy vault instances share one WASM binary (CAP-85, Adapter Protocol 28):
-
-```bash
-# Atomic fleet upgrade — upgrades all vault instances sharing this WASM
-stellar contract deploy --wasm vault.wasm --upgrade-fleet true
-```
+All strategy vault instances share one WASM binary. Fleet upgrades use CAP-85 "externally managed contract executables" (Protocol 28). There is **no** `--upgrade-fleet` CLI flag; follow the CAP-85 and stellar-cli documentation for the exact procedure and verify on testnet first.
 
 State migrations use the standard CAP-85 data-migration path.
 
