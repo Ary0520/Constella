@@ -1469,3 +1469,136 @@ fn test_policy_registration_invalid_parameters_rejected() {
     );
 }
 
+// -------------------------------------------------------------------------
+// Audit P3 (2026-11-15): only the policy owner (with the vault's consent)
+// may register; only the owner may amend; the admin can do neither.
+// Every call under test uses an explicit auth tree (AGENT-RULES Rule 13).
+// -------------------------------------------------------------------------
+mod p3 {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::{IntoVal, Val};
+
+    fn reg_args(ctx: &TestContext, hash: &BytesN<32>) -> Vec<Val> {
+        (
+            ctx.vault.clone(),
+            ctx.owner.clone(),
+            hash.clone(),
+            ctx.registry_address.clone(),
+            1000u32,
+            2500u32,
+            3000u32,
+            50u32,
+            500u32,
+            sample_sleeves(&ctx.env),
+        )
+            .into_val(&ctx.env)
+    }
+
+    fn try_register(ctx: &TestContext, signers: &[&Address], hash: &BytesN<32>) -> bool {
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        let args = reg_args(ctx, hash);
+        let invoke = MockAuthInvoke {
+            contract: &ctx.policy_address,
+            fn_name: "register_policy",
+            args,
+            sub_invokes: &[],
+        };
+        let auths: std::vec::Vec<MockAuth> =
+            signers.iter().map(|a| MockAuth { address: a, invoke: &invoke }).collect();
+        ctx.env.mock_auths(&auths);
+        policy
+            .try_register_policy(
+                &ctx.vault, &ctx.owner, hash, &ctx.registry_address,
+                &1000, &2500, &3000, &50, &500, &sample_sleeves(&ctx.env),
+            )
+            .is_ok()
+    }
+
+    fn try_amend(ctx: &TestContext, signer: &Address, hash: &BytesN<32>, floor: u32) -> bool {
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        let sleeves = sample_sleeves(&ctx.env);
+        ctx.env.mock_auths(&[MockAuth {
+            address: signer,
+            invoke: &MockAuthInvoke {
+                contract: &ctx.policy_address,
+                fn_name: "update_policy",
+                args: (ctx.vault.clone(), hash.clone(), floor, 2500u32, 3000u32, 50u32, 500u32, sleeves.clone())
+                    .into_val(&ctx.env),
+                sub_invokes: &[],
+            },
+        }]);
+        policy
+            .try_update_policy(&ctx.vault, hash, &floor, &2500, &3000, &50, &500, &sleeves)
+            .is_ok()
+    }
+
+    #[test]
+    fn register_requires_owner_and_vault() {
+        let ctx = setup_test_context();
+        let h = sample_hash(&ctx.env, 0x11);
+        assert!(!try_register(&ctx, &[&ctx.admin], &h), "admin alone");
+        assert!(!try_register(&ctx, &[&ctx.owner], &h), "owner without vault consent");
+        assert!(!try_register(&ctx, &[&ctx.vault], &h), "vault without owner signature");
+        assert!(!try_register(&ctx, &[&ctx.admin, &ctx.vault], &h), "admin + vault, no owner");
+
+        assert!(try_register(&ctx, &[&ctx.owner, &ctx.vault], &h));
+        let signers: std::vec::Vec<Address> = ctx.env.auths().iter().map(|a| a.0.clone()).collect();
+        assert!(signers.contains(&ctx.owner) && signers.contains(&ctx.vault));
+        assert!(!signers.contains(&ctx.admin));
+
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().owner, ctx.owner);
+    }
+
+    #[test]
+    fn policy_cannot_be_registered_twice() {
+        let ctx = setup_test_context();
+        assert!(try_register(&ctx, &[&ctx.owner, &ctx.vault], &sample_hash(&ctx.env, 0x11)));
+        assert!(!try_register(&ctx, &[&ctx.owner, &ctx.vault], &sample_hash(&ctx.env, 0x22)));
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert_eq!(policy.get_policy_hash(&ctx.vault), sample_hash(&ctx.env, 0x11));
+        assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().version, 1);
+    }
+
+    #[test]
+    fn only_owner_can_amend() {
+        let ctx = setup_test_context();
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert!(try_register(&ctx, &[&ctx.owner, &ctx.vault], &sample_hash(&ctx.env, 0x11)));
+
+        let intruder = Address::generate(&ctx.env);
+        for who in [&ctx.admin, &ctx.vault, &ctx.proposer, &intruder] {
+            assert!(!try_amend(&ctx, who, &sample_hash(&ctx.env, 0xEE), 0));
+        }
+        assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().min_liquidity_sleeve_bps, 1000);
+
+        assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1500));
+        assert_eq!(ctx.env.auths()[0].0, ctx.owner);
+        let cfg = policy.get_policy_config(&ctx.vault).unwrap();
+        assert_eq!((cfg.version, cfg.min_liquidity_sleeve_bps), (2, 1500));
+        assert_eq!(cfg.policy_hash, sample_hash(&ctx.env, 0x33));
+    }
+
+    #[test]
+    fn terms_hash_tracks_exactly_the_stored_terms() {
+        let ctx = setup_test_context();
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert!(try_register(&ctx, &[&ctx.owner, &ctx.vault], &sample_hash(&ctx.env, 0x11)));
+        let sleeves = sample_sleeves(&ctx.env);
+        let expected = compute_terms_hash(&ctx.env, &ctx.registry_address, 1000, 2500, 3000, 50, 500, &sleeves);
+        let before = policy.get_policy_config(&ctx.vault).unwrap().terms_hash;
+        assert_eq!(before, expected);
+
+        assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1500));
+        let after = policy.get_policy_config(&ctx.vault).unwrap().terms_hash;
+        assert_ne!(after, before);
+        assert_eq!(after, compute_terms_hash(&ctx.env, &ctx.registry_address, 1500, 2500, 3000, 50, 500, &sleeves));
+    }
+
+    #[test]
+    fn amending_unknown_vault_fails() {
+        let ctx = setup_test_context();
+        assert!(!try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1000));
+    }
+}
