@@ -12,7 +12,7 @@
 | Numéraire / assets | Circle **testnet** USDC `CBIELTK6…DAMA`, EURC `CCUUDM43…MCGZ` (real SACs, faucet at faucet.circle.com) | ✅ available |
 | Oracle — USDC | Base asset (exactly 1.0) | ✅ |
 | Oracle — EURC, source 1 | Reflector testnet CEX/DEX `CCYOZJCO…RN63`: `Other("EURC")` ÷ `Other("USDC")` (ViaUsdc, O7b). Live: EURC 1.1001 USD, USDC 1.0004 USD, updated every 5 min | ✅ works with O7b today. Caveat: testnet Reflector is a **single-node** cluster |
-| Oracle — EURC, source 2 (independent) | (a) Constella feeder service pushing an FX-derived EURC price with its own key (O7a), or (b) Reflector testnet FX `CCSSOHTB…NV4W` `Other("EUR")` cross-rated with the CEX feed's USDC | (a) feeder service not built yet; (b) needs a **cross-feed** quote (USDC leg from a different feed) — logged |
+| Oracle — EURC, source 2 (independent) | (a) Constella feeder service pushing an FX-derived EURC price with its own key (O7a), or (b) Reflector testnet FX `CCSSOHTB…NV4W` `Other("EUR")` cross-rated with the CEX feed's USDC | **(a) ✅ built** (`services/feeder`, `b9451e4`): end-to-end tested on a real protocol-30 local network, the same as testnet; it runs on testnet once the oracle is deployed there. (b) optional cross-feed quote, logged |
 | Oracle — RedStone | Testnet adapter `CBIHT4HV…6BK3`: USDC (data 4.8 h old at check), XLM (~55 min), BTC; **no EUROC** | ⚠️ too sparse for EURC on testnet; usable for XLM/BTC. O7c (RedStone pull sources) is implemented; on testnet it can price XLM/BTC, and on mainnet EURC/BENJI/USDY |
 | Oracle — issuer NAVs (BENJI, USDY, Spiko) | Issuer testnet tokens not confirmed | ❌ to investigate before Phase 3 assets |
 | Blend positions (adapter) | Blend v2 testnet deployment | To verify when the adapter is built |

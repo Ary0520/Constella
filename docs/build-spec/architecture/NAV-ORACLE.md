@@ -48,6 +48,12 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 - `deactivate_source` is immediate (it can only halt pricing).
 - Verified provider facts for the pull sources (Reflector, RedStone) are in `references/ORACLE-SOURCES.md`.
 
+### Constella feeder service (audit O7d)
+- `services/feeder` pushes Constella-derived prices with each source's own feeder key.
+- **`ECB_EURC`:** EURC in USDC = ECB EUR/USD reference rate (Circle par redemption), timestamped at the ECB concertation (14:15 Europe/Berlin). Staleness limit 5 days (weekends and holidays).
+- **Gates:** sanity band, 500 bps jump guard (refuse and alert), ordering, idempotence.
+- **Independence:** this is a fundamental value, independent of market feeds, so a stablecoin depeg trips the cross-source deviation breaker.
+
 ### Reflector pull sources (audit O7b, `1e2c5ff`)
 - `register_reflector_source(source, ReflectorConfig { contract, asset, quote, rounds })`: the source's price is read live from a Reflector Pulse feed. It goes through the same immediate-or-48 h rule as pushed sources and cannot be pushed into.
 - **Rounds:** the median of the newest `rounds` records (3–20). Fewer real records (gaps) mean the source is invalid. Staleness is measured on the **oldest** round used.
