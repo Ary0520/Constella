@@ -1,6 +1,7 @@
 # Stellar Ecosystem Proposals (SEPs) Reference
 
-> Technical standards powering the Constella architecture. All implementations must strictly conform to these SEPs.
+> Technical standards powering the Constella architecture. All implementations must strictly conform to these SEPs.  
+> **Status (verified 15 Nov 2026):** SEP-40 Draft v0.1.0 · SEP-41 Draft v0.5.2 · SEP-56 Draft v0.1.2 · SEP-57 Draft v0.4.0. Drafts can change — re-check the upstream text before each slice.
 
 ---
 
@@ -11,8 +12,9 @@ SEP-41 defines the standard token interface for Soroban smart contracts, acting 
 
 ### Replicating Properties
 - **Decimals & Metadata:** Token name, symbol, decimals (default 7 for classic Stellar asset parity).
-- **Core Operations:** `transfer`, `transfer_from`, `approve`, `balance`, `allowance`.
-- **Status:** Finalized, production-standard across Soroban DeFi.
+- **Core Operations:** `allowance`, `approve(from, spender, amount, live_until_ledger)`, `balance`, `transfer(from, to: MuxedAddress, amount)`, `transfer_from(spender, from, to, amount)`, **`burn(from, amount)`**, **`burn_from(spender, from, amount)`**, `decimals`, `name`, `symbol`.
+- **Events (CAP-67 format):** `transfer` topics `["transfer", from, to]` data `amount` (or `{amount, to_muxed_id}`); `approve` topics `["approve", from, spender]` data `[amount, live_until_ledger]`; `mint` topics `["mint", to]` data `amount`; `burn` topics `["burn", from]` data `amount`. Event names are SEP-41-defined lower-case and take precedence over Rule 8 for token events.
+- **Status:** Draft v0.5.2, de-facto standard across Soroban DeFi.
 
 ### Implementation in Constella
 Every Constella basket token (vault share token) **must** implement SEP-41 so that:
@@ -25,7 +27,7 @@ Every Constella basket token (vault share token) **must** implement SEP-41 so th
 ## 2. SEP-56: Tokenized Vault Standard
 
 ### Overview
-SEP-56 is Stellar's ecosystem adaptation of Ethereum's ERC-4626 Tokenized Vault Standard. It provides a standardized API for yield-bearing single-asset deposit vaults.
+SEP-56 (Draft v0.1.2, authored by OpenZeppelin) is Stellar's ecosystem adaptation of Ethereum's ERC-4626 Tokenized Vault Standard. It provides a standardized API for yield-bearing single-asset deposit vaults.
 
 ### Core Functions & Properties
 ```rust
@@ -91,16 +93,21 @@ SEP-40 specifies the standard interface for price oracle contracts on Soroban, s
 
 ### Core Interface
 ```rust
+pub enum Asset { Stellar(Address), Other(Symbol) }
+pub struct PriceData { pub price: i128, pub timestamp: u64 }
+
 pub trait SEP40Oracle {
-    fn base(env: Env) -> Address;
+    fn base(env: Env) -> Asset;
+    fn assets(env: Env) -> Vec<Asset>;
     fn decimals(env: Env) -> u32;
     fn resolution(env: Env) -> u32; // In seconds
-    fn price(env: Env, asset: Address) -> Option<PriceData>;
-    fn lastprice(env: Env, asset: Address) -> Option<PriceData>;
-    fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>;
-    fn assets(env: Env) -> Vec<Address>;
+    fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData>;
+    fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>>;
+    fn lastprice(env: Env, asset: Asset) -> Option<PriceData>;
 }
 ```
+
+> Blend v2 consumes oracles through the `sep-40-oracle` crate and calls only `lastprice(&Asset::Stellar(addr))`, rejecting prices ≤ 0 or older than 24h.
 
 ### Implementation in Constella
 - Constella's NAV Oracle contract implements SEP-40.
