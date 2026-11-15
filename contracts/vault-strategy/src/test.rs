@@ -1683,3 +1683,39 @@ mod w7 {
         assert!(!ctx.vault_client.is_eligible_liquidator(&ctx.admin), "not even the admin until SEP-57 exists");
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit M4 (2026-11-15): sleeve labels come from the registry, never free text.
+// -------------------------------------------------------------------------
+mod m4 {
+    use super::*;
+
+    #[test]
+    fn cash_sleeve_label_comes_from_registry() {
+        let ctx = setup_test_context();
+        let cash = ctx.vault_client.get_sleeves().get(0).unwrap();
+        assert_eq!(cash.asset_id, String::from_str(&ctx.env, "USDC"));
+        assert_eq!(cash.contract_address, ctx.numeraire_address);
+    }
+
+    #[test]
+    fn set_sleeves_rejects_labels_that_do_not_match_the_registry() {
+        let ctx = setup_test_context();
+        let gov = register_gov_fund(&ctx); // registry id SPIKO_USD
+        let mut mislabeled = SdkVec::new(&ctx.env);
+        mislabeled.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 0));
+        mislabeled.push_back(sleeve(&ctx, "FRANKLIN_BENJI", &gov, SleeveType::UsdGovFunds, 5000, 0));
+        assert_eq!(ctx.vault_client.try_set_sleeves(&mislabeled).err().unwrap().unwrap(), VaultError::InvalidSleeveConfig.into());
+
+        let mut bad_cash = SdkVec::new(&ctx.env);
+        bad_cash.push_back(sleeve(&ctx, "USDT", &ctx.numeraire_address, SleeveType::CashStable, 5000, 0));
+        bad_cash.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+        assert_eq!(ctx.vault_client.try_set_sleeves(&bad_cash).err().unwrap().unwrap(), VaultError::InvalidSleeveConfig.into());
+
+        let mut ok = SdkVec::new(&ctx.env);
+        ok.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 0));
+        ok.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+        ctx.vault_client.set_sleeves(&ok);
+        assert_eq!(ctx.vault_client.get_sleeves().get(1).unwrap().asset_id, String::from_str(&ctx.env, "SPIKO_USD"));
+    }
+}

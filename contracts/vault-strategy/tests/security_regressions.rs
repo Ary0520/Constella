@@ -880,3 +880,62 @@ fn m3_fresh_deployments_cannot_be_taken_over() {
     assert!(!stranger_initializes(&env, &vault, args), "vault hijack");
     assert_eq!(StrategyVaultClient::new(&env, &vault).get_config(), legit, "configuration unchanged");
 }
+
+// ---------------------------------------------------------------------------
+// M4 — the vault always labelled its cash sleeve "USDC", even for a EURC
+// vault, and accepted any token as numéraire. VAULT-DESIGN: numéraire is USDC
+// or EURC; README Closed Universe: only registered, active assets are used.
+// ---------------------------------------------------------------------------
+fn eur_vault_config(env: &Env, admin: &Address, numeraire: &Address, registry: &Address) -> VaultConfig {
+    let oracle = env.register(NavOracle, (admin.clone(), numeraire.clone(), 7u32, 300u32));
+    let policy = env.register(PolicyContract, (admin.clone(), oracle.clone()));
+    VaultConfig {
+        admin: admin.clone(),
+        pause_authority: admin.clone(),
+        numeraire: numeraire.clone(),
+        policy_contract: policy,
+        oracle_contract: oracle,
+        registry_contract: registry.clone(),
+        treasury: admin.clone(),
+        management_fee_bps: 0,
+        tvl_cap: 1_000_000 * ONE,
+        per_user_cap: 100_000 * ONE,
+    }
+}
+
+#[test]
+fn m4_cash_sleeve_is_named_from_the_registry_and_numeraire_must_be_registered() {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(T0);
+    let admin = Address::generate(&env);
+    let registry_id = env.register(AssetRegistry, (admin.clone(),));
+    let eurc = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    AssetRegistryClient::new(&env, &registry_id).add_asset(&AssetEntry {
+        contract_address: eurc.clone(),
+        asset_id: Symbol::new(&env, "EURC"),
+        issuer: Symbol::new(&env, "CIRCLE"),
+        sleeve_type: RegSleeve::Cash,
+        liquidity_tier: 0,
+        permissionless: true,
+        oracle_sources: Vec::from_array(&env, [Symbol::new(&env, "EURC_A"), Symbol::new(&env, "EURC_B")]),
+        eligible_jurisdictions: Vec::new(&env),
+        blocked_jurisdictions: Vec::new(&env),
+        investor_classes_required: Vec::new(&env),
+        is_active: true,
+        added_at: T0,
+    });
+
+    let cfg = eur_vault_config(&env, &admin, &eurc, &registry_id);
+    let vault = env.register(StrategyVault, (cfg, String::from_str(&env, "Euro Vault"), String::from_str(&env, "cEUR"), 7u32));
+    let cash = StrategyVaultClient::new(&env, &vault).get_sleeves().get(0).unwrap();
+    assert_eq!(cash.asset_id, String::from_str(&env, "EURC"), "a EURC vault's cash sleeve must be labelled EURC");
+
+    // A token that is not in the closed universe cannot be the numéraire.
+    let rogue = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let cfg = eur_vault_config(&env, &admin, &rogue, &registry_id);
+    let deployed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        env.register(StrategyVault, (cfg, String::from_str(&env, "Rogue"), String::from_str(&env, "R"), 7u32))
+    }));
+    assert!(deployed.is_err(), "an unregistered numéraire must make deployment fail");
+}
