@@ -453,6 +453,7 @@ fn test_t45_sep41_token_standard() {
 // T46: Liquidity Sleeve Floor & Capacity Boundary Protection
 // -------------------------------------------------------------------------
 #[test]
+#[ignore = "audit V2: fabricated sleeve holdings via set_sleeves; re-enable when W1 (policy-validated rebalance execution) can acquire real holdings"]
 fn test_t46_liquidity_sleeve_floor_protection() {
     let ctx = setup_test_context();
 
@@ -683,6 +684,7 @@ fn test_edge_cases_and_authorizations() {
 // Boundary & Dual NAV Edge Cases
 // -------------------------------------------------------------------------
 #[test]
+#[ignore = "audit V2: fabricated sleeve holdings via set_sleeves; re-enable when W1 (policy-validated rebalance execution) can acquire real holdings"]
 fn test_exact_liquidity_floor_boundary() {
     let ctx = setup_test_context();
 
@@ -790,6 +792,7 @@ fn test_exact_liquidity_floor_boundary() {
 }
 
 #[test]
+#[ignore = "audit V2: fabricated sleeve holdings via set_sleeves; re-enable when W1 (policy-validated rebalance execution) can acquire real holdings"]
 fn test_dual_nav_asymmetric_max_redeem() {
     let ctx = setup_test_context();
 
