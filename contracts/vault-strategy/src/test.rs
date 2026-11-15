@@ -1483,3 +1483,146 @@ mod v4 {
     }
 }
 
+// -------------------------------------------------------------------------
+// Audit W3 (2026-11-15): deposit caps (AGENT-RULES Rule 6) and a 48h upgrade
+// timelock (CONTRACTS-SPEC). Admin calls under test use explicit auth.
+// -------------------------------------------------------------------------
+mod w3 {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::{BytesN, IntoVal};
+
+    const ONE: i128 = 10_000_000;
+
+    fn err(e: VaultError) -> soroban_sdk::Error {
+        soroban_sdk::Error::from_contract_error(e as u32)
+    }
+
+    #[test]
+    fn initialize_requires_sane_caps() {
+        let ctx = setup_test_context();
+        let mut cfg = ctx.vault_client.get_config();
+        for (tvl, user) in [(0, 0), (100, 0), (0, 100), (100, 101)] {
+            cfg.tvl_cap = tvl;
+            cfg.per_user_cap = user;
+            let fresh = ctx.env.register(StrategyVault, ());
+            let c = StrategyVaultClient::new(&ctx.env, &fresh);
+            let r = c.try_initialize(&cfg, &String::from_str(&ctx.env, "V"), &String::from_str(&ctx.env, "V"), &7);
+            assert_eq!(r.err().unwrap().unwrap(), err(VaultError::InvalidCaps), "tvl {tvl} user {user}");
+        }
+    }
+
+    #[test]
+    fn per_user_cap_enforced_per_receiver() {
+        let ctx = setup_test_context();
+        configure_vault_oracle_feeds(&ctx);
+        ctx.numeraire_admin.mint(&ctx.alice, &(200_000 * ONE));
+        ctx.numeraire_admin.mint(&ctx.bob, &(10 * ONE));
+        // Feeds price the vault at $1.00 deposit NAV: 100k USDC = the cap.
+        assert_eq!(ctx.vault_client.max_deposit(&ctx.alice), 100_000 * ONE);
+        ctx.vault_client.deposit(&(100_000 * ONE), &ctx.alice);
+        assert_eq!(ctx.vault_client.max_deposit(&ctx.alice), 0);
+        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
+        assert_eq!(ctx.vault_client.try_mint(&ONE, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
+        assert_eq!(ctx.vault_client.deposit(&(10 * ONE), &ctx.bob), 10 * ONE, "other users unaffected");
+    }
+
+    #[test]
+    fn tvl_cap_enforced_across_users_and_max_views_are_exact() {
+        let ctx = setup_test_context();
+        configure_vault_oracle_feeds(&ctx);
+        ctx.vault_client.lower_caps(&(150 * ONE), &(100 * ONE));
+        ctx.numeraire_admin.mint(&ctx.alice, &(1000 * ONE));
+        ctx.numeraire_admin.mint(&ctx.bob, &(1000 * ONE));
+        ctx.vault_client.deposit(&(100 * ONE), &ctx.alice);
+        assert_eq!(ctx.vault_client.max_deposit(&ctx.bob), 50 * ONE, "TVL room binds before bob's user room");
+        let m = ctx.vault_client.max_mint(&ctx.bob);
+        ctx.vault_client.mint(&m, &ctx.bob);
+        assert_eq!(ctx.vault_client.max_deposit(&ctx.bob), 0);
+        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.bob).err().unwrap().unwrap(), err(VaultError::TvlCapExceeded));
+        // Withdrawals reopen room.
+        ctx.vault_client.redeem(&(10 * ONE), &ctx.alice, &ctx.alice);
+        assert!(ctx.vault_client.max_deposit(&ctx.bob) > 0);
+    }
+
+    #[test]
+    fn caps_can_only_be_lowered_and_only_by_admin() {
+        let ctx = setup_test_context();
+        let cfg = ctx.vault_client.get_config();
+        assert_eq!(ctx.vault_client.try_lower_caps(&(cfg.tvl_cap + 1), &cfg.per_user_cap).err().unwrap().unwrap(), err(VaultError::InvalidCaps));
+        assert_eq!(ctx.vault_client.try_lower_caps(&cfg.tvl_cap, &(cfg.per_user_cap + 1)).err().unwrap().unwrap(), err(VaultError::InvalidCaps));
+        let stranger = Address::generate(&ctx.env);
+        ctx.env.mock_auths(&[MockAuth {
+            address: &stranger,
+            invoke: &MockAuthInvoke { contract: &ctx.vault_id, fn_name: "lower_caps", args: (ONE, ONE).into_val(&ctx.env), sub_invokes: &[] },
+        }]);
+        assert!(ctx.vault_client.try_lower_caps(&ONE, &ONE).is_err());
+        ctx.env.mock_auths(&[MockAuth {
+            address: &ctx.admin,
+            invoke: &MockAuthInvoke { contract: &ctx.vault_id, fn_name: "lower_caps", args: (500 * ONE, 50 * ONE).into_val(&ctx.env), sub_invokes: &[] },
+        }]);
+        ctx.vault_client.lower_caps(&(500 * ONE), &(50 * ONE));
+        let after = ctx.vault_client.get_config();
+        assert_eq!((after.tvl_cap, after.per_user_cap), (500 * ONE, 50 * ONE));
+    }
+
+    #[test]
+    fn upgrade_waits_48h_and_can_be_cancelled() {
+        let ctx = setup_test_context();
+        let hash = BytesN::from_array(&ctx.env, &[0xAB; 32]);
+        assert_eq!(ctx.vault_client.try_execute_upgrade().err().unwrap().unwrap(), err(VaultError::NoPendingUpgrade));
+
+        ctx.vault_client.propose_upgrade(&hash);
+        let p = ctx.vault_client.get_pending_upgrade().unwrap();
+        assert_eq!(p.executable_at - p.proposed_at, UPGRADE_TIMELOCK_SECONDS);
+        assert_eq!(UPGRADE_TIMELOCK_SECONDS, 48 * 3600);
+
+        ctx.env.ledger().set_timestamp(p.executable_at - 1);
+        assert_eq!(ctx.vault_client.try_execute_upgrade().err().unwrap().unwrap(), err(VaultError::UpgradeNotReady));
+
+        ctx.vault_client.cancel_upgrade();
+        assert!(ctx.vault_client.get_pending_upgrade().is_none());
+        ctx.env.ledger().set_timestamp(p.executable_at + 1);
+        assert_eq!(ctx.vault_client.try_execute_upgrade().err().unwrap().unwrap(), err(VaultError::NoPendingUpgrade));
+    }
+
+    #[test]
+    fn timelock_gate_opens_exactly_at_48h() {
+        let ctx = setup_test_context();
+        // Hash of WASM never uploaded: once past the gate, the HOST rejects the
+        // swap, which proves our timelock let it through (a full swap with a real
+        // WASM is covered by the local-network e2e suite, not unit tests).
+        let hash = BytesN::from_array(&ctx.env, &[0xCD; 32]);
+        ctx.vault_client.propose_upgrade(&hash);
+        let p = ctx.vault_client.get_pending_upgrade().unwrap();
+        ctx.env.ledger().set_timestamp(p.executable_at);
+        let r = ctx.vault_client.try_execute_upgrade();
+        assert!(r.is_err());
+        assert_ne!(r.err().unwrap().ok(), Some(err(VaultError::UpgradeNotReady)), "gate must be open at 48h");
+        assert!(ctx.vault_client.get_pending_upgrade().is_some(), "failed swap reverts; proposal stays");
+    }
+
+    #[test]
+    fn only_admin_can_propose_execute_or_cancel_upgrades() {
+        let ctx = setup_test_context();
+        let hash = BytesN::from_array(&ctx.env, &[0xEF; 32]);
+        for who in [&ctx.pause_authority, &ctx.policy_owner, &ctx.alice] {
+            ctx.env.mock_auths(&[MockAuth {
+                address: who,
+                invoke: &MockAuthInvoke { contract: &ctx.vault_id, fn_name: "propose_upgrade", args: (hash.clone(),).into_val(&ctx.env), sub_invokes: &[] },
+            }]);
+            assert!(ctx.vault_client.try_propose_upgrade(&hash).is_err());
+        }
+        ctx.env.mock_all_auths();
+        ctx.vault_client.propose_upgrade(&hash);
+        for f in ["cancel_upgrade", "execute_upgrade"] {
+            ctx.env.mock_auths(&[MockAuth {
+                address: &ctx.pause_authority,
+                invoke: &MockAuthInvoke { contract: &ctx.vault_id, fn_name: f, args: ().into_val(&ctx.env), sub_invokes: &[] },
+            }]);
+            let r = if f == "cancel_upgrade" { ctx.vault_client.try_cancel_upgrade().is_err() } else { ctx.vault_client.try_execute_upgrade().is_err() };
+            assert!(r, "{f} by pause authority must fail");
+        }
+        assert!(ctx.vault_client.get_pending_upgrade().is_some());
+    }
+}
