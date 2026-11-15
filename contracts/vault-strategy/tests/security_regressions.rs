@@ -11,7 +11,7 @@ extern crate std;
 use constella_nav_oracle::{NavOracle, NavOracleClient, OracleSource};
 use constella_policy::{PolicyContract, PolicyContractClient};
 use constella_registry::{AssetEntry, AssetRegistry, AssetRegistryClient, SleeveType as RegSleeve};
-use constella_vault_strategy::{StrategyVault, StrategyVaultClient, VaultConfig};
+use constella_vault_strategy::{SleeveState, SleeveType, StrategyVault, StrategyVaultClient, VaultConfig};
 use soroban_sdk::{
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
     token, Address, Env, IntoVal, String, Symbol, Vec,
@@ -27,6 +27,8 @@ struct Stack<'a> {
     vault: StrategyVaultClient<'a>,
     vault_id: Address,
     treasury: Address,
+    admin: Address,
+    usdc_addr: Address,
 }
 
 fn oracle_source(env: &Env, id: &str, asset: &Address, price: i128) -> OracleSource {
@@ -43,9 +45,11 @@ fn oracle_source(env: &Env, id: &str, asset: &Address, price: i128) -> OracleSou
     }
 }
 
-/// Full contract stack: registry (USDC registered), policy, oracle with two
-/// independent $1.00 feeds for the vault NAV, and a 0-fee strategy vault.
-fn deploy_stack() -> Stack<'static> {
+/// Full contract stack: registry (USDC registered), policy, oracle and a
+/// 0-fee strategy vault. With `vault_nav_feeds`, the oracle carries two
+/// independent $1.00 feeds for the vault NAV; without, share price is derived
+/// from sleeve composition.
+fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
     let env = Env::default();
     env.mock_all_auths(); // setup only
     env.ledger().set_timestamp(T0);
@@ -79,15 +83,17 @@ fn deploy_stack() -> Stack<'static> {
     let oracle_id = env.register(NavOracle, ());
     let oracle = NavOracleClient::new(&env, &oracle_id);
     oracle.initialize(&admin, &usdc_addr, &7, &300);
-    oracle.configure_sleeve(&Symbol::new(&env, "VAULT"), &200, &2);
-    oracle.register_source(&oracle_source(&env, "USDC_A", &usdc_addr, ONE));
-    oracle.register_source(&oracle_source(&env, "USDC_B", &usdc_addr, ONE));
+    if vault_nav_feeds {
+        oracle.configure_sleeve(&Symbol::new(&env, "VAULT"), &200, &2);
+        oracle.register_source(&oracle_source(&env, "USDC_A", &usdc_addr, ONE));
+        oracle.register_source(&oracle_source(&env, "USDC_B", &usdc_addr, ONE));
+    }
 
     let vault_id = env.register(StrategyVault, ());
     let vault = StrategyVaultClient::new(&env, &vault_id);
     vault.initialize(
         &VaultConfig {
-            admin,
+            admin: admin.clone(),
             pause_authority: Address::generate(&env),
             numeraire: usdc_addr.clone(),
             policy_contract: policy_id,
@@ -108,7 +114,13 @@ fn deploy_stack() -> Stack<'static> {
         vault,
         vault_id,
         treasury,
+        admin,
+        usdc_addr,
     }
+}
+
+fn deploy_stack() -> Stack<'static> {
+    deploy_stack_with(true)
 }
 
 fn authorize(s: &Stack, who: &Address, fn_name: &'static str, args: soroban_sdk::Vec<soroban_sdk::Val>) {
@@ -169,4 +181,52 @@ fn v1_self_transfer_from_cannot_inflate_shares() {
 
     assert_eq!(s.vault.balance(&owner), 50 * ONE);
     assert_eq!(s.vault.total_supply(), 50 * ONE);
+}
+
+// ---------------------------------------------------------------------------
+// V2 — admin overwrote the cash sleeve's book balance, inflating NAV, then
+// redeemed a sliver of its own shares for depositors' real USDC.
+// ---------------------------------------------------------------------------
+#[test]
+fn v2_admin_cannot_inject_sleeve_balance_to_drain_depositors() {
+    let s = deploy_stack_with(false); // NAV from sleeve composition
+    let alice = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(1000 * ONE));
+    s.usdc_admin.mint(&s.admin, &ONE);
+    s.vault.deposit(&(1000 * ONE), &alice);
+    s.vault.deposit(&ONE, &s.admin);
+    let admin_usdc_before = s.usdc.balance(&s.admin);
+
+    // Attack step 1: admin rewrites the cash sleeve's recorded balance.
+    let mut forged = Vec::new(&s.env);
+    forged.push_back(SleeveState {
+        asset_id: String::from_str(&s.env, "USDC"),
+        contract_address: s.usdc_addr.clone(),
+        target_weight_bps: 10_000,
+        band_bps: 0,
+        current_balance: 1_001_000_000 * ONE,
+        sleeve_type: SleeveType::CashStable,
+        liquidity_tier: 0,
+    });
+    s.env.mock_auths(&[MockAuth {
+        address: &s.admin,
+        invoke: &MockAuthInvoke {
+            contract: &s.vault_id,
+            fn_name: "set_sleeves",
+            args: (forged.clone(),).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.vault.try_set_sleeves(&forged).is_err(), "forged balance must be rejected");
+
+    // Attack step 2: redeem a sliver of shares for 1000 USDC.
+    s.env.mock_all_auths();
+    let sliver = s.vault.convert_to_shares(&(1000 * ONE));
+    let _ = s.vault.try_redeem(&sliver.min(s.vault.balance(&s.admin)), &s.admin, &s.admin);
+    let _ = s.vault.try_redeem(&s.vault.balance(&s.admin), &s.admin, &s.admin);
+
+    let admin_gain = s.usdc.balance(&s.admin) - admin_usdc_before;
+    assert!(admin_gain <= ONE, "admin extracted {admin_gain} after depositing {ONE}");
+    let alice_out = s.vault.redeem(&s.vault.balance(&alice), &alice, &alice);
+    assert_eq!(alice_out, 1000 * ONE);
 }
