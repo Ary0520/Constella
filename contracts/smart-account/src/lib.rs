@@ -104,15 +104,17 @@ impl CustomAccountInterface for SmartAccountContract {
             }
             seen_keys.push_back(sig.public_key.clone());
 
-            // Validate public key format: 65 bytes uncompressed SEC-1 begins with 0x04
+            // Validate public key format: 65 bytes uncompressed SEC-1 begins with 0x04 and has non-zero coordinates
             let pk_arr = sig.public_key.to_array();
-            if pk_arr[0] != 0x04 {
+            if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
                 return Err(AccError::InvalidSignature);
             }
 
-            // Validate raw signature: cannot be all zeros
+            // Validate raw signature: neither r nor s can be all zeros
             let sig_arr = sig.signature.to_array();
-            if sig_arr.iter().all(|&b| b == 0) {
+            let r_is_zero = sig_arr[..32].iter().all(|&b| b == 0);
+            let s_is_zero = sig_arr[32..].iter().all(|&b| b == 0);
+            if r_is_zero || s_is_zero {
                 return Err(AccError::InvalidSignature);
             }
 
@@ -159,7 +161,7 @@ impl SmartAccountContract {
         }
 
         let pk_arr = admin_public_key.to_array();
-        if pk_arr[0] != 0x04 {
+        if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
             return Err(AccError::InvalidSignature);
         }
 
@@ -207,7 +209,7 @@ impl SmartAccountContract {
         }
 
         let pk_arr = signer.public_key.to_array();
-        if pk_arr[0] != 0x04 {
+        if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
             return Err(AccError::InvalidSignature);
         }
 
@@ -234,6 +236,77 @@ impl SmartAccountContract {
         env.events().publish(
             (
                 Symbol::new(&env, "signer_added"),
+                env.current_contract_address(),
+            ),
+            signer.public_key,
+        );
+
+        Ok(())
+    }
+
+    /// Update an existing signer's role, weight, or name (requires self-authorization; anti-bricking safety enforced)
+    pub fn update_signer(env: Env, signer: Signer) -> Result<(), AccError> {
+        env.current_contract_address().require_auth();
+
+        if !env.storage().instance().has(&DataKey::Initialized) {
+            return Err(AccError::NotInitialized);
+        }
+
+        if signer.weight == 0 {
+            return Err(AccError::InvalidSignerWeight);
+        }
+
+        let pk_arr = signer.public_key.to_array();
+        if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
+            return Err(AccError::InvalidSignature);
+        }
+
+        let existing: Signer = match env
+            .storage()
+            .instance()
+            .get(&DataKey::Signer(signer.public_key.clone()))
+        {
+            Some(s) => s,
+            None => return Err(AccError::SignerNotFound),
+        };
+
+        let threshold: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Threshold)
+            .unwrap_or(1);
+
+        let keys: Vec<BytesN<65>> = env
+            .storage()
+            .instance()
+            .get(&DataKey::SignerKeys)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total_weight: u32 = 0;
+        for k in keys.iter() {
+            if let Some(s) = env
+                .storage()
+                .instance()
+                .get::<_, Signer>(&DataKey::Signer(k))
+            {
+                total_weight = total_weight.saturating_add(s.weight);
+            }
+        }
+
+        let new_total_weight = total_weight
+            .saturating_sub(existing.weight)
+            .saturating_add(signer.weight);
+        if new_total_weight < threshold {
+            return Err(AccError::CannotRemoveBelowThreshold);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::Signer(signer.public_key.clone()), &signer);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "signer_updated"),
                 env.current_contract_address(),
             ),
             signer.public_key,

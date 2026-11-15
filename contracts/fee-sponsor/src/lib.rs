@@ -214,27 +214,11 @@ impl FeeSponsorContract {
             return Err(SponsorError::TargetNotWhitelisted);
         }
 
-        let now = env.ledger().timestamp();
-        let today_epoch = now / 86400;
-
         // Global daily budget validation
-        let global_stats: GlobalSponsorStats = env
-            .storage()
-            .instance()
-            .get(&DataKey::GlobalStats)
-            .unwrap_or(GlobalSponsorStats {
-                total_ops_today: 0,
-                total_fees_today_stroops: 0,
-                current_day_epoch: today_epoch,
-            });
-
-        let projected_global_fees = if global_stats.current_day_epoch == today_epoch {
-            global_stats
-                .total_fees_today_stroops
-                .saturating_add(fee_bid_stroops)
-        } else {
-            fee_bid_stroops
-        };
+        let global_stats = Self::get_global_stats(env.clone());
+        let projected_global_fees = global_stats
+            .total_fees_today_stroops
+            .saturating_add(fee_bid_stroops);
 
         if projected_global_fees > config.daily_budget_stroops {
             return Err(SponsorError::DailyBudgetExceeded);
@@ -243,27 +227,11 @@ impl FeeSponsorContract {
         // Per-user quota validation (hourly & daily)
         let user_stats = Self::get_user_stats(env.clone(), user);
 
-        let effective_hourly_ops = if user_stats.last_op_timestamp == 0
-            || (now / 3600 != user_stats.last_op_timestamp / 3600)
-        {
-            0
-        } else {
-            user_stats.hourly_ops
-        };
-
-        let effective_daily_ops = if user_stats.last_op_timestamp == 0
-            || (now / 86400 != user_stats.last_op_timestamp / 86400)
-        {
-            0
-        } else {
-            user_stats.daily_ops
-        };
-
-        if effective_hourly_ops.saturating_add(1) > config.max_ops_per_hour {
+        if user_stats.hourly_ops.saturating_add(1) > config.max_ops_per_hour {
             return Err(SponsorError::HourlyLimitExceeded);
         }
 
-        if effective_daily_ops.saturating_add(1) > config.max_ops_per_day {
+        if user_stats.daily_ops.saturating_add(1) > config.max_ops_per_day {
             return Err(SponsorError::DailyLimitExceeded);
         }
 
@@ -291,52 +259,23 @@ impl FeeSponsorContract {
         let today_epoch = now / 86400;
 
         // Update Global Stats
-        let mut global_stats: GlobalSponsorStats = env
-            .storage()
-            .instance()
-            .get(&DataKey::GlobalStats)
-            .unwrap_or(GlobalSponsorStats {
-                total_ops_today: 0,
-                total_fees_today_stroops: 0,
-                current_day_epoch: today_epoch,
-            });
-
-        if global_stats.current_day_epoch != today_epoch {
-            global_stats.current_day_epoch = today_epoch;
-            global_stats.total_ops_today = 1;
-            global_stats.total_fees_today_stroops = fee_spent_stroops;
-        } else {
-            global_stats.total_ops_today = global_stats.total_ops_today.saturating_add(1);
-            global_stats.total_fees_today_stroops = global_stats
+        let global_stats = Self::get_global_stats(env.clone());
+        let updated_global_stats = GlobalSponsorStats {
+            total_ops_today: global_stats.total_ops_today.saturating_add(1),
+            total_fees_today_stroops: global_stats
                 .total_fees_today_stroops
-                .saturating_add(fee_spent_stroops);
-        }
+                .saturating_add(fee_spent_stroops),
+            current_day_epoch: today_epoch,
+        };
         env.storage()
             .instance()
-            .set(&DataKey::GlobalStats, &global_stats);
+            .set(&DataKey::GlobalStats, &updated_global_stats);
 
         // Update User Stats
         let current_user_stats = Self::get_user_stats(env.clone(), user.clone());
-
-        let new_hourly = if current_user_stats.last_op_timestamp == 0
-            || (now / 3600 != current_user_stats.last_op_timestamp / 3600)
-        {
-            1
-        } else {
-            current_user_stats.hourly_ops.saturating_add(1)
-        };
-
-        let new_daily = if current_user_stats.last_op_timestamp == 0
-            || (now / 86400 != current_user_stats.last_op_timestamp / 86400)
-        {
-            1
-        } else {
-            current_user_stats.daily_ops.saturating_add(1)
-        };
-
         let updated_user_stats = UserSponsorStats {
-            hourly_ops: new_hourly,
-            daily_ops: new_daily,
+            hourly_ops: current_user_stats.hourly_ops.saturating_add(1),
+            daily_ops: current_user_stats.daily_ops.saturating_add(1),
             last_op_timestamp: now,
         };
 
@@ -386,6 +325,21 @@ impl FeeSponsorContract {
         Ok(())
     }
 
+    /// Transfer sponsorship administration to a new admin address
+    pub fn set_admin(env: Env, new_admin: Address) -> Result<(), SponsorError> {
+        let mut config = Self::require_admin(&env)?;
+        let old_admin = config.admin.clone();
+        config.admin = new_admin.clone();
+        env.storage().instance().set(&DataKey::Config, &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "sponsor_admin_transferred"), old_admin),
+            new_admin,
+        );
+
+        Ok(())
+    }
+
     /// Emergency circuit breaker: pause all sponsorship immediately
     pub fn pause(env: Env) -> Result<(), SponsorError> {
         let mut config = Self::require_admin(&env)?;
@@ -418,31 +372,58 @@ impl FeeSponsorContract {
         }
     }
 
-    /// Query usage statistics for a specific user
+    /// Query usage statistics for a specific user (evaluates effective quota for current timestamp)
     pub fn get_user_stats(env: Env, user: Address) -> UserSponsorStats {
-        env.storage()
-            .instance()
-            .get(&DataKey::UserStats(user))
-            .unwrap_or(UserSponsorStats {
+        let now = env.ledger().timestamp();
+        let stored: Option<UserSponsorStats> =
+            env.storage().instance().get(&DataKey::UserStats(user));
+        match stored {
+            Some(stats) => {
+                let hourly = if stats.last_op_timestamp == 0
+                    || (now / 3600 != stats.last_op_timestamp / 3600)
+                {
+                    0
+                } else {
+                    stats.hourly_ops
+                };
+
+                let daily = if stats.last_op_timestamp == 0
+                    || (now / 86400 != stats.last_op_timestamp / 86400)
+                {
+                    0
+                } else {
+                    stats.daily_ops
+                };
+
+                UserSponsorStats {
+                    hourly_ops: hourly,
+                    daily_ops: daily,
+                    last_op_timestamp: stats.last_op_timestamp,
+                }
+            }
+            None => UserSponsorStats {
                 hourly_ops: 0,
                 daily_ops: 0,
                 last_op_timestamp: 0,
-            })
+            },
+        }
     }
 
-    /// Query global sponsorship stats for today
+    /// Query global sponsorship stats for today (resets if day rolled over)
     pub fn get_global_stats(env: Env) -> GlobalSponsorStats {
         let now = env.ledger().timestamp();
         let today_epoch = now / 86400;
 
-        env.storage()
-            .instance()
-            .get(&DataKey::GlobalStats)
-            .unwrap_or(GlobalSponsorStats {
+        let stored: Option<GlobalSponsorStats> =
+            env.storage().instance().get(&DataKey::GlobalStats);
+        match stored {
+            Some(stats) if stats.current_day_epoch == today_epoch => stats,
+            _ => GlobalSponsorStats {
                 total_ops_today: 0,
                 total_fees_today_stroops: 0,
                 current_day_epoch: today_epoch,
-            })
+            },
+        }
     }
 
     /// Query all currently whitelisted target contracts

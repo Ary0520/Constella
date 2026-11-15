@@ -237,6 +237,82 @@ fn test_t49_invalid_signature_rejection() {
         &empty_contexts,
     );
     assert_eq!(empty_res, Err(Ok(AccError::ThresholdNotMet)));
+
+    // Case 6: Public key with invalid SEC-1 prefix (e.g. 0x02 compressed instead of 0x04 uncompressed)
+    let mut bad_prefix_bytes = [0u8; 65];
+    bad_prefix_bytes[0] = 0x02;
+    bad_prefix_bytes[1] = 0x01;
+    let bad_pk = BytesN::<65>::from_array(&env, &bad_prefix_bytes);
+    let bad_prefix_auth = PasskeyAuth {
+        signatures: vec![
+            &env,
+            PasskeySignature {
+                public_key: bad_pk,
+                signature: signature_bytes.clone(),
+            },
+        ],
+    };
+    let bad_prefix_res = env.try_invoke_contract_check_auth::<AccError>(
+        &contract_id,
+        &payload_hash,
+        bad_prefix_auth.into_val(&env),
+        &empty_contexts,
+    );
+    assert_eq!(bad_prefix_res, Err(Ok(AccError::InvalidSignature)));
+
+    // Case 7: Public key with all-zero coordinate point [0x04, 0, ..., 0]
+    let mut zero_pt_bytes = [0u8; 65];
+    zero_pt_bytes[0] = 0x04;
+    let zero_pt_pk = BytesN::<65>::from_array(&env, &zero_pt_bytes);
+    let zero_pt_auth = PasskeyAuth {
+        signatures: vec![
+            &env,
+            PasskeySignature {
+                public_key: zero_pt_pk,
+                signature: signature_bytes.clone(),
+            },
+        ],
+    };
+    let zero_pt_res = env.try_invoke_contract_check_auth::<AccError>(
+        &contract_id,
+        &payload_hash,
+        zero_pt_auth.into_val(&env),
+        &empty_contexts,
+    );
+    assert_eq!(zero_pt_res, Err(Ok(AccError::InvalidSignature)));
+
+    // Case 8: Signature where r = 0 or s = 0 (scalar component zero)
+    let mut zero_r_bytes = [1u8; 64];
+    for b in zero_r_bytes[..32].iter_mut() {
+        *b = 0;
+    }
+    let zero_r_sig = BytesN::<64>::from_array(&env, &zero_r_bytes);
+    let zero_r_auth = PasskeyAuth {
+        signatures: vec![
+            &env,
+            PasskeySignature {
+                public_key: admin_kp.public_key_bytes.clone(),
+                signature: zero_r_sig,
+            },
+        ],
+    };
+    let zero_r_res = env.try_invoke_contract_check_auth::<AccError>(
+        &contract_id,
+        &payload_hash,
+        zero_r_auth.into_val(&env),
+        &empty_contexts,
+    );
+    assert_eq!(zero_r_res, Err(Ok(AccError::InvalidSignature)));
+
+    // Case 9: Check auth on uninitialized contract fails with NotInitialized
+    let uninit_id = env.register(SmartAccountContract, ());
+    let uninit_res = env.try_invoke_contract_check_auth::<AccError>(
+        &uninit_id,
+        &payload_hash,
+        valid_auth.into_val(&env),
+        &empty_contexts,
+    );
+    assert_eq!(uninit_res, Err(Ok(AccError::NotInitialized)));
 }
 
 #[test]
@@ -432,12 +508,124 @@ fn test_t51_signer_rotation_and_safety() {
     // Zero weight signer rejected
     let kp_zero = generate_keypair(&env);
     let zero_weight_res = client.try_add_signer(&Signer {
-        public_key: kp_zero.public_key_bytes,
+        public_key: kp_zero.public_key_bytes.clone(),
         weight: 0,
         role: SignerRole::Owner,
         name: String::from_str(&env, "Zero Weight"),
     });
     assert_eq!(zero_weight_res, Err(Ok(AccError::InvalidSignerWeight)));
+
+    // Non-existent signer removal rejected with SignerNotFound
+    let non_existent_kp = generate_keypair(&env);
+    let rem_non_existent = client.try_remove_signer(&non_existent_kp.public_key_bytes);
+    assert_eq!(rem_non_existent, Err(Ok(AccError::SignerNotFound)));
+
+    // Signer addition with invalid public key format rejected
+    let mut bad_pk_bytes = [0u8; 65];
+    bad_pk_bytes[0] = 0x02; // Compressed prefix
+    bad_pk_bytes[1] = 0x05;
+    let bad_pk = BytesN::<65>::from_array(&env, &bad_pk_bytes);
+    let bad_pk_res = client.try_add_signer(&Signer {
+        public_key: bad_pk,
+        weight: 1,
+        role: SignerRole::Owner,
+        name: String::from_str(&env, "Bad PK"),
+    });
+    assert_eq!(bad_pk_res, Err(Ok(AccError::InvalidSignature)));
+
+    // Update signer: successfully adjust role, name, and weight
+    let updated_signer = Signer {
+        public_key: kp_new.public_key_bytes.clone(),
+        weight: 2,
+        role: SignerRole::Owner,
+        name: String::from_str(&env, "Promoted Owner Key"),
+    };
+    let update_res = client.try_update_signer(&updated_signer);
+    assert!(update_res.is_ok());
+
+    let fetched = client.get_signer(&kp_new.public_key_bytes).unwrap();
+    assert_eq!(fetched.weight, 2);
+    assert_eq!(fetched.role, SignerRole::Owner);
+    assert_eq!(fetched.name, String::from_str(&env, "Promoted Owner Key"));
+
+    // Now threshold can be safely increased to 2
+    client.update_threshold(&2);
+    assert_eq!(client.get_threshold(), 2);
+
+    // Update signer: cannot reduce weight below threshold (anti-bricking)
+    let underweight_signer = Signer {
+        public_key: kp_new.public_key_bytes.clone(),
+        weight: 1, // Below threshold 2
+        role: SignerRole::Owner,
+        name: String::from_str(&env, "Underweight"),
+    };
+    let underweight_res = client.try_update_signer(&underweight_signer);
+    assert_eq!(
+        underweight_res,
+        Err(Ok(AccError::CannotRemoveBelowThreshold))
+    );
+
+    // Update signer: non-existent signer fails with SignerNotFound
+    let non_existent_update = Signer {
+        public_key: non_existent_kp.public_key_bytes.clone(),
+        weight: 1,
+        role: SignerRole::Guardian,
+        name: String::from_str(&env, "Ghost"),
+    };
+    assert_eq!(
+        client.try_update_signer(&non_existent_update),
+        Err(Ok(AccError::SignerNotFound))
+    );
+
+    // Uninitialized checks
+    let uninit_id = env.register(SmartAccountContract, ());
+    let uninit_client = SmartAccountContractClient::new(&env, &uninit_id);
+    assert_eq!(
+        uninit_client.try_add_signer(&updated_signer),
+        Err(Ok(AccError::NotInitialized))
+    );
+    assert_eq!(
+        uninit_client.try_remove_signer(&kp_new.public_key_bytes),
+        Err(Ok(AccError::NotInitialized))
+    );
+    assert_eq!(
+        uninit_client.try_update_threshold(&1),
+        Err(Ok(AccError::NotInitialized))
+    );
+    assert_eq!(
+        uninit_client.try_update_signer(&updated_signer),
+        Err(Ok(AccError::NotInitialized))
+    );
+    assert_eq!(uninit_client.get_threshold(), 0);
+    assert_eq!(uninit_client.get_signers().len(), 0);
+}
+
+#[test]
+fn test_smart_account_unauthorized_self_auth_enforcement() {
+    let env = Env::default();
+    let contract_id = env.register(SmartAccountContract, ());
+    let client = SmartAccountContractClient::new(&env, &contract_id);
+
+    let admin_kp = generate_keypair(&env);
+    client.initialize(
+        &admin_kp.public_key_bytes,
+        &1,
+        &String::from_str(&env, "Owner Passkey"),
+    );
+
+    let new_kp = generate_keypair(&env);
+    let new_signer = Signer {
+        public_key: new_kp.public_key_bytes.clone(),
+        weight: 1,
+        role: SignerRole::Backup,
+        name: String::from_str(&env, "Backup Key"),
+    };
+
+    // Attempting management calls without self-authorization fails
+    assert!(client.try_add_signer(&new_signer).is_err());
+    assert!(client.try_remove_signer(&admin_kp.public_key_bytes).is_err());
+    assert!(client.try_update_threshold(&2).is_err());
+    assert!(client.try_update_signer(&new_signer).is_err());
 }
 
 #[test]
