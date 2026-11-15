@@ -24,6 +24,12 @@ pub enum VaultError {
     InvalidBps = 12,
     SleeveNotFound = 13,
     MathOverflow = 14,
+    /// Sleeve holdings are recorded only by value-moving flows; they can never be set directly.
+    BalanceNotSettable = 15,
+    /// A sleeve cannot be removed while the vault still holds its asset.
+    SleeveHasHoldings = 16,
+    /// Malformed sleeve set (duplicate asset, cash sleeve not the numéraire, not exactly one cash sleeve).
+    InvalidSleeveConfig = 17,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
