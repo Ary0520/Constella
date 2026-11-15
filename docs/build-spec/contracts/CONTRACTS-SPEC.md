@@ -359,8 +359,9 @@ Data: { relevant fields, timestamp }
 
 | Event | Trigger |
 |---|---|
-| `DEPOSIT` | User deposits numéraire |
-| `REDEEM` | User redeems shares |
+| `deposit` | SEP-56 event (name defined by the standard): topics `[deposit, operator, from, receiver]`, data `(assets, shares)`; emitted by `deposit` and `mint` |
+| `withdraw` | SEP-56 event: topics `[withdraw, operator, receiver, owner]`, data `(assets, shares)`; emitted by `withdraw` and `redeem` |
+| `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard) |
 | `REBALANCE_STEP` | Each trade in a rebalance |
 | `REBALANCE_COMPLETE` | Full rebalance completed |
 | `NAV_PAUSE` | Circuit breaker triggered |
@@ -370,4 +371,6 @@ Data: { relevant fields, timestamp }
 | `POLICY_UPDATED` | Policy hash updated |
 | `VAULT_PAUSED` | Vault paused |
 | `VAULT_UNPAUSED` | Vault unpaused |
+| `VAULT_INITIALIZED` / `SLEEVES_UPDATED` / `CAPS_LOWERED` | Vault configured at deployment / layout changed / caps lowered |
+| `UPGRADE_PROPOSED` / `UPGRADE_CANCELLED` | Timelocked upgrade lifecycle (audit W3) |
 | `UPGRADE` | WASM upgraded |
