@@ -48,6 +48,7 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
   - Logs the deviation event on-chain
 - Trading and rebalancing for the affected sleeve also paused
 - Unaffected sleeves continue normally
+- **Where it is detected (audit O4, 15 Nov 2026):** the deviation check runs inside every price write (`update_price`, `register_source`), so the pause and its `NAV_PAUSE` event persist in that successful transaction. Reads re-check as defence in depth, but a pause first seen inside a caller that reverts would be rolled back — so writes are the authoritative trigger. Staleness and insufficient sources (Rule 5) are evaluated live on every read and are not latched.
 
 ### Rule 5: Staleness limits and hard stop
 - Every source has a **staleness limit** (time since last update, defined per-source in registry)
