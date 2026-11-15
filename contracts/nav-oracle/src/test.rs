@@ -875,3 +875,75 @@ mod o4 {
         assert_eq!(client.get_collateral_nav(&sleeve).unwrap().price, 1_000_000);
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit O2 (2026-11-15): timestamps must not be in the future, updates must
+// not go backwards, and any future-dated stored source is invalid.
+// -------------------------------------------------------------------------
+mod o2 {
+    use super::*;
+
+    fn err(e: OracleError) -> Result<(), Result<soroban_sdk::Error, soroban_sdk::InvokeError>> {
+        Err(Ok(soroban_sdk::Error::from_contract_error(e as u32)))
+    }
+
+    fn feed(env: &Env) -> (NavOracleClient<'_>, Symbol, Address) {
+        let (client, _admin, _base) = setup_oracle(env);
+        let sleeve = Symbol::new(env, "USD_GOV_FUNDS");
+        client.configure_sleeve(&sleeve, &200, &2);
+        env.ledger().set_timestamp(10_000);
+        let asset = Address::generate(env);
+        client.register_source(&create_source(env, "NAV", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 10_000));
+        client.register_source(&create_source(env, "RFL", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 10_000));
+        (client, sleeve, asset)
+    }
+
+    #[test]
+    fn update_with_future_timestamp_rejected() {
+        let env = Env::default();
+        let (client, _sleeve, _asset) = feed(&env);
+        let nav = Symbol::new(&env, "NAV");
+        assert_eq!(
+            client.try_update_price(&nav, &1_000_000, &200_000, &10_001).map(|_| ()),
+            err(OracleError::FutureTimestamp)
+        );
+        assert_eq!(client.get_source(&nav).unwrap().timestamp, 10_000);
+    }
+
+    #[test]
+    fn register_with_future_timestamp_rejected() {
+        let env = Env::default();
+        let (client, _sleeve, asset) = feed(&env);
+        let src = create_source(&env, "LATE", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 99_999);
+        assert_eq!(client.try_register_source(&src).map(|_| ()), err(OracleError::FutureTimestamp));
+        assert!(client.get_source(&Symbol::new(&env, "LATE")).is_none());
+    }
+
+    #[test]
+    fn out_of_order_update_rejected_but_equal_and_newer_accepted() {
+        let env = Env::default();
+        let (client, _sleeve, _asset) = feed(&env);
+        let nav = Symbol::new(&env, "NAV");
+        env.ledger().set_timestamp(20_000);
+        client.update_price(&nav, &1_001_000, &200_000, &15_000);
+        assert_eq!(
+            client.try_update_price(&nav, &1_002_000, &200_000, &14_999).map(|_| ()),
+            err(OracleError::OutOfOrderUpdate)
+        );
+        client.update_price(&nav, &1_002_000, &200_000, &15_000); // same-time correction
+        client.update_price(&nav, &1_003_000, &200_000, &20_000); // ledger "now"
+        assert_eq!(client.get_source(&nav).unwrap().price, 1_003_000);
+    }
+
+    #[test]
+    fn stored_future_dated_source_is_treated_as_invalid() {
+        let env = Env::default();
+        let (client, sleeve, _asset) = feed(&env);
+        assert!(client.get_collateral_nav(&sleeve).is_some());
+        // Ledger time moves behind the stored timestamps (e.g. data written
+        // before this fix or a misconfigured network): sources are invalid.
+        env.ledger().set_timestamp(9_000);
+        assert!(client.get_collateral_nav(&sleeve).is_none());
+        assert!(client.get_deposit_nav(&sleeve).is_none());
+    }
+}
