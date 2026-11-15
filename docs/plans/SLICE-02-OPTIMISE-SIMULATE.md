@@ -1,7 +1,7 @@
 # Slice 2 Micro-Spec: Thesis Engine Optimise & Simulate (Steps 3 & 4)
 
 > **Module:** `services/ai-engine`  
-> **Status:** Specification & Plan Phase (Pre-Implementation)  
+> **Status:** Implemented (code + tests on main). Open findings tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/ai-engine/THESIS-ENGINE.md`](../build-spec/ai-engine/THESIS-ENGINE.md), [`docs/build-spec/architecture/VAULT-DESIGN.md`](../build-spec/architecture/VAULT-DESIGN.md), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 3, 10, 11)
 
 ---

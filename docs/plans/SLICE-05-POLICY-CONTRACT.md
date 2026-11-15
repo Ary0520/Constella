@@ -1,7 +1,7 @@
 # Slice 5 Micro-Spec: Policy Storage & Rebalance Guardrails Contract (Soroban Rust)
 
 > **Module:** `contracts/policy`  
-> **Status:** Specification & Plan Phase (Pre-Implementation)  
+> **Status:** Implemented (code + tests on main). Open findings tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/contracts/CONTRACTS-SPEC.md`](../build-spec/contracts/CONTRACTS-SPEC.md#L71-L112), [`docs/build-spec/architecture/EXECUTION.md`](../build-spec/architecture/EXECUTION.md#L33-L85), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 5, 6, 8, 11, 12)
 
 ---

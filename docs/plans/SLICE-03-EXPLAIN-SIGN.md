@@ -1,7 +1,7 @@
 # Slice 3 Micro-Spec: Thesis Engine Explain & Sign (Steps 5 & 6)
 
 > **Module:** `services/ai-engine`  
-> **Status:** Specification & Plan Phase (Pre-Implementation)  
+> **Status:** Implemented (code + tests on main). Open findings tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/ai-engine/THESIS-ENGINE.md`](../build-spec/ai-engine/THESIS-ENGINE.md), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 5, 11), [`docs/build-spec/contracts/CONTRACTS-SPEC.md`](../build-spec/contracts/CONTRACTS-SPEC.md)
 
 ---

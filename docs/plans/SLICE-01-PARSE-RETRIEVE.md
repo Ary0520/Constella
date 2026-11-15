@@ -1,7 +1,7 @@
 # Slice 1 Micro-Spec: Thesis Engine Parse & Retrieve (Steps 1 & 2)
 
 > **Module:** `services/ai-engine`  
-> **Status:** Specification & Test Harness Phase (Pre-Implementation)  
+> **Status:** Implemented (code + tests on main). Open findings tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/ai-engine/THESIS-ENGINE.md`](../build-spec/ai-engine/THESIS-ENGINE.md), [`docs/build-spec/ai-engine/REGISTRY.md`](../build-spec/ai-engine/REGISTRY.md)
 
 ---

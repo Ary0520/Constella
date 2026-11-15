@@ -1,7 +1,7 @@
 # Slice 4 Micro-Spec: Closed Universe Asset Registry Contract (Soroban Rust)
 
 > **Module:** `contracts/registry`  
-> **Status:** Specification & Plan Phase (Pre-Implementation)  
+> **Status:** Implemented (code + tests on main). Open findings tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/contracts/CONTRACTS-SPEC.md`](../build-spec/contracts/CONTRACTS-SPEC.md#L32-L70), [`docs/build-spec/ai-engine/REGISTRY.md`](../build-spec/ai-engine/REGISTRY.md), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 4, 6, 8, 11, 12)
 
 ---

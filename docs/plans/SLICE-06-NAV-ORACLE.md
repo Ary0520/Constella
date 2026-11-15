@@ -1,7 +1,7 @@
 # Slice 6 Micro-Spec: NAV Oracle Contract (SEP-40 Multi-Source & Deviation Circuit Breakers)
 
 > **Module:** `contracts/nav-oracle`  
-> **Status:** Implemented & Verified  
+> **Status:** Implemented. Open findings (O1–O4, W5) tracked in `docs/audit/AUDIT-2026-11-15.md`.  
 > **Reference:** [`docs/build-spec/architecture/NAV-ORACLE.md`](../build-spec/architecture/NAV-ORACLE.md), [`docs/build-spec/contracts/CONTRACTS-SPEC.md`](../build-spec/contracts/CONTRACTS-SPEC.md#L197-L240), [`docs/build-spec/contracts/SEPS.md`](../build-spec/contracts/SEPS.md#L87-L111), [`docs/build-spec/AGENT-RULES.md`](../build-spec/AGENT-RULES.md) (Rule 1, 3, 6, 8, 11, 12)
 
 ---
