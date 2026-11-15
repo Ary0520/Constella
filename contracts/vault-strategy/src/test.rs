@@ -1319,3 +1319,77 @@ mod p3_bind {
     }
 
 }
+
+// -------------------------------------------------------------------------
+// Audit V3 (2026-11-15): an unpriced sleeve that holds nothing must never
+// halt the vault (NAV-ORACLE Rules 4/5: "unaffected sleeves continue").
+// -------------------------------------------------------------------------
+mod v3 {
+    use super::*;
+
+    fn vault_with_empty_gov_sleeve(ctx: &TestContext) -> Address {
+        let gov = register_gov_fund(ctx);
+        ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
+        ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+        let mut sleeves = SdkVec::new(&ctx.env);
+        sleeves.push_back(sleeve(ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 500_0000000));
+        sleeves.push_back(sleeve(ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+        ctx.vault_client.set_sleeves(&sleeves);
+        gov
+    }
+
+    fn assert_vault_operates(ctx: &TestContext) {
+        assert_eq!(ctx.vault_client.get_nav_deposit().unwrap().price, 10_000_000);
+        assert_eq!(ctx.vault_client.get_nav_conservative().unwrap().price, 10_000_000);
+        assert_eq!(ctx.vault_client.deposit(&100_0000000, &ctx.alice), 100_0000000);
+        assert_eq!(ctx.vault_client.redeem(&50_0000000, &ctx.alice, &ctx.alice), 50_0000000);
+        assert_eq!(ctx.vault_client.withdraw(&10_0000000, &ctx.alice, &ctx.alice), 10_0000000);
+    }
+
+    #[test]
+    fn paused_empty_sleeve_does_not_halt_vault() {
+        let ctx = setup_test_context();
+        vault_with_empty_gov_sleeve(&ctx);
+        let gov_sym = Symbol::new(&ctx.env, "USD_GOV_FUNDS");
+        ctx.oracle_client.trigger_circuit_breaker(&ctx.admin, &gov_sym, &Symbol::new(&ctx.env, "MANUAL"));
+        assert!(ctx.oracle_client.is_sleeve_paused(&gov_sym));
+        assert_vault_operates(&ctx);
+    }
+
+    #[test]
+    fn stale_empty_sleeve_does_not_halt_vault() {
+        let ctx = setup_test_context();
+        vault_with_empty_gov_sleeve(&ctx);
+        // Gov-fund feeds have a 4h staleness limit; jump 1 day.
+        ctx.env.ledger().set_timestamp(1_000_000 + 86_400);
+        assert!(ctx.oracle_client.get_collateral_nav(&Symbol::new(&ctx.env, "USD_GOV_FUNDS")).is_none());
+        assert_vault_operates(&ctx);
+    }
+
+    #[test]
+    fn never_priced_empty_sleeve_does_not_halt_vault() {
+        let ctx = setup_test_context();
+        // Registered asset with NO oracle sources configured for its sleeve.
+        let eur = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
+        ctx.registry_client.add_asset(&AssetEntry {
+            contract_address: eur.clone(),
+            asset_id: Symbol::new(&ctx.env, "SPIKO_EUR"),
+            sleeve_type: RegSleeveType::EurSovereign,
+            liquidity_tier: 1,
+            permissionless: true,
+            oracle_sources: SdkVec::from_array(&ctx.env, [Symbol::new(&ctx.env, "NONE_YET")]),
+            eligible_jurisdictions: SdkVec::new(&ctx.env),
+            blocked_jurisdictions: SdkVec::new(&ctx.env),
+            investor_classes_required: SdkVec::new(&ctx.env),
+            is_active: true,
+            added_at: 1_000_000,
+        });
+        ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
+        ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+        let mut sleeves = SdkVec::new(&ctx.env);
+        sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 8000, 500_0000000));
+        sleeves.push_back(sleeve(&ctx, "SPIKO_EUR", &eur, SleeveType::EurSovereign, 2000, 0));
+        ctx.vault_client.set_sleeves(&sleeves);
+        assert_vault_operates(&ctx);
+    }
+}
