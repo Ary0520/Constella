@@ -35,7 +35,10 @@ For users who don't own XLM and don't want to think about blockchain, this is a 
 - No seed phrase, no private key management by the user
 - Social recovery: multiple authorized signers (e.g. phone + email + guardian address)
 - **Zipper (Protocol 27, CAP-71):** Authentication delegation for custom accounts — cheaper multi-signer setups with replay protection
-- Uses OpenZeppelin `stellar-accounts`: passkey signatures are WebAuthn assertions verified by OZ's audited WebAuthn verifier (audit S1, W4.3a — user presence **and** user verification required). Moving signer/threshold/context-rule management to the full OZ smart-account framework is W4.3b.
+- Built on OpenZeppelin `stellar-accounts` context rules (W4.3b). Passkey signatures are WebAuthn assertions, requiring user presence **and** user verification; a shared `webauthn-verifier` contract checks them.
+- **Owner rule:** the owner passkey has full control. This rule cannot be removed, cannot expire, and always keeps a signer.
+- **Recovery rule:** M-of-N guardians under the shared `threshold-policy`, scoped to the account's own management functions. Guardians can rotate a lost owner passkey but **cannot** move funds.
+- **Open decision:** a time delay on recovery actions (so the owner can cancel a malicious recovery) is not yet implemented; logged in the audit tracker.
 
 **User experience:** "Create account with Face ID" → deposit → done. No XLM, no seed phrase.
 

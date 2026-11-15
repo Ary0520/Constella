@@ -17,6 +17,10 @@ constella-contracts/
 ├── vault-private/      # Per-institution vault (same WASM as strategy) [Q1 2027]
 ├── nav-oracle/         # NAV computation and circuit breakers
 ├── keeper/             # Rebalance proposer and TTL extender
+├── smart-account/      # Passkey smart account (OZ context rules)
+├── webauthn-verifier/  # Shared passkey verifier (OZ Verifier)
+├── threshold-policy/   # Shared M-of-N policy (OZ Policy)
+├── fee-sponsor/        # Fee sponsorship quotas
 ├── adapters/
 │   ├── blend/          # Blend supply position adapter [Phase 2]
 │   ├── defindex/       # DeFindex yield aggregator adapter [Phase 2]
@@ -235,6 +239,47 @@ pub struct RiskSheet {
 ```
 
 **Share class:** Open (Phase 1); Gated/SEP-57 (Phase 3+, requires identity verifier)
+
+---
+
+## Smart Account, WebAuthn Verifier and Threshold Policy (W4.3b, `4b421cc`)
+
+**Base:** OpenZeppelin `stellar-accounts` 0.8.0 (context-rule smart account).
+
+```rust
+// smart-account
+fn __constructor(env: Env, verifier: Address, owner_key: Bytes, name: String) // installs the owner rule
+fn __check_auth(env, payload: Hash<32>, sig: AuthPayload, contexts: Vec<Context>) // OZ do_check_auth
+fn get_owner_rule(env: Env) -> u32
+// OZ SmartAccount: add_context_rule, get_context_rule(s_count), add/remove_signer,
+// add/remove_policy, update_context_rule_name / _valid_until, remove_context_rule,
+// get_signer_id, get_policy_id, auth_digest. No `execute`, no `initialize`.
+
+// webauthn-verifier (stateless, one deployment for all accounts)
+fn verify(env, hash: Bytes, key_data: Bytes /* 65-byte P-256 key [+ credential id] */,
+          sig_data: Bytes /* XDR WebAuthnSigData */) -> bool
+
+// threshold-policy (one deployment, state per (account, rule))
+fn enforce / install / uninstall      // OZ Policy, simple_threshold
+fn get_threshold(env, context_rule_id: u32, smart_account: Address) -> u32
+fn set_threshold(env, threshold: u32, context_rule: ContextRule, smart_account: Address)
+```
+
+**Rules:**
+- **Owner rule:** installed by the constructor. `Default` scope (any operation), owner passkey, no policies.
+- **Recovery rule:** added by the owner. `CallContract(self)` scope, so it can manage the account only. Guardian passkeys sit under an M-of-N threshold policy, so recovery can rotate the owner key but cannot move funds.
+- **Signed rule choice:** each operation is matched to the rule the signer chose, and that choice is signed. A passkey signs a WebAuthn assertion over `SHA-256(XDR(account, signature_payload, context_rule_ids))`.
+
+**Anti-bricking (Constella overrides of OZ defaults):**
+- The owner rule cannot be removed, cannot be given an expiry, and must keep at least one signer.
+- No signer removal may leave a threshold-governed rule with fewer signers than its threshold.
+
+**Errors:** `AccError` 1 `InvalidPublicKey`, 2 `OwnerRuleProtected`, 3 `OwnerRuleNeedsSigner`, 4 `ThresholdUnreachable`; OZ `SmartAccountError` 3000-3018, `WebAuthnError` 3110-3119, simple threshold 32xx.
+
+**Client requirements:**
+- Submit low-S P-256 signatures.
+- Encode `WebAuthnSigData` as XDR in the `AuthPayload` signer map.
+- Pass one rule ID per authorized context. A vault deposit authorizes two contexts (the vault call and the USDC transfer), and both use the owner rule.
 
 ---
 
