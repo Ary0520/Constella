@@ -322,6 +322,10 @@ fn activate_source(env: Env, source_id: Symbol)      // anyone, after the delay;
 fn cancel_source_change(env: Env, source_id: Symbol) // admin
 fn deactivate_source(env: Env, source_id: Symbol)    // admin; immediate (fails safe)
 fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource>
+// Reflector pull sources (O7b)
+fn register_reflector_source(env: Env, source: OracleSource, config: ReflectorConfig) // admin; validated against the live feed
+fn pull_price(env: Env, source_id: Symbol) -> Option<SourcedPrice>  // live converted price; None if gappy/stale/unreadable/overflow
+fn get_pull_feed(env: Env, source_id: Symbol) -> Option<PullFeed>
 // caller must sign AND be the pause authority or the admin (audit O1)
 fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol)
 fn clear_circuit_breaker(env: Env, sleeve_id: Symbol)  // admin (multisig) only

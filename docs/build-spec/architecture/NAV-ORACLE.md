@@ -48,6 +48,17 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 - `deactivate_source` is immediate (it can only halt pricing).
 - Verified provider facts for the pull sources (Reflector, RedStone) are in `references/ORACLE-SOURCES.md`.
 
+### Reflector pull sources (audit O7b, `1e2c5ff`)
+- `register_reflector_source(source, ReflectorConfig { contract, asset, quote, rounds })`: the source's price is read live from a Reflector Pulse feed. It goes through the same immediate-or-48 h rule as pushed sources and cannot be pushed into.
+- **Rounds:** the median of the newest `rounds` records (3–20). Fewer real records (gaps) mean the source is invalid. Staleness is measured on the **oldest** round used.
+- **Conversion** (rounding down):
+  - `InBase`, for a feed whose base is our numéraire (e.g. Reflector pubnet, base USDC): `median × 10^ours / 10^feed_decimals`.
+  - `ViaUsdc(key)`, for USD-based feeds (Reflector CEX/DEX, FX): `median(asset) × 10^ours / median(USDC)`, using the same feed's USDC key. USD is never assumed to equal USDC, and the cross rate is as stale as its stalest leg.
+  - Overflow invalidates the source; it never wraps.
+- **Validated at registration against the live feed:** decimals, quoted asset, base or USDC key, round bounds. A depth floor must be 0, because Reflector carries no depth.
+- **Thin markets:** Reflector's pubnet feed is an SDEX/AMM VWAP. Use it only alongside an independent source; the cross-source deviation breaker then fails closed on manipulation (YieldBlox lesson, `references/ORACLE-SOURCES.md` §5).
+- **Operations:** Reflector assets expire unless renewed with XRF, and an expired asset reads as invalid. Monitor and fund every key used.
+
 ### Per-asset evaluation (audit O6, 15 Nov 2026)
 - Every rule below is evaluated **per asset**, among that asset's own sources. A sleeve may hold several assets at different prices (USDC and EURC in cash; BENJI and USDY in USD gov funds), and comparing them would be meaningless.
 - The **sleeve** is the configuration and pause domain: deviation threshold, minimum valid sources, and the pause flag / `NAV_PAUSE` event.
