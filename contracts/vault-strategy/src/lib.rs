@@ -330,130 +330,121 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
     }
 }
 
-fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NavKind {
+    /// Median of valid sources — used to mint shares.
+    Deposit,
+    /// Minimum of valid sources — used for redemptions and lender views.
+    Collateral,
+}
+
+fn share_scale(env: &Env) -> i128 {
     let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-    let scale = 10i128.pow(decimals);
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
+    10i128.pow(decimals)
+}
+
+/// Value of one sleeve in numéraire, and the oracle timestamp used.
+///
+/// Audit V4: this is the ONLY place a sleeve is valued. There is no par
+/// fallback: cash counts at face value, an empty sleeve counts as exactly 0
+/// (audit V3), and a funded non-cash sleeve must have a valid oracle price or
+/// the caller gets `OracleUnavailable` (NAV-ORACLE Rule 5 hard stop).
+fn sleeve_value(
+    env: &Env,
+    oracle: &NavOracleClient,
+    sleeve: &SleeveState,
+    kind: NavKind,
+    scale: i128,
+) -> Result<(i128, u64), VaultError> {
+    let held = sleeve_holdings(env, sleeve);
+    if sleeve.sleeve_type == SleeveType::CashStable {
+        return Ok((held, 0));
+    }
+    if held == 0 {
+        return Ok((0, 0));
+    }
+    let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
+    let pd = match kind {
+        NavKind::Deposit => oracle.get_deposit_nav(&sym),
+        NavKind::Collateral => oracle.get_collateral_nav(&sym),
+    }
+    .ok_or(VaultError::OracleUnavailable)?;
+    if pd.price <= 0 {
+        return Err(VaultError::OracleUnavailable);
+    }
+    let value = held.checked_mul(pd.price).ok_or(VaultError::MathOverflow)? / scale;
+    Ok((value, pd.timestamp))
+}
+
+/// Total value of all sleeves and the latest oracle timestamp involved.
+fn holdings_value(env: &Env, config: &VaultConfig, kind: NavKind) -> Result<(i128, u64), VaultError> {
     let sleeves: Vec<SleeveState> = env
         .storage()
         .instance()
         .get(&DataKey::Sleeves)
         .unwrap_or_else(|| Vec::new(env));
+    let oracle = NavOracleClient::new(env, &config.oracle_contract);
+    let scale = share_scale(env);
+    let mut total = 0i128;
+    let mut latest_ts = env.ledger().timestamp();
+    for sleeve in sleeves.iter() {
+        let (value, ts) = sleeve_value(env, &oracle, &sleeve, kind, scale)?;
+        total = total.checked_add(value).ok_or(VaultError::MathOverflow)?;
+        if ts > latest_ts {
+            latest_ts = ts;
+        }
+    }
+    Ok((total, latest_ts))
+}
 
+fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> Option<PriceData> {
+    let scale = share_scale(env);
+    let total_shares: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::TotalShares)
+        .unwrap_or(0);
+    let has_sleeves = env
+        .storage()
+        .instance()
+        .get::<_, Vec<SleeveState>>(&DataKey::Sleeves)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    // Whole-vault oracle shortcut (tracked as audit V5; behaviour unchanged here).
     let oracle = NavOracleClient::new(env, &config.oracle_contract);
     let vault_sym = Symbol::new(env, "VAULT");
-    if let Some(pd) = oracle.get_deposit_nav(&vault_sym) {
+    let shortcut = match kind {
+        NavKind::Deposit => oracle.get_deposit_nav(&vault_sym),
+        NavKind::Collateral => oracle.get_collateral_nav(&vault_sym),
+    };
+    if let Some(pd) = shortcut {
         return Some(pd);
     }
 
-    let mut total_value = 0i128;
-    let mut latest_ts = env.ledger().timestamp();
-    let mut has_sleeves = false;
-
-    for sleeve in sleeves.iter() {
-        has_sleeves = true;
-        if sleeve.sleeve_type == SleeveType::CashStable {
-            total_value = total_value.checked_add(sleeve_holdings(env, &sleeve))?;
-        } else {
-            // Audit V3: a sleeve that holds nothing contributes exactly 0, so an
-            // unpriced (paused / stale / unconfigured) empty sleeve must not
-            // block pricing. A FUNDED sleeve with no valid price still makes
-            // this return None (hard stop) until queued in-kind claims exist (V6).
-            let held = sleeve_holdings(env, &sleeve);
-            if held == 0 {
-                continue;
-            }
-            let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
-            let pd = oracle.get_deposit_nav(&sym)?;
-            if pd.timestamp > latest_ts {
-                latest_ts = pd.timestamp;
-            }
-            let val = held.checked_mul(pd.price)? / scale;
-            total_value = total_value.checked_add(val)?;
-        }
-    }
-
-    if !has_sleeves || total_shares == 0 {
-        Some(PriceData {
-            price: scale,
-            timestamp: latest_ts,
-            source: Symbol::new(env, "MEDIAN_NAV"),
-        })
+    let (total_value, latest_ts) = holdings_value(env, config, kind).ok()?;
+    let source = match kind {
+        NavKind::Deposit => Symbol::new(env, "MEDIAN_NAV"),
+        NavKind::Collateral => Symbol::new(env, "CONSERVATIVE_NAV"),
+    };
+    let price = if !has_sleeves || total_shares == 0 {
+        scale
     } else {
-        let nav_per_share = (total_value.checked_mul(scale)?) / total_shares;
-        Some(PriceData {
-            price: nav_per_share,
-            timestamp: latest_ts,
-            source: Symbol::new(env, "MEDIAN_NAV"),
-        })
-    }
+        total_value.checked_mul(scale)? / total_shares
+    };
+    Some(PriceData {
+        price,
+        timestamp: latest_ts,
+        source,
+    })
+}
+
+fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
+    compute_nav(env, config, NavKind::Deposit)
 }
 
 fn compute_conservative_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
-    let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-    let scale = 10i128.pow(decimals);
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
-    let sleeves: Vec<SleeveState> = env
-        .storage()
-        .instance()
-        .get(&DataKey::Sleeves)
-        .unwrap_or_else(|| Vec::new(env));
-
-    let oracle = NavOracleClient::new(env, &config.oracle_contract);
-    let vault_sym = Symbol::new(env, "VAULT");
-    if let Some(pd) = oracle.get_collateral_nav(&vault_sym) {
-        return Some(pd);
-    }
-
-    let mut total_value = 0i128;
-    let mut latest_ts = env.ledger().timestamp();
-    let mut has_sleeves = false;
-
-    for sleeve in sleeves.iter() {
-        has_sleeves = true;
-        if sleeve.sleeve_type == SleeveType::CashStable {
-            total_value = total_value.checked_add(sleeve_holdings(env, &sleeve))?;
-        } else {
-            // Audit V3: a sleeve that holds nothing contributes exactly 0, so an
-            // unpriced (paused / stale / unconfigured) empty sleeve must not
-            // block pricing. A FUNDED sleeve with no valid price still makes
-            // this return None (hard stop) until queued in-kind claims exist (V6).
-            let held = sleeve_holdings(env, &sleeve);
-            if held == 0 {
-                continue;
-            }
-            let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
-            let pd = oracle.get_collateral_nav(&sym)?;
-            if pd.timestamp > latest_ts {
-                latest_ts = pd.timestamp;
-            }
-            let val = held.checked_mul(pd.price)? / scale;
-            total_value = total_value.checked_add(val)?;
-        }
-    }
-
-    if !has_sleeves || total_shares == 0 {
-        Some(PriceData {
-            price: scale,
-            timestamp: latest_ts,
-            source: Symbol::new(env, "CONSERVATIVE_NAV"),
-        })
-    } else {
-        let nav_per_share = (total_value.checked_mul(scale)?) / total_shares;
-        Some(PriceData {
-            price: nav_per_share,
-            timestamp: latest_ts,
-            source: Symbol::new(env, "CONSERVATIVE_NAV"),
-        })
-    }
+    compute_nav(env, config, NavKind::Collateral)
 }
 
 /// Tokens of `asset` actually held by this vault right now.
@@ -928,41 +919,10 @@ impl StrategyVault {
 
     pub fn total_assets(env: Env) -> i128 {
         let config = get_config(&env);
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-        let sleeves: Vec<SleeveState> = env
-            .storage()
-            .instance()
-            .get(&DataKey::Sleeves)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut total = 0i128;
-        let oracle = NavOracleClient::new(&env, &config.oracle_contract);
-
-        for sleeve in sleeves.iter() {
-            if sleeve.sleeve_type == SleeveType::CashStable {
-                total = match total.checked_add(sleeve_holdings(&env, &sleeve)) {
-                    Some(v) => v,
-                    None => panic_with_error!(&env, VaultError::MathOverflow),
-                };
-            } else {
-                let sym = compute_sleeve_symbol(&env, sleeve.sleeve_type);
-                let price = if let Some(pd) = oracle.get_collateral_nav(&sym) {
-                    pd.price
-                } else {
-                    scale
-                };
-                let val = match sleeve_holdings(&env, &sleeve).checked_mul(price) {
-                    Some(product) => product / scale,
-                    None => panic_with_error!(&env, VaultError::MathOverflow),
-                };
-                total = match total.checked_add(val) {
-                    Some(v) => v,
-                    None => panic_with_error!(&env, VaultError::MathOverflow),
-                };
-            }
+        match holdings_value(&env, &config, NavKind::Collateral) {
+            Ok((total, _)) => total,
+            Err(e) => panic_with_error!(&env, e),
         }
-        total
     }
 
     pub fn total_supply(env: Env) -> i128 {
@@ -1220,9 +1180,14 @@ impl StrategyVault {
             .instance()
             .get(&DataKey::Sleeves)
             .unwrap_or_else(|| Vec::new(&env));
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
+        let scale = share_scale(&env);
         let oracle = NavOracleClient::new(&env, &config.oracle_contract);
+        let add = |acc: i128, v: i128| -> i128 {
+            match acc.checked_add(v) {
+                Some(x) => x,
+                None => panic_with_error!(&env, VaultError::MathOverflow),
+            }
+        };
 
         let mut cash_balance = 0i128;
         let mut in_24h = 0i128;
@@ -1230,24 +1195,17 @@ impl StrategyVault {
         let mut longer = 0i128;
 
         for sleeve in sleeves.iter() {
-            let sym = compute_sleeve_symbol(&env, sleeve.sleeve_type);
-            let price = if sleeve.sleeve_type == SleeveType::CashStable {
-                scale
-            } else if let Some(pd) = oracle.get_collateral_nav(&sym) {
-                pd.price
-            } else {
-                scale
+            let value = match sleeve_value(&env, &oracle, &sleeve, NavKind::Collateral, scale) {
+                Ok((v, _)) => v,
+                Err(e) => panic_with_error!(&env, e),
             };
-            let held = sleeve_holdings(&env, &sleeve);
-            let value = (held * price) / scale;
-
             if sleeve.sleeve_type == SleeveType::CashStable {
-                cash_balance += held;
+                cash_balance = add(cash_balance, value);
             } else {
                 match sleeve.liquidity_tier {
-                    0 | 1 => in_24h += value,
-                    2 => in_1w += value,
-                    _ => longer += value,
+                    0 | 1 => in_24h = add(in_24h, value),
+                    2 => in_1w = add(in_1w, value),
+                    _ => longer = add(longer, value),
                 }
             }
         }
@@ -1273,8 +1231,7 @@ impl StrategyVault {
             .get(&DataKey::Sleeves)
             .unwrap_or_else(|| Vec::new(&env));
         let total_a = Self::total_assets(env.clone());
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
+        let scale = share_scale(&env);
         let oracle = NavOracleClient::new(&env, &config.oracle_contract);
 
         let mut weighted_hours = 0u64;
@@ -1287,18 +1244,17 @@ impl StrategyVault {
                     2 => 168,
                     _ => 720,
                 };
-                let price = if sleeve.sleeve_type == SleeveType::CashStable {
-                    scale
-                } else {
-                    let sym = compute_sleeve_symbol(&env, sleeve.sleeve_type);
-                    if let Some(pd) = oracle.get_collateral_nav(&sym) {
-                        pd.price
-                    } else {
-                        scale
-                    }
+                let value = match sleeve_value(&env, &oracle, &sleeve, NavKind::Collateral, scale) {
+                    Ok((v, _)) => v,
+                    Err(e) => panic_with_error!(&env, e),
                 };
-                let val = (sleeve_holdings(&env, &sleeve) * price) / scale;
-                total_val_hours += val * tier_hours;
+                total_val_hours = match value
+                    .checked_mul(tier_hours)
+                    .and_then(|vh| total_val_hours.checked_add(vh))
+                {
+                    Some(x) => x,
+                    None => panic_with_error!(&env, VaultError::MathOverflow),
+                };
             }
             weighted_hours = (total_val_hours / total_a) as u64;
         }
