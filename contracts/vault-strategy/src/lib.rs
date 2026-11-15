@@ -349,7 +349,6 @@ pub enum DataKey {
 pub trait NavOracleInterface {
     fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
     fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
-    fn price(env: Env, asset: Address) -> Option<PriceData>;
     fn get_source(env: Env, source_id: Symbol) -> Option<OracleSource>;
     fn get_sleeve_sources(env: Env, sleeve_id: Symbol) -> Vec<Symbol>;
 }

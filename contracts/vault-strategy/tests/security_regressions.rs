@@ -496,7 +496,7 @@ fn o3_single_source_configuration_is_refused() {
     let mut src = oracle_source(&s.env, "ONLY_FEED", &asset, 107 * ONE);
     src.sleeve = xlm_sleeve.clone();
     s.oracle.register_source(&src);
-    assert!(s.oracle.price(&asset).is_none(), "a single source must not produce a price");
+    assert!(s.oracle.collateral_price(&asset).is_none(), "a single source must not produce a price");
     assert!(s.oracle.get_collateral_nav(&xlm_sleeve).is_none());
 }
 

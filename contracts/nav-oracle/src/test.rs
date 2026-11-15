@@ -328,8 +328,8 @@ fn test_t39_sep40_interface_conformance() {
     let env = Env::default();
     let (client, _admin, base_asset) = setup_oracle(&env);
 
-    // Verify metadata functions
-    assert_eq!(client.base(), base_asset);
+    // SEP-40 metadata (W5: Asset enum, not raw addresses)
+    assert_eq!(client.base(), Asset::Stellar(base_asset.clone()));
     assert_eq!(client.decimals(), 7);
     assert_eq!(client.resolution(), 300);
 
@@ -343,44 +343,33 @@ fn test_t39_sep40_interface_conformance() {
     let s2 = create_source(&env, "REFLECTOR_BENJI", &benji_asset, "USD_GOV_FUNDS", 1_010_000, 200_000, 1000);
     client.register_source(&s1);
     client.register_source(&s2);
+    let benji = Asset::Stellar(benji_asset.clone());
 
     // assets() returns registered assets
-    let assets = client.assets();
-    assert_eq!(assets.len(), 1);
-    assert_eq!(assets.get(0).unwrap(), benji_asset);
+    assert_eq!(client.assets(), soroban_sdk::vec![&env, benji.clone()]);
 
-    // price() returns conservative NAV (minimum of valid sources)
-    let p = client.price(&benji_asset).expect("price should return Some");
+    // Conservative NAV (minimum of valid sources), with its source
+    let p = client.collateral_price(&benji_asset).expect("collateral price should exist");
     assert_eq!(p.price, 1_000_000);
     assert_eq!(p.source, Symbol::new(&env, "BENJI_NAV"));
 
-    // lastprice() returns valid price
-    let lp = client.lastprice(&benji_asset).expect("lastprice should return Some");
-    assert_eq!(lp.price, 1_000_000);
+    // lastprice() = conservative price, timestamp on the resolution grid
+    assert_eq!(client.lastprice(&benji), Some(PriceData { price: 1_000_000, timestamp: 900 }));
 
-    // prices() SEP-40 batch query returns vector of option prices
-    let batch_prices = client.prices(&assets, &1).expect("prices batch should return Some");
-    assert_eq!(batch_prices.len(), 1);
-    assert_eq!(batch_prices.get(0).unwrap().unwrap().price, 1_000_000);
+    // prices() / price(): history recorded at registration
+    assert_eq!(client.prices(&benji, &1), Some(soroban_sdk::vec![&env, PriceData { price: 1_000_000, timestamp: 900 }]));
+    assert_eq!(client.prices(&benji, &0), None);
+    assert_eq!(client.price(&benji, &1000), Some(PriceData { price: 1_000_000, timestamp: 900 }));
 
-    // prices() with 0 records returns empty vector
-    let batch_empty = client.prices(&assets, &0).expect("prices 0 records returns empty");
-    assert_eq!(batch_empty.len(), 0);
-
-    // When time advances past staleness limit:
+    // When time advances past the sources' staleness limit:
     env.ledger().set_timestamp(50_000);
-
-    // Fresh price returns None due to staleness
-    assert!(client.price(&benji_asset).is_none());
-
-    // Batch prices also returns None for stale asset
-    let batch_prices_stale = client.prices(&assets, &1).expect("prices batch returns Some");
-    assert_eq!(batch_prices_stale.len(), 1);
-    assert!(batch_prices_stale.get(0).unwrap().is_none());
-
-    // lastprice still returns the last recorded price (SEP-40 requirement)
-    let lp_stale = client.lastprice(&benji_asset).expect("lastprice returns historical");
-    assert_eq!(lp_stale.price, 1_000_000);
+    assert!(client.collateral_price(&benji_asset).is_none());
+    // W5 (deliberate change): lastprice no longer returns the last stored
+    // price once our own rules invalidate it. Consumers such as Blend accept
+    // prices up to 24h old; returning it would let them lend against a price
+    // Constella treats as stale (Rule 5). Historical records stay queryable.
+    assert_eq!(client.lastprice(&benji), None);
+    assert_eq!(client.price(&benji, &1000), Some(PriceData { price: 1_000_000, timestamp: 900 }));
 }
 
 #[test]
@@ -440,7 +429,7 @@ fn test_uninitialized_and_authorization_checks() {
     let contract_id = env.register(NavOracle, (admin.clone(), base.clone(), 7u32, 300u32));
     let client = NavOracleClient::new(&env, &contract_id);
     assert_eq!(client.get_admin(), admin);
-    assert_eq!(client.base(), base);
+    assert_eq!(client.base(), Asset::Stellar(base.clone()));
     let r = env.try_invoke_contract::<(), soroban_sdk::Error>(
         &contract_id,
         &Symbol::new(&env, "initialize"),
@@ -516,10 +505,10 @@ fn test_thin_feed_cannot_poison_lastprice() {
     client.register_source(&s1);
     client.register_source(&s2);
 
-    // Query price() -> establishes valid conservative NAV of $1.00 and records LastPrice
-    let p = client.price(&benji_asset).expect("valid price");
+    let benji = Asset::Stellar(benji_asset.clone());
+    let p = client.collateral_price(&benji_asset).expect("valid price");
     assert_eq!(p.price, 1_000_000);
-    assert_eq!(client.lastprice(&benji_asset).unwrap().price, 1_000_000);
+    assert_eq!(client.lastprice(&benji).unwrap().price, 1_000_000);
 
     // YieldBlox exploit attempt: A thin market feed ($107.00, but only $50k depth < $100k min)
     let s3_thin = create_source(&env, "MANIPULATED_SDEX", &benji_asset, "USD_GOV_FUNDS", 107_000_000, 50_000, 1000);
@@ -529,9 +518,11 @@ fn test_thin_feed_cannot_poison_lastprice() {
     client.update_price(&Symbol::new(&env, "MANIPULATED_SDEX"), &108_000_000, &40_000, &1000);
 
     // CRITICAL SECURITY ASSERTION: lastprice MUST NOT be poisoned by thin feeds!
-    let lp = client.lastprice(&benji_asset).expect("lastprice returns valid cached price");
+    let lp = client.lastprice(&benji).expect("lastprice returns the valid conservative price");
     assert_eq!(lp.price, 1_000_000, "Thin feed must not poison lastprice");
-    assert_eq!(lp.source, Symbol::new(&env, "BENJI_NAV"));
+    assert_eq!(client.collateral_price(&benji_asset).unwrap().source, Symbol::new(&env, "BENJI_NAV"));
+    let h = client.prices(&benji, &20).unwrap();
+    assert!(h.iter().all(|r| r.price == 1_000_000), "thin feed must not poison history either");
 }
 
 #[test]
@@ -1004,7 +995,7 @@ mod o3 {
         env.ledger().set_timestamp(1000);
         let asset = Address::generate(&env);
         client.register_source(&create_source(&env, "ONLY", &asset, "XLM", 107_000_000, 200_000, 1000));
-        assert!(client.price(&asset).is_none());
+        assert!(client.collateral_price(&asset).is_none());
         assert!(client.get_collateral_nav(&Symbol::new(&env, "XLM")).is_none());
         assert!(client.get_deposit_nav(&Symbol::new(&env, "XLM")).is_none());
     }
@@ -1167,8 +1158,8 @@ mod o6 {
         assert!(!client.is_sleeve_paused(&sleeve), "8% between two healthy assets is not a deviation");
         assert_eq!(client.asset_price(&x).unwrap().price, 1_000_500); // median of X only
         assert_eq!(client.asset_price(&y).unwrap().price, 1_081_000); // median of Y only
-        assert_eq!(client.price(&x).unwrap().price, 1_000_000); // conservative = min of X
-        assert_eq!(client.price(&y).unwrap().price, 1_080_000);
+        assert_eq!(client.collateral_price(&x).unwrap().price, 1_000_000); // conservative = min of X
+        assert_eq!(client.collateral_price(&y).unwrap().price, 1_080_000);
         // A price update within one asset's own band keeps the sleeve live.
         client.update_price(&Symbol::new(&env, "Y_B"), &1_085_000, &200_000, &1000);
         assert!(!client.is_sleeve_paused(&sleeve));
@@ -1198,7 +1189,7 @@ mod o6 {
         client.register_source(&create_source(&env, "Y_ONLY", &y, "GOV", 1_000_000, 200_000, 1000));
         assert!(client.asset_price(&x).is_some());
         assert_eq!(client.asset_price(&y), None, "one source for Y must never price Y");
-        assert_eq!(client.price(&y), None);
+        assert_eq!(client.collateral_price(&y), None);
     }
 
     #[test]

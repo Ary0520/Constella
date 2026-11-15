@@ -30,9 +30,32 @@ pub enum OracleError {
     AssetSleeveMismatch = 14,
 }
 
+/// SEP-40 asset identifier (identical to script3/sep-40-oracle and Reflector).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Asset {
+    /// Stellar asset contract (SAC) or Soroban token address.
+    Stellar(Address),
+    /// Any other asset; this oracle quotes none (always `None`).
+    Other(Symbol),
+}
+
+/// SEP-40 price record: exactly `{price, timestamp}` (audit W5). Older SDKs
+/// decode contracttype structs strictly, so no field may ever be added.
+/// `price` has `decimals()` decimals; `timestamp` is in seconds, on the
+/// `resolution()` grid.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PriceData {
+    pub price: i128,
+    pub timestamp: u64,
+}
+
+/// Constella's detailed price: the SEP-40 fields plus the source it came from.
+/// Used by the vault / policy views (same wire layout as before W5).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourcedPrice {
     pub price: i128,
     pub timestamp: u64,
     pub source: Symbol,
@@ -150,7 +173,8 @@ pub enum DataKey {
     AssetSources(Address),
     AssetSleeve(Address),
     AllAssets,
-    LastPrice(Address),
+    /// SEP-40 history: conservative price snapshots, newest first (W5).
+    History(Address),
     PauseAuthority,
 }
 
@@ -176,30 +200,36 @@ pub trait NavOracleTrait {
     );
 
     /// Rule 3: Conservative NAV (minimum of valid sources) for collateral sizing
-    fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
+    fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice>;
 
     /// Rule 3: Deposit NAV (median of valid sources) for share pricing
-    fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
+    fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice>;
 
-    /// SEP-40: Standard price query
-    fn price(env: Env, asset: Address) -> Option<PriceData>;
+    /// Rule 3 collateral price of one asset: minimum of its valid sources.
+    fn collateral_price(env: Env, asset: Address) -> Option<SourcedPrice>;
 
-    /// SEP-40: Standard last price query
-    fn lastprice(env: Env, asset: Address) -> Option<PriceData>;
+    /// SEP-40: price at `timestamp` (seconds), floored to the resolution grid;
+    /// `None` for unknown assets, the future, or periods with no valid price.
+    fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData>;
+
+    /// SEP-40: the current conservative (collateral) price, evaluated live:
+    /// `None` whenever Constella's rules give no valid price (stale per the
+    /// source's own limit, fewer than 2 valid sources, or a paused sleeve).
+    fn lastprice(env: Env, asset: Asset) -> Option<PriceData>;
 
     /// Fair price of one asset in the numéraire: median of the asset's own
     /// valid sources (same validity rules as every other read). The base
     /// asset is exactly 1.0. Used to value both legs of a trade (audit P1).
-    fn asset_price(env: Env, asset: Address) -> Option<PriceData>;
+    fn asset_price(env: Env, asset: Address) -> Option<SourcedPrice>;
 
-    /// SEP-40: Standard batch price query
-    fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>;
+    /// SEP-40: the last `records` (1..=20) price records, newest first.
+    fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>>;
 
     /// SEP-40 metadata queries
-    fn base(env: Env) -> Address;
+    fn base(env: Env) -> Asset;
     fn decimals(env: Env) -> u32;
     fn resolution(env: Env) -> u32;
-    fn assets(env: Env) -> Vec<Address>;
+    fn assets(env: Env) -> Vec<Asset>;
 
     /// Circuit breaker status and management
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool;
@@ -258,12 +288,12 @@ fn sort_sources_by_price(mut sources: Vec<OracleSource>) -> Vec<OracleSource> {
 }
 
 /// Median of an already-validated, non-empty source list.
-fn median_price(sources: Vec<OracleSource>) -> PriceData {
+fn median_price(sources: Vec<OracleSource>) -> SourcedPrice {
     let sorted = sort_sources_by_price(sources);
     let len = sorted.len();
     if len % 2 == 1 {
         let m = sorted.get(len / 2).unwrap();
-        PriceData {
+        SourcedPrice {
             price: m.price,
             timestamp: m.timestamp,
             source: m.source_id.clone(),
@@ -271,7 +301,7 @@ fn median_price(sources: Vec<OracleSource>) -> PriceData {
     } else {
         let s1 = sorted.get(len / 2 - 1).unwrap();
         let s2 = sorted.get(len / 2).unwrap();
-        PriceData {
+        SourcedPrice {
             price: s1.price + (s2.price - s1.price) / 2,
             timestamp: s1.timestamp.min(s2.timestamp),
             source: s2.source_id.clone(),
@@ -445,6 +475,74 @@ fn latch_deviation_on_write(env: &Env, asset: &Address) {
     let _ = evaluate_asset(env, asset);
 }
 
+/// Reflector-compatible cap on `prices` records (audit W5).
+pub const MAX_PRICE_RECORDS: u32 = 20;
+const HISTORY_TTL_THRESHOLD: u32 = 29 * 17_280;
+const HISTORY_EXTEND_AMOUNT: u32 = 30 * 17_280;
+
+/// Floor a timestamp (seconds) to the resolution grid.
+fn on_grid(env: &Env, t: u64) -> u64 {
+    let r: u32 = env.storage().instance().get(&DataKey::Resolution).unwrap_or(0);
+    if r == 0 {
+        t
+    } else {
+        t / r as u64 * r as u64
+    }
+}
+
+fn base_asset(env: &Env) -> Option<Address> {
+    env.storage().instance().get(&DataKey::BaseAsset)
+}
+
+fn one(env: &Env) -> i128 {
+    let d: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
+    10i128.pow(d)
+}
+
+/// Conservative (collateral) SEP-40 price of `asset` right now: minimum of
+/// its valid sources, stamped with the OLDEST data used, on the grid. The base
+/// asset is exactly 1.0. `None` whenever the asset has no valid price.
+fn conservative_now(env: &Env, asset: &Address) -> Option<PriceData> {
+    if base_asset(env).as_ref() == Some(asset) {
+        return Some(PriceData { price: one(env), timestamp: on_grid(env, env.ledger().timestamp()) });
+    }
+    let valid = evaluate_asset(env, asset).ok()?;
+    let mut price = i128::MAX;
+    let mut oldest = u64::MAX;
+    for s in valid.iter() {
+        price = price.min(s.price);
+        oldest = oldest.min(s.timestamp);
+    }
+    Some(PriceData { price, timestamp: on_grid(env, oldest) })
+}
+
+fn history(env: &Env, asset: &Address) -> Vec<PriceData> {
+    env.storage().persistent().get(&DataKey::History(asset.clone())).unwrap_or_else(|| Vec::new(env))
+}
+
+/// After a successful price write, record the asset's conservative price in
+/// the grid bucket of the CURRENT ledger time - what the oracle reported then -
+/// so a record never contains data newer than its timestamp (no look-ahead).
+/// Latest write in a bucket wins; never backwards; capped at MAX_PRICE_RECORDS.
+fn record_snapshot(env: &Env, asset: &Address) {
+    let Some(live) = conservative_now(env, asset) else { return };
+    let pd = PriceData { price: live.price, timestamp: on_grid(env, env.ledger().timestamp()) };
+    let mut h = history(env, asset);
+    match h.first() {
+        Some(newest) if newest.timestamp == pd.timestamp => h.set(0, pd),
+        Some(newest) if newest.timestamp > pd.timestamp => return,
+        _ => {
+            h.push_front(pd);
+            while h.len() > MAX_PRICE_RECORDS {
+                h.pop_back();
+            }
+        }
+    }
+    let key = DataKey::History(asset.clone());
+    env.storage().persistent().set(&key, &h);
+    env.storage().persistent().extend_ttl(&key, HISTORY_TTL_THRESHOLD, HISTORY_EXTEND_AMOUNT);
+}
+
 #[contract]
 pub struct NavOracle;
 
@@ -599,6 +697,7 @@ impl NavOracleTrait for NavOracle {
         }
 
         latch_deviation_on_write(&env, &source.asset);
+        record_snapshot(&env, &source.asset);
     }
 
     fn update_price(
@@ -654,22 +753,23 @@ impl NavOracleTrait for NavOracle {
         }
         .publish(&env);
         latch_deviation_on_write(&env, &source.asset);
+        record_snapshot(&env, &source.asset);
     }
 
-    fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData> {
+    fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice> {
         // Audit O6: only a single-asset sleeve has a sleeve-level price.
         let asset = single_asset_of_sleeve(&env, &sleeve_id)?;
-        Self::price(env, asset)
+        Self::collateral_price(env, asset)
     }
 
-    fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData> {
+    fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice> {
         // Audit O6: only a single-asset sleeve has a sleeve-level price.
         let asset = single_asset_of_sleeve(&env, &sleeve_id)?;
         let valid_sources = evaluate_asset(&env, &asset).ok()?;
         Some(median_price(valid_sources))
     }
 
-    fn price(env: Env, asset: Address) -> Option<PriceData> {
+    fn collateral_price(env: Env, asset: Address) -> Option<SourcedPrice> {
         let valid_sources = evaluate_asset(&env, &asset).ok()?;
         let mut min_source = valid_sources.get(0).unwrap();
         for s in valid_sources.iter() {
@@ -677,22 +777,30 @@ impl NavOracleTrait for NavOracle {
                 min_source = s;
             }
         }
-        let price_data = PriceData {
+        Some(SourcedPrice {
             price: min_source.price,
             timestamp: min_source.timestamp,
             source: min_source.source_id.clone(),
-        };
-        env.storage()
-            .instance()
-            .set(&DataKey::LastPrice(asset), &price_data);
-        Some(price_data)
+        })
     }
 
-    fn asset_price(env: Env, asset: Address) -> Option<PriceData> {
+    fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData> {
+        let Asset::Stellar(asset) = asset else { return None };
+        if timestamp > env.ledger().timestamp() {
+            return None;
+        }
+        let bucket = on_grid(&env, timestamp);
+        if base_asset(&env).as_ref() == Some(&asset) {
+            return Some(PriceData { price: one(&env), timestamp: bucket });
+        }
+        history(&env, &asset).iter().find(|p| p.timestamp == bucket)
+    }
+
+    fn asset_price(env: Env, asset: Address) -> Option<SourcedPrice> {
         let base: Address = env.storage().instance().get(&DataKey::BaseAsset)?;
         if asset == base {
             let decimals: u32 = env.storage().instance().get(&DataKey::Decimals)?;
-            return Some(PriceData {
+            return Some(SourcedPrice {
                 price: 10i128.pow(decimals),
                 timestamp: env.ledger().timestamp(),
                 source: Symbol::new(&env, "BASE"),
@@ -702,64 +810,46 @@ impl NavOracleTrait for NavOracle {
         Some(median_price(valid))
     }
 
-    fn lastprice(env: Env, asset: Address) -> Option<PriceData> {
-        if let Some(lp) = env
-            .storage()
-            .instance()
-            .get::<_, PriceData>(&DataKey::LastPrice(asset.clone()))
-        {
-            return Some(lp);
+    fn lastprice(env: Env, asset: Asset) -> Option<PriceData> {
+        // Audit W5: live evaluation. The former implementation returned a
+        // stored price even after the sources went stale or the sleeve paused;
+        // a consumer with a looser staleness window (Blend: 24h) would then
+        // lend against a price Constella itself considers invalid.
+        let Asset::Stellar(asset) = asset else { return None };
+        conservative_now(&env, &asset)
+    }
+
+    fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>> {
+        if records == 0 || records > MAX_PRICE_RECORDS {
+            return None;
         }
-
-        // If not explicitly stored in LastPrice, look for active source with valid depth
-        let source_ids: Vec<Symbol> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AssetSources(asset))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut min_price = i128::MAX;
-        let mut min_source: Option<OracleSource> = None;
-
-        for s_id in source_ids.iter() {
-            if let Some(s) = env
-                .storage()
-                .instance()
-                .get::<_, OracleSource>(&DataKey::Source(s_id))
-            {
-                if s.is_active
-                    && s.current_liquidity_depth_usd >= s.min_liquidity_depth_usd
-                    && s.price > 0
-                    && s.price < min_price
-                {
-                    min_price = s.price;
-                    min_source = Some(s);
+        let Asset::Stellar(asset) = asset else { return None };
+        let mut out = Vec::new(&env);
+        if base_asset(&env).as_ref() == Some(&asset) {
+            let r: u32 = env.storage().instance().get(&DataKey::Resolution).unwrap_or(0);
+            let mut t = on_grid(&env, env.ledger().timestamp());
+            for _ in 0..records {
+                out.push_back(PriceData { price: one(&env), timestamp: t });
+                if r == 0 || t < r as u64 {
+                    break;
                 }
+                t -= r as u64;
             }
+            return Some(out);
         }
-
-        min_source.map(|s| PriceData {
-            price: s.price,
-            timestamp: s.timestamp,
-            source: s.source_id,
-        })
+        for p in history(&env, &asset).iter().take(records as usize) {
+            out.push_back(p);
+        }
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
     }
 
-    fn prices(env: Env, assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>> {
-        if records == 0 {
-            return Some(Vec::new(&env));
-        }
-        let mut results = Vec::new(&env);
-        for asset in assets.iter() {
-            let p = Self::price(env.clone(), asset);
-            results.push_back(p);
-        }
-        Some(results)
-    }
-
-    fn base(env: Env) -> Address {
-        match env.storage().instance().get(&DataKey::BaseAsset) {
-            Some(a) => a,
+    fn base(env: Env) -> Asset {
+        match base_asset(&env) {
+            Some(a) => Asset::Stellar(a),
             None => panic_with_error!(&env, OracleError::NotInitialized),
         }
     }
@@ -778,11 +868,9 @@ impl NavOracleTrait for NavOracle {
         }
     }
 
-    fn assets(env: Env) -> Vec<Address> {
-        env.storage()
-            .instance()
-            .get(&DataKey::AllAssets)
-            .unwrap_or_else(|| Vec::new(&env))
+    fn assets(env: Env) -> Vec<Asset> {
+        let all: Vec<Address> = env.storage().instance().get(&DataKey::AllAssets).unwrap_or_else(|| Vec::new(&env));
+        Vec::from_iter(&env, all.iter().map(Asset::Stellar))
     }
 
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool {
@@ -987,7 +1075,7 @@ impl NavOracleTrait for NavOracle {
 
     fn get_sources(env: Env) -> Vec<OracleSource> {
         let mut sources: Vec<OracleSource> = Vec::new(&env);
-        let assets = Self::assets(env.clone());
+        let assets: Vec<Address> = env.storage().instance().get(&DataKey::AllAssets).unwrap_or_else(|| Vec::new(&env));
         for asset in assets.iter() {
             let asset_sources: Vec<Symbol> = env
                 .storage()
