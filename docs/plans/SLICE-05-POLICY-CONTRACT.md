@@ -49,7 +49,8 @@ pub trait PolicyContractTrait {
         sleeves: Vec<SleeveTarget>,
     );
 
-    /// Amend a vault's policy (requires the stored owner's fresh signature)
+    /// Propose an amendment (owner signature). Takes effect only via
+    /// activate_policy_update after the notice period (>= 48h, audit P4).
     fn update_policy(
         env: Env,
         vault: Address,
