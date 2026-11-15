@@ -462,3 +462,7 @@ impl FeeSponsorContract {
         Ok(config)
     }
 }
+
+#[cfg(test)]
+mod test;
+
