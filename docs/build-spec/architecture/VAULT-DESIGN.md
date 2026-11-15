@@ -91,7 +91,7 @@ A vault logically partitions its holdings into named sleeves:
 Vault (USDC numéraire)
 ├── Sleeve: CASH_STABLE        → USDC, EURC          (5–15% by default)
 ├── Sleeve: USD_GOV_FUNDS      → BENJI, USDY, Spiko  (up to 70%)
-├── Sleeve: EURO_SOVEREIGN     → Spiko EUR, GOVY      (up to 20%)
+├── Sleeve: EUR_SOVEREIGN      → Spiko EUR, GOVY      (up to 20%)
 ├── Sleeve: YIELD_DOLLAR       → YLDS, wYLDS           (up to 20%)
 ├── Sleeve: LENDING            → Blend/DeFindex        (up to 15%)
 ├── Sleeve: EQUITY             → JQQQ, DTC stocks     (future, gated)
