@@ -100,6 +100,8 @@ fn setup_test_context() -> TestContext<'static> {
         registry_contract: registry_id.clone(),
         treasury: treasury.clone(),
         management_fee_bps: 100, // 1% per year
+        tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
+        per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
     };
 
     vault_client.initialize(
@@ -1480,3 +1482,4 @@ mod v4 {
         assert!(ctx.vault_client.get_redemption_capacity().instant > 0);
     }
 }
+

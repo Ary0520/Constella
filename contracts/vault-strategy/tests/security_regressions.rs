@@ -108,6 +108,8 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
             registry_contract: registry_id.clone(),
             treasury: treasury.clone(),
             management_fee_bps: 0,
+            tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
+            per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
         },
         &String::from_str(&env, "Constella Strategy Vault"),
         &String::from_str(&env, "cVAULT"),

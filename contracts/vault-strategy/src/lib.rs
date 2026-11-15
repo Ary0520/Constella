@@ -30,6 +30,28 @@ pub enum VaultError {
     SleeveHasHoldings = 16,
     /// Malformed sleeve set (duplicate asset, cash sleeve not the numéraire, not exactly one cash sleeve).
     InvalidSleeveConfig = 17,
+    /// Deposit would push total vault value above `tvl_cap` (AGENT-RULES Rule 6).
+    TvlCapExceeded = 18,
+    /// Deposit would push the receiver's position above `per_user_cap`.
+    UserCapExceeded = 19,
+    /// Caps must be > 0 with per_user_cap <= tvl_cap; lower_caps may only decrease.
+    InvalidCaps = 20,
+    /// The pending upgrade's 48h timelock has not elapsed.
+    UpgradeNotReady = 21,
+    /// No upgrade has been proposed.
+    NoPendingUpgrade = 22,
+}
+
+/// Timelock between proposing and executing a WASM upgrade (CONTRACTS-SPEC:
+/// "admin multisig + 48h timelock"; audit W3).
+pub const UPGRADE_TIMELOCK_SECONDS: u64 = 172_800;
+
+#[derive(Clone, Debug, PartialEq)]
+#[contracttype]
+pub struct PendingUpgrade {
+    pub wasm_hash: BytesN<32>,
+    pub proposed_at: u64,
+    pub executable_at: u64,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -67,6 +89,11 @@ pub struct VaultConfig {
     pub registry_contract: Address,
     pub treasury: Address,
     pub management_fee_bps: u32,
+    /// Maximum total vault value in numéraire units (AGENT-RULES Rule 6;
+    /// ROADMAP 3.2 mainnet beta: $1M). Can only be lowered in-place.
+    pub tvl_cap: i128,
+    /// Maximum value any single receiver may hold via deposit/mint.
+    pub per_user_cap: i128,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -148,6 +175,7 @@ pub enum DataKey {
     Sleeves,
     IsPaused,
     LastFeeAccrual,
+    PendingUpgrade,
 }
 
 // Cross-Contract Client Traits for Decoupled WASM Compilation
@@ -641,6 +669,37 @@ fn burn_shares_internal(env: &Env, owner: &Address, shares: i128) {
     );
 }
 
+/// Remaining room under (tvl_cap, per_user_cap) for `receiver`, in numéraire
+/// units, valued at the deposit NAV the depositor would pay (audit W3).
+fn cap_room(env: &Env, config: &VaultConfig, receiver: &Address, deposit_nav: i128, scale: i128) -> (i128, i128) {
+    let tvl = match holdings_value(env, config, NavKind::Deposit) {
+        Ok((v, _)) => v,
+        Err(e) => panic_with_error!(env, e),
+    };
+    let held_shares: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::Balance(receiver.clone()))
+        .unwrap_or(0);
+    let position = match held_shares.checked_mul(deposit_nav) {
+        Some(v) => v / scale,
+        None => panic_with_error!(env, VaultError::MathOverflow),
+    };
+    let tvl_room = (config.tvl_cap - tvl).max(0);
+    let user_room = (config.per_user_cap - position).max(0);
+    (tvl_room, user_room)
+}
+
+fn enforce_caps(env: &Env, config: &VaultConfig, receiver: &Address, assets: i128, deposit_nav: i128, scale: i128) {
+    let (tvl_room, user_room) = cap_room(env, config, receiver, deposit_nav, scale);
+    if assets > tvl_room {
+        panic_with_error!(env, VaultError::TvlCapExceeded);
+    }
+    if assets > user_room {
+        panic_with_error!(env, VaultError::UserCapExceeded);
+    }
+}
+
 #[contract]
 pub struct StrategyVault;
 
@@ -658,6 +717,9 @@ impl StrategyVault {
         }
         if config.management_fee_bps > 10000 || decimals > 18 {
             panic_with_error!(&env, VaultError::InvalidBps);
+        }
+        if config.tvl_cap <= 0 || config.per_user_cap <= 0 || config.per_user_cap > config.tvl_cap {
+            panic_with_error!(&env, VaultError::InvalidCaps);
         }
 
         let admin = config.admin.clone();
@@ -718,6 +780,7 @@ impl StrategyVault {
         if shares <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
+        enforce_caps(&env, &config, &receiver, assets, deposit_nav, scale);
 
         token::Client::new(&env, &config.numeraire).transfer(
             &receiver,
@@ -762,6 +825,7 @@ impl StrategyVault {
         if assets <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
+        enforce_caps(&env, &config, &receiver, assets, deposit_nav, scale);
 
         token::Client::new(&env, &config.numeraire).transfer(
             &receiver,
@@ -971,20 +1035,59 @@ impl StrategyVault {
         get_config(&env).numeraire
     }
 
-    pub fn max_deposit(env: Env, _receiver: Address) -> i128 {
+    /// SEP-56: the most `receiver` can deposit right now (audit W3: real caps).
+    pub fn max_deposit(env: Env, receiver: Address) -> i128 {
         if is_vault_paused(&env) {
-            0
-        } else {
-            i128::MAX
+            return 0;
+        }
+        let config = get_config(&env);
+        let nav = match compute_deposit_nav(&env, &config) {
+            Some(pd) if pd.price > 0 => pd.price,
+            _ => return 0,
+        };
+        let (tvl_room, user_room) = cap_room(&env, &config, &receiver, nav, share_scale(&env));
+        tvl_room.min(user_room)
+    }
+
+    /// SEP-56: the most shares `receiver` can mint right now (mint rounds the
+    /// asset cost up, so floor(room / nav) shares always fit).
+    pub fn max_mint(env: Env, receiver: Address) -> i128 {
+        if is_vault_paused(&env) {
+            return 0;
+        }
+        let config = get_config(&env);
+        let nav = match compute_deposit_nav(&env, &config) {
+            Some(pd) if pd.price > 0 => pd.price,
+            _ => return 0,
+        };
+        let scale = share_scale(&env);
+        let (tvl_room, user_room) = cap_room(&env, &config, &receiver, nav, scale);
+        match tvl_room.min(user_room).checked_mul(scale) {
+            Some(v) => v / nav,
+            None => panic_with_error!(&env, VaultError::MathOverflow),
         }
     }
 
-    pub fn max_mint(env: Env, _receiver: Address) -> i128 {
-        if is_vault_paused(&env) {
-            0
-        } else {
-            i128::MAX
+    /// Lower the deposit caps immediately (risk-reducing). Raising caps is a
+    /// governance action (ROADMAP 4.6) only possible through a timelocked upgrade.
+    pub fn lower_caps(env: Env, tvl_cap: i128, per_user_cap: i128) {
+        let mut config = get_config(&env);
+        config.admin.require_auth();
+        if tvl_cap <= 0
+            || per_user_cap <= 0
+            || per_user_cap > tvl_cap
+            || tvl_cap > config.tvl_cap
+            || per_user_cap > config.per_user_cap
+        {
+            panic_with_error!(&env, VaultError::InvalidCaps);
         }
+        config.tvl_cap = tvl_cap;
+        config.per_user_cap = per_user_cap;
+        env.storage().instance().set(&DataKey::Config, &config);
+        env.events().publish(
+            (Symbol::new(&env, "CAPS_LOWERED"), config.admin),
+            (tvl_cap, per_user_cap),
+        );
     }
 
     pub fn max_withdraw(env: Env, owner: Address) -> i128 {
@@ -1510,15 +1613,60 @@ impl StrategyVault {
         is_vault_paused(&env)
     }
 
-    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) {
+    /// Schedule a WASM upgrade (admin). Executable only after
+    /// UPGRADE_TIMELOCK_SECONDS so holders can review it and exit (audit W3).
+    pub fn propose_upgrade(env: Env, new_wasm_hash: BytesN<32>) {
         let config = get_config(&env);
         config.admin.require_auth();
-
-        env.deployer().update_current_contract_wasm(new_wasm_hash);
+        let now = env.ledger().timestamp();
+        let pending = PendingUpgrade {
+            wasm_hash: new_wasm_hash.clone(),
+            proposed_at: now,
+            executable_at: now + UPGRADE_TIMELOCK_SECONDS,
+        };
+        env.storage().instance().set(&DataKey::PendingUpgrade, &pending);
         env.events().publish(
-            (Symbol::new(&env, "vault_upgraded"), config.admin),
-            env.ledger().timestamp(),
+            (Symbol::new(&env, "UPGRADE_PROPOSED"), config.admin),
+            (new_wasm_hash, pending.executable_at),
         );
+    }
+
+    /// Execute the proposed upgrade once its timelock has elapsed (admin).
+    pub fn execute_upgrade(env: Env) {
+        let config = get_config(&env);
+        config.admin.require_auth();
+        let pending: PendingUpgrade = match env.storage().instance().get(&DataKey::PendingUpgrade) {
+            Some(p) => p,
+            None => panic_with_error!(&env, VaultError::NoPendingUpgrade),
+        };
+        if env.ledger().timestamp() < pending.executable_at {
+            panic_with_error!(&env, VaultError::UpgradeNotReady);
+        }
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.events().publish(
+            (Symbol::new(&env, "UPGRADE"), config.admin),
+            pending.wasm_hash.clone(),
+        );
+        env.deployer().update_current_contract_wasm(pending.wasm_hash);
+    }
+
+    /// Drop a proposed upgrade (admin).
+    pub fn cancel_upgrade(env: Env) {
+        let config = get_config(&env);
+        config.admin.require_auth();
+        let pending: PendingUpgrade = match env.storage().instance().get(&DataKey::PendingUpgrade) {
+            Some(p) => p,
+            None => panic_with_error!(&env, VaultError::NoPendingUpgrade),
+        };
+        env.storage().instance().remove(&DataKey::PendingUpgrade);
+        env.events().publish(
+            (Symbol::new(&env, "UPGRADE_CANCELLED"), config.admin),
+            pending.wasm_hash,
+        );
+    }
+
+    pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
+        env.storage().instance().get(&DataKey::PendingUpgrade)
     }
 
     pub fn admin_pause(env: Env) {
