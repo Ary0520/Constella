@@ -416,3 +416,31 @@ fn v3_pausing_an_empty_sleeve_does_not_freeze_the_vault() {
     assert!(s.vault.try_redeem(&(10 * ONE), &alice, &alice).is_ok(), "redemption blocked by an unrelated empty sleeve");
     assert_eq!(s.usdc.balance(&alice), 410 * ONE);
 }
+
+// ---------------------------------------------------------------------------
+// O4 — a deviation breaker tripped only when someone READ a price. If that
+// read happened inside a vault call that then reverted, the pause and its
+// NAV_PAUSE event were rolled back with it. NAV-ORACLE: every circuit-breaker
+// event MUST be emitted on-chain. Deviation must latch when prices change.
+// ---------------------------------------------------------------------------
+#[test]
+fn o4_deviation_pause_latches_when_the_price_is_pushed() {
+    let s = deploy_stack(); // VAULT sleeve priced by USDC_A and USDC_B at $1.00
+    let vault_sleeve = Symbol::new(&s.env, "VAULT");
+    let alice = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(100 * ONE));
+    s.vault.deposit(&(100 * ONE), &alice);
+
+    // A feed diverges 10% (threshold 2%). Nobody reads a price yet.
+    s.oracle.update_price(&Symbol::new(&s.env, "USDC_B"), &(ONE * 11 / 10), &200_000, &T0);
+    assert!(
+        s.oracle.is_sleeve_paused(&vault_sleeve),
+        "deviation must latch in the same successful call that pushed the price"
+    );
+    assert_eq!(s.oracle.get_sleeve_config(&vault_sleeve).unwrap().pause_reason, Symbol::new(&s.env, "DEVIATION"));
+
+    // A vault call that reverts afterwards cannot undo the pause.
+    assert!(s.vault.try_redeem(&(1_000 * ONE), &alice, &alice).is_err());
+    assert!(s.oracle.is_sleeve_paused(&vault_sleeve));
+    assert!(s.oracle.get_deposit_nav(&vault_sleeve).is_none());
+}
