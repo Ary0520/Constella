@@ -53,6 +53,7 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 - If an issuer freezes an asset: the **sleeve** is frozen, not the entire basket
   - Remaining sleeves continue to operate
   - Redemptions from frozen sleeve are queued
+  - **Implementation status (15 Nov 2026):** a frozen or unpriced sleeve that holds nothing is skipped when pricing shares, so it never blocks the vault (audit V3). A *funded* frozen sleeve currently hard-stops pricing; queued in-kind claims are tracked as audit V6 and ship with rebalance execution (W1).
 
 ---
 
