@@ -1143,7 +1143,7 @@ mod o6 {
     use super::*;
 
     fn err(e: OracleError) -> Result<(), Result<soroban_sdk::Error, soroban_sdk::InvokeError>> {
-        Err(Ok(e.into()))
+        Err(Ok(soroban_sdk::Error::from_contract_error(e as u32)))
     }
 
     /// Sleeve "CASH" (2% threshold, >= 2 sources) holding X at $1.00 and Y at $1.08.
@@ -1209,6 +1209,10 @@ mod o6 {
         assert!(client.asset_price(&x).is_some());
         assert_eq!(client.get_deposit_nav(&sleeve), None, "a blended price across assets is meaningless");
         assert_eq!(client.get_collateral_nav(&sleeve), None);
+        // Reading must not freeze the sleeve (pre-fix, this read compared all
+        // assets' sources and latched a DEVIATION pause anyone could trigger).
+        assert!(!client.is_sleeve_paused(&sleeve), "a read paused the sleeve");
+        assert!(client.asset_price(&x).is_some());
     }
 
     #[test]
@@ -1217,10 +1221,10 @@ mod o6 {
         let (client, _sleeve, x, y) = two_asset_sleeve(&env);
         client.configure_sleeve(&Symbol::new(&env, "OTHER"), &200, &2);
         let moved = create_source(&env, "X_C", &x, "OTHER", 1_000_000, 200_000, 1000);
-        assert_eq!(client.try_register_source(&moved), err(OracleError::AssetSleeveMismatch));
+        assert_eq!(client.try_register_source(&moved).map(|_| ()), err(OracleError::AssetSleeveMismatch));
         // Re-registering an existing source id for another asset is refused.
         let hijack = create_source(&env, "X_A", &y, "CASH", 1_080_000, 200_000, 1000);
-        assert_eq!(client.try_register_source(&hijack), err(OracleError::AssetSleeveMismatch));
+        assert_eq!(client.try_register_source(&hijack).map(|_| ()), err(OracleError::AssetSleeveMismatch));
         assert_eq!(client.get_source(&Symbol::new(&env, "X_A")).unwrap().asset, x);
     }
 }

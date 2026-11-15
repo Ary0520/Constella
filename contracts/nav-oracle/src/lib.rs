@@ -25,6 +25,9 @@ pub enum OracleError {
     FutureTimestamp = 12,
     /// Update is older than the price already stored for this source.
     OutOfOrderUpdate = 13,
+    /// An asset's sources must all belong to one sleeve, and a source id
+    /// cannot be re-registered for another asset or sleeve (audit O6).
+    AssetSleeveMismatch = 14,
 }
 
 #[contracttype]
@@ -371,15 +374,8 @@ fn evaluate_sources(
     Ok(valid_sources)
 }
 
-/// Audit O4: evaluate a sleeve's sources right after a price write and latch a
-/// deviation pause (persisting `NAV_PAUSE`) inside that successful call.
-///
-/// Previously deviation was only detected on reads; a read inside a caller
-/// that later reverted rolled the pause and its event back. Staleness and
-/// insufficient-sources remain live checks on every read (never latched).
-fn latch_deviation_on_write(env: &Env, sleeve_id: &Symbol) {
-    let mut config: SleeveOracleConfig = env
-        .storage()
+fn sleeve_config(env: &Env, sleeve_id: &Symbol) -> SleeveOracleConfig {
+    env.storage()
         .instance()
         .get(&DataKey::SleeveConfig(sleeve_id.clone()))
         .unwrap_or(SleeveOracleConfig {
@@ -388,18 +384,65 @@ fn latch_deviation_on_write(env: &Env, sleeve_id: &Symbol) {
             min_valid_sources: MIN_VALID_SOURCES_FLOOR,
             is_paused: false,
             pause_reason: Symbol::new(env, ""),
-        });
-    if config.is_paused {
-        return;
-    }
+        })
+}
+
+/// Audit O6: validate ONE asset's sources under its sleeve's configuration.
+/// Deviation, the minimum-source rule and median/minimum are computed among
+/// the same asset's sources only; a deviation pauses the asset's sleeve
+/// (NAV-ORACLE Rule 4: "deposits paused for the affected sleeve").
+fn evaluate_asset(env: &Env, asset: &Address) -> Result<Vec<OracleSource>, OracleError> {
+    let sleeve_id: Symbol = env
+        .storage()
+        .instance()
+        .get(&DataKey::AssetSleeve(asset.clone()))
+        .ok_or(OracleError::AssetNotFound)?;
+    let mut config = sleeve_config(env, &sleeve_id);
+    let source_ids: Vec<Symbol> = env
+        .storage()
+        .instance()
+        .get(&DataKey::AssetSources(asset.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+    evaluate_sources(env, &source_ids, &sleeve_id, &mut config)
+}
+
+/// The sleeve's only asset, or None when it has no sources or more than one
+/// asset: a sleeve-level price across different assets is meaningless (O6).
+fn single_asset_of_sleeve(env: &Env, sleeve_id: &Symbol) -> Option<Address> {
     let source_ids: Vec<Symbol> = env
         .storage()
         .instance()
         .get(&DataKey::SleeveSources(sleeve_id.clone()))
         .unwrap_or_else(|| Vec::new(env));
+    let mut asset: Option<Address> = None;
+    for id in source_ids.iter() {
+        let src: OracleSource = env.storage().instance().get(&DataKey::Source(id))?;
+        match &asset {
+            None => asset = Some(src.asset),
+            Some(a) if *a == src.asset => {}
+            Some(_) => return None,
+        }
+    }
+    asset
+}
+
+/// Audit O4/O6: evaluate the written asset's sources right after a price
+/// write and latch a deviation pause (persisting `NAV_PAUSE`) inside that
+/// successful call. Previously deviation was only detected on reads (a read
+/// inside a reverting caller rolled the pause back), and it compared every
+/// source in the sleeve, including other assets' sources (false pauses).
+/// Staleness and insufficient sources remain live checks on every read.
+fn latch_deviation_on_write(env: &Env, asset: &Address) {
+    let sleeve_id: Symbol = match env.storage().instance().get(&DataKey::AssetSleeve(asset.clone())) {
+        Some(s) => s,
+        None => return,
+    };
+    if sleeve_config(env, &sleeve_id).is_paused {
+        return;
+    }
     // On DeviationExceeded the pause + NAV_PAUSE are already persisted by
     // evaluate_sources; InsufficientSources is intentionally not latched.
-    let _ = evaluate_sources(env, &source_ids, sleeve_id, &mut config);
+    let _ = evaluate_asset(env, asset);
 }
 
 #[contract]
@@ -477,7 +520,17 @@ impl NavOracleTrait for NavOracle {
         if source.timestamp > env.ledger().timestamp() {
             panic_with_error!(&env, OracleError::FutureTimestamp);
         }
-
+        // Audit O6: one sleeve per asset; a source id keeps its asset and sleeve.
+        if let Some(existing) = env.storage().instance().get::<_, OracleSource>(&DataKey::Source(source.source_id.clone())) {
+            if existing.asset != source.asset || existing.sleeve != source.sleeve {
+                panic_with_error!(&env, OracleError::AssetSleeveMismatch);
+            }
+        }
+        if let Some(sleeve) = env.storage().instance().get::<_, Symbol>(&DataKey::AssetSleeve(source.asset.clone())) {
+            if sleeve != source.sleeve {
+                panic_with_error!(&env, OracleError::AssetSleeveMismatch);
+            }
+        }
         env.storage()
             .instance()
             .set(&DataKey::Source(source.source_id.clone()), &source);
@@ -545,7 +598,7 @@ impl NavOracleTrait for NavOracle {
             env.storage().instance().set(&DataKey::AllAssets, &all_assets);
         }
 
-        latch_deviation_on_write(&env, &source.sleeve);
+        latch_deviation_on_write(&env, &source.asset);
     }
 
     fn update_price(
@@ -600,118 +653,38 @@ impl NavOracleTrait for NavOracle {
             timestamp,
         }
         .publish(&env);
-
-        latch_deviation_on_write(&env, &source.sleeve);
+        latch_deviation_on_write(&env, &source.asset);
     }
 
     fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData> {
-        let mut config: SleeveOracleConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::SleeveConfig(sleeve_id.clone()))
-            .unwrap_or(SleeveOracleConfig {
-                sleeve_id: sleeve_id.clone(),
-                deviation_threshold_bps: 200,
-                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
-                is_paused: false,
-                pause_reason: Symbol::new(&env, ""),
-            });
-
-        let source_ids: Vec<Symbol> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SleeveSources(sleeve_id.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let valid_sources = evaluate_sources(&env, &source_ids, &sleeve_id, &mut config).ok()?;
-
-        let mut min_source = valid_sources.get(0).unwrap();
-        for s in valid_sources.iter() {
-            if s.price < min_source.price {
-                min_source = s;
-            }
-        }
-
-        let price_data = PriceData {
-            price: min_source.price,
-            timestamp: min_source.timestamp,
-            source: min_source.source_id.clone(),
-        };
-
-        env.storage()
-            .instance()
-            .set(&DataKey::LastPrice(min_source.asset.clone()), &price_data);
-
-        Some(price_data)
+        // Audit O6: only a single-asset sleeve has a sleeve-level price.
+        let asset = single_asset_of_sleeve(&env, &sleeve_id)?;
+        Self::price(env, asset)
     }
 
     fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData> {
-        let mut config: SleeveOracleConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::SleeveConfig(sleeve_id.clone()))
-            .unwrap_or(SleeveOracleConfig {
-                sleeve_id: sleeve_id.clone(),
-                deviation_threshold_bps: 200,
-                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
-                is_paused: false,
-                pause_reason: Symbol::new(&env, ""),
-            });
-
-        let source_ids: Vec<Symbol> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SleeveSources(sleeve_id.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let valid_sources = evaluate_sources(&env, &source_ids, &sleeve_id, &mut config).ok()?;
-
+        // Audit O6: only a single-asset sleeve has a sleeve-level price.
+        let asset = single_asset_of_sleeve(&env, &sleeve_id)?;
+        let valid_sources = evaluate_asset(&env, &asset).ok()?;
         Some(median_price(valid_sources))
     }
 
     fn price(env: Env, asset: Address) -> Option<PriceData> {
-        let sleeve_id: Symbol = env
-            .storage()
-            .instance()
-            .get(&DataKey::AssetSleeve(asset.clone()))?;
-
-        let mut config: SleeveOracleConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::SleeveConfig(sleeve_id.clone()))
-            .unwrap_or(SleeveOracleConfig {
-                sleeve_id: sleeve_id.clone(),
-                deviation_threshold_bps: 200,
-                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
-                is_paused: false,
-                pause_reason: Symbol::new(&env, ""),
-            });
-
-        let source_ids: Vec<Symbol> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AssetSources(asset.clone()))
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let valid_sources = evaluate_sources(&env, &source_ids, &sleeve_id, &mut config).ok()?;
-
+        let valid_sources = evaluate_asset(&env, &asset).ok()?;
         let mut min_source = valid_sources.get(0).unwrap();
         for s in valid_sources.iter() {
             if s.price < min_source.price {
                 min_source = s;
             }
         }
-
         let price_data = PriceData {
             price: min_source.price,
             timestamp: min_source.timestamp,
             source: min_source.source_id.clone(),
         };
-
         env.storage()
             .instance()
             .set(&DataKey::LastPrice(asset), &price_data);
-
         Some(price_data)
     }
 
@@ -725,27 +698,7 @@ impl NavOracleTrait for NavOracle {
                 source: Symbol::new(&env, "BASE"),
             });
         }
-        let sleeve_id: Symbol = env
-            .storage()
-            .instance()
-            .get(&DataKey::AssetSleeve(asset.clone()))?;
-        let mut config: SleeveOracleConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::SleeveConfig(sleeve_id.clone()))
-            .unwrap_or(SleeveOracleConfig {
-                sleeve_id: sleeve_id.clone(),
-                deviation_threshold_bps: 200,
-                min_valid_sources: MIN_VALID_SOURCES_FLOOR,
-                is_paused: false,
-                pause_reason: Symbol::new(&env, ""),
-            });
-        let source_ids: Vec<Symbol> = env
-            .storage()
-            .instance()
-            .get(&DataKey::AssetSources(asset))
-            .unwrap_or_else(|| Vec::new(&env));
-        let valid = evaluate_sources(&env, &source_ids, &sleeve_id, &mut config).ok()?;
+        let valid = evaluate_asset(&env, &asset).ok()?;
         Some(median_price(valid))
     }
 
