@@ -18,8 +18,8 @@
 | **Redemption Ladder** | A structured view showing what percentage of basket capital can be exited across time horizons (< 1 hour, 24 hours, 7 days, illiquid). |
 | **Band** | The permissible drift percentage around a sleeve's target weight (e.g., Target 40% with ±5% band = 35%–45%) before triggering keeper rebalancing. |
 | **Issuer Cap** | A maximum protocol or user-defined ceiling preventing any single asset issuer (e.g., Spiko) from exceeding a fixed percentage (default 30%) of basket AUM. |
-| **Conservative NAV** | The lowest price among all verified, non-stale oracle feeds; used exclusively for Collateral Passport risk evaluations to protect lenders. |
-| **Deposit NAV** | The median price of verified oracle feeds; used for minting and redeeming shares to ensure fair equity among depositors. |
+| **Conservative NAV** | The lowest price among all verified, non-stale oracle feeds; used for Collateral Passport risk evaluations **and for redemptions/withdrawals**, so departing holders never extract more than the most conservative valuation. |
+| **Deposit NAV** | The median price of verified oracle feeds; used for deposits/minting so new entrants are not under-priced. Invariant: Conservative NAV ≤ Deposit NAV. |
 | **Circuit Breaker** | An automated contract pause that isolates an individual sleeve when price deviation exceeds thresholds (> 2%–3%) or oracle feeds go stale. |
 | **Collateral Passport** | The standardized on-chain data package (conservative NAV, instant liquidity, risk sheet, liquidation path) that allows lenders to accept basket shares. |
 | **Listing Kit** | The turnkey configuration package (addresses, risk parameters, oracle adapters) provided to Blend and Liqvid pool creators to list basket tokens. |
