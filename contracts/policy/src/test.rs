@@ -1943,3 +1943,145 @@ mod m1 {
     }
 }
 
+// -------------------------------------------------------------------------
+// Audit P4 (2026-11-15, owner decision D-E): amendments wait a notice period
+// (protocol minimum 48h, owner may lengthen, never shorten); anyone may
+// activate after it elapses; the owner may cancel; old terms rule meanwhile.
+// -------------------------------------------------------------------------
+mod p4 {
+    use super::*;
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+
+    const H: u64 = 3600;
+
+    fn registered(ctx: &TestContext) -> PolicyContractClient<'_> {
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        policy.register_policy(
+            &ctx.vault, &ctx.owner, &sample_hash(&ctx.env, 0x01), &ctx.registry_address,
+            &1000, &2500, &3000, &50, &500, &sample_sleeves(&ctx.env),
+        );
+        policy
+    }
+
+    fn propose(ctx: &TestContext, policy: &PolicyContractClient, hash: u8, floor: u32) {
+        policy.update_policy(&ctx.vault, &sample_hash(&ctx.env, hash), &floor, &2500, &3000, &50, &500, &sample_sleeves(&ctx.env));
+    }
+
+    fn warp(ctx: &TestContext, secs: u64) {
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + secs);
+    }
+
+    fn code(e: PolicyError) -> Result<(), Result<soroban_sdk::Error, soroban_sdk::InvokeError>> {
+        Err(Ok(soroban_sdk::Error::from_contract_error(e as u32)))
+    }
+
+    #[test]
+    fn amendment_waits_full_notice_then_anyone_activates() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        assert_eq!(policy.get_notice_period(&ctx.vault), PROTOCOL_MIN_NOTICE_SECONDS);
+        assert_eq!(PROTOCOL_MIN_NOTICE_SECONDS, 48 * H);
+
+        propose(&ctx, &policy, 0x02, 0);
+        let pending = policy.get_pending_policy_update(&ctx.vault).unwrap();
+        assert_eq!(pending.effective_at, pending.proposed_at + 48 * H);
+        assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().min_liquidity_sleeve_bps, 1000);
+
+        warp(&ctx, 48 * H - 1);
+        assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoticeNotElapsed));
+
+        warp(&ctx, 1);
+        ctx.env.set_auths(&[]); // permissionless
+        policy.activate_policy_update(&ctx.vault);
+        let cfg = policy.get_policy_config(&ctx.vault).unwrap();
+        assert_eq!((cfg.policy_hash, cfg.version, cfg.min_liquidity_sleeve_bps), (sample_hash(&ctx.env, 0x02), 2, 0));
+        assert!(policy.get_pending_policy_update(&ctx.vault).is_none());
+        assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoPendingUpdate));
+    }
+
+    #[test]
+    fn old_terms_govern_rebalances_during_notice() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        propose(&ctx, &policy, 0x02, 0);
+        let weights = vec![
+            &ctx.env,
+            (Symbol::new(&ctx.env, "CIRCLE_USDC"), 2000u32),
+            (Symbol::new(&ctx.env, "CIRCLE_EURC"), 1000u32),
+            (Symbol::new(&ctx.env, "FRANKLIN_BENJI"), 2500u32),
+            (Symbol::new(&ctx.env, "SPIKO_EUSTBL"), 2500u32),
+            (Symbol::new(&ctx.env, "BLEND_BLND"), 2000u32),
+        ];
+        let mk = |hash: u8| RebalanceProposal {
+            vault: ctx.vault.clone(),
+            policy_hash: sample_hash(&ctx.env, hash),
+            operations: vec![&ctx.env],
+            weights_after: weights.clone(),
+            deadline: ctx.env.ledger().timestamp() + 600,
+            proposer: ctx.proposer.clone(),
+        };
+        let old = policy.validate_rebalance(&ctx.vault, &mk(0x01));
+        let new = policy.validate_rebalance(&ctx.vault, &mk(0x02));
+        assert_eq!(new.code, PolicyError::PolicyHashMismatch as u32, "pending terms are not yet in force");
+        assert_ne!(old.code, PolicyError::PolicyHashMismatch as u32, "current terms still govern");
+    }
+
+    #[test]
+    fn owner_cancels_admin_cannot() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        propose(&ctx, &policy, 0x02, 0);
+        ctx.env.mock_auths(&[MockAuth {
+            address: &ctx.admin,
+            invoke: &MockAuthInvoke { contract: &ctx.policy_address, fn_name: "cancel_policy_update", args: (ctx.vault.clone(),).into_val(&ctx.env), sub_invokes: &[] },
+        }]);
+        assert!(policy.try_cancel_policy_update(&ctx.vault).is_err());
+        assert!(policy.get_pending_policy_update(&ctx.vault).is_some());
+
+        ctx.env.mock_auths(&[MockAuth {
+            address: &ctx.owner,
+            invoke: &MockAuthInvoke { contract: &ctx.policy_address, fn_name: "cancel_policy_update", args: (ctx.vault.clone(),).into_val(&ctx.env), sub_invokes: &[] },
+        }]);
+        policy.cancel_policy_update(&ctx.vault);
+        assert!(policy.get_pending_policy_update(&ctx.vault).is_none());
+        warp(&ctx, 48 * H);
+        assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoPendingUpdate));
+        assert_eq!(policy.get_policy_hash(&ctx.vault), sample_hash(&ctx.env, 0x01));
+    }
+
+    #[test]
+    fn new_proposal_replaces_pending_and_restarts_clock() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        propose(&ctx, &policy, 0x02, 1500);
+        warp(&ctx, 24 * H);
+        propose(&ctx, &policy, 0x03, 2000);
+        warp(&ctx, 24 * H); // 48h after the FIRST proposal
+        assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoticeNotElapsed));
+        warp(&ctx, 24 * H); // 48h after the replacement
+        policy.activate_policy_update(&ctx.vault);
+        assert_eq!(policy.get_policy_hash(&ctx.vault), sample_hash(&ctx.env, 0x03));
+    }
+
+    #[test]
+    fn notice_can_only_be_lengthened_by_the_owner() {
+        let ctx = setup_test_context();
+        let policy = registered(&ctx);
+        assert_eq!(policy.try_set_notice_period(&ctx.vault, &(24 * H)).map(|_| ()), code(PolicyError::NoticeTooShort));
+        policy.set_notice_period(&ctx.vault, &(7 * 24 * H));
+        assert_eq!(policy.get_notice_period(&ctx.vault), 7 * 24 * H);
+        assert_eq!(policy.try_set_notice_period(&ctx.vault, &(72 * H)).map(|_| ()), code(PolicyError::NoticeTooShort));
+
+        ctx.env.mock_auths(&[MockAuth {
+            address: &ctx.admin,
+            invoke: &MockAuthInvoke { contract: &ctx.policy_address, fn_name: "set_notice_period", args: (ctx.vault.clone(), 30 * 24 * H).into_val(&ctx.env), sub_invokes: &[] },
+        }]);
+        assert!(policy.try_set_notice_period(&ctx.vault, &(30 * 24 * H)).is_err(), "admin cannot change notice");
+
+        ctx.env.mock_all_auths();
+        propose(&ctx, &policy, 0x02, 0);
+        let p = policy.get_pending_policy_update(&ctx.vault).unwrap();
+        assert_eq!(p.effective_at - p.proposed_at, 7 * 24 * H, "longer notice applies to new proposals");
+    }
+}
