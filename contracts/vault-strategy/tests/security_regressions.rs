@@ -352,3 +352,67 @@ fn o1_stranger_cannot_trip_a_circuit_breaker() {
     s.env.mock_all_auths();
     assert_eq!(s.vault.deposit(&(100 * ONE), &user), 100 * ONE);
 }
+
+// ---------------------------------------------------------------------------
+// V3 — pausing one sleeve froze the WHOLE vault (deposits and cash-only
+// redemptions). NAV-ORACLE Rules 4/5: unaffected sleeves continue normally.
+// ---------------------------------------------------------------------------
+#[test]
+fn v3_pausing_an_empty_sleeve_does_not_freeze_the_vault() {
+    let s = deploy_stack_with(false); // NAV from sleeve composition
+    let registry = AssetRegistryClient::new(&s.env, &s.registry_id);
+    let gov = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+    let gov_sleeve = Symbol::new(&s.env, "USD_GOV_FUNDS");
+    registry.add_asset(&AssetEntry {
+        contract_address: gov.clone(),
+        asset_id: Symbol::new(&s.env, "SPIKO_USD"),
+        sleeve_type: RegSleeve::UsdGovFund,
+        liquidity_tier: 1,
+        permissionless: true,
+        oracle_sources: Vec::from_array(&s.env, [Symbol::new(&s.env, "SPIKO_NAV"), Symbol::new(&s.env, "SPIKO_RFL")]),
+        eligible_jurisdictions: Vec::new(&s.env),
+        blocked_jurisdictions: Vec::new(&s.env),
+        investor_classes_required: Vec::new(&s.env),
+        is_active: true,
+        added_at: T0,
+    });
+    s.oracle.configure_sleeve(&gov_sleeve, &200, &2);
+    for id in ["SPIKO_NAV", "SPIKO_RFL"] {
+        let mut src = oracle_source(&s.env, id, &gov, ONE);
+        src.sleeve = gov_sleeve.clone();
+        s.oracle.register_source(&src);
+    }
+
+    let alice = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(1000 * ONE));
+    s.vault.deposit(&(500 * ONE), &alice);
+    let mut sleeves = Vec::new(&s.env);
+    sleeves.push_back(SleeveState {
+        asset_id: String::from_str(&s.env, "USDC"),
+        contract_address: s.usdc_addr.clone(),
+        target_weight_bps: 5000,
+        band_bps: 500,
+        current_balance: 500 * ONE,
+        sleeve_type: SleeveType::CashStable,
+        liquidity_tier: 0,
+    });
+    sleeves.push_back(SleeveState {
+        asset_id: String::from_str(&s.env, "SPIKO_USD"),
+        contract_address: gov,
+        target_weight_bps: 5000,
+        band_bps: 500,
+        current_balance: 0,
+        sleeve_type: SleeveType::UsdGovFunds,
+        liquidity_tier: 1,
+    });
+    s.vault.set_sleeves(&sleeves);
+
+    // The authorized pause authority (admin by default) halts the gov sleeve.
+    s.oracle.trigger_circuit_breaker(&s.admin, &gov_sleeve, &Symbol::new(&s.env, "ISSUER_FREEZE"));
+    assert!(s.oracle.is_sleeve_paused(&gov_sleeve));
+
+    // Original PoC: both of these failed. The cash sleeve must keep working.
+    assert!(s.vault.try_deposit(&(100 * ONE), &alice).is_ok(), "deposit blocked by an unrelated empty sleeve");
+    assert!(s.vault.try_redeem(&(10 * ONE), &alice, &alice).is_ok(), "redemption blocked by an unrelated empty sleeve");
+    assert_eq!(s.usdc.balance(&alice), 410 * ONE);
+}
