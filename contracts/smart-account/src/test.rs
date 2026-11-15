@@ -723,7 +723,7 @@ fn test_t55_sponsored_passkey_vault_deposit() {
     assert_eq!(sponsor_val, Ok(Ok(())));
 
     // B) User executes deposit of 500 USDC into Strategy Vault via smart account
-    let shares_minted = vault_client.deposit(&500_0000000, &user_account_id);
+    let shares_minted = vault_client.deposit(&500_0000000, &user_account_id, &user_account_id, &user_account_id);
     assert_eq!(shares_minted, 500_0000000);
 
     // C) Sponsor records the sponsored transaction

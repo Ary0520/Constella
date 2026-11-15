@@ -156,8 +156,8 @@ fn v1_self_transfer_cannot_inflate_shares_or_drain_vault() {
     let victim = Address::generate(&s.env);
     s.usdc_admin.mint(&attacker, &(100 * ONE));
     s.usdc_admin.mint(&victim, &(900 * ONE));
-    s.vault.deposit(&(100 * ONE), &attacker);
-    s.vault.deposit(&(900 * ONE), &victim);
+    s.vault.deposit(&(100 * ONE), &attacker, &attacker, &attacker);
+    s.vault.deposit(&(900 * ONE), &victim, &victim, &victim);
 
     // Original exploit: repeatedly transfer the full balance to oneself.
     for _ in 0..3 {
@@ -176,7 +176,7 @@ fn v1_self_transfer_cannot_inflate_shares_or_drain_vault() {
 
     // Attacker can only get back what they put in; the victim is whole.
     s.env.mock_all_auths();
-    let out = s.vault.redeem(&s.vault.balance(&attacker), &attacker, &attacker);
+    let out = s.vault.redeem(&s.vault.balance(&attacker), &attacker, &attacker, &attacker);
     assert!(out <= 100 * ONE, "attacker redeemed {out}, deposited {}", 100 * ONE);
     assert_eq!(s.vault.balance(&victim), 900 * ONE);
     assert!(s.usdc.balance(&s.vault_id) >= 900 * ONE * 99 / 100);
@@ -188,7 +188,7 @@ fn v1_self_transfer_from_cannot_inflate_shares() {
     let owner = Address::generate(&s.env);
     let spender = Address::generate(&s.env);
     s.usdc_admin.mint(&owner, &(50 * ONE));
-    s.vault.deposit(&(50 * ONE), &owner);
+    s.vault.deposit(&(50 * ONE), &owner, &owner, &owner);
     s.vault.approve(&owner, &spender, &(50 * ONE), &10_000);
 
     authorize(&s, &spender, "transfer_from", (spender.clone(), owner.clone(), owner.clone(), 50 * ONE).into_val(&s.env));
@@ -209,8 +209,8 @@ fn v2_admin_cannot_inject_sleeve_balance_to_drain_depositors() {
     let alice = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(1000 * ONE));
     s.usdc_admin.mint(&s.admin, &ONE);
-    s.vault.deposit(&(1000 * ONE), &alice);
-    s.vault.deposit(&ONE, &s.admin);
+    s.vault.deposit(&(1000 * ONE), &alice, &alice, &alice);
+    s.vault.deposit(&ONE, &s.admin, &s.admin, &s.admin);
     let admin_usdc_before = s.usdc.balance(&s.admin);
 
     // Attack step 1: admin rewrites the cash sleeve's recorded balance.
@@ -238,12 +238,12 @@ fn v2_admin_cannot_inject_sleeve_balance_to_drain_depositors() {
     // Attack step 2: redeem a sliver of shares for 1000 USDC.
     s.env.mock_all_auths();
     let sliver = s.vault.convert_to_shares(&(1000 * ONE));
-    let _ = s.vault.try_redeem(&sliver.min(s.vault.balance(&s.admin)), &s.admin, &s.admin);
-    let _ = s.vault.try_redeem(&s.vault.balance(&s.admin), &s.admin, &s.admin);
+    let _ = s.vault.try_redeem(&sliver.min(s.vault.balance(&s.admin)), &s.admin, &s.admin, &s.admin);
+    let _ = s.vault.try_redeem(&s.vault.balance(&s.admin), &s.admin, &s.admin, &s.admin);
 
     let admin_gain = s.usdc.balance(&s.admin) - admin_usdc_before;
     assert!(admin_gain <= ONE, "admin extracted {admin_gain} after depositing {ONE}");
-    let alice_out = s.vault.redeem(&s.vault.balance(&alice), &alice, &alice);
+    let alice_out = s.vault.redeem(&s.vault.balance(&alice), &alice, &alice, &alice);
     assert_eq!(alice_out, 1000 * ONE);
 }
 
@@ -362,7 +362,7 @@ fn o1_stranger_cannot_trip_a_circuit_breaker() {
 
     // The vault keeps working for honest users.
     s.env.mock_all_auths();
-    assert_eq!(s.vault.deposit(&(100 * ONE), &user), 100 * ONE);
+    assert_eq!(s.vault.deposit(&(100 * ONE), &user, &user, &user), 100 * ONE);
 }
 
 // ---------------------------------------------------------------------------
@@ -398,7 +398,7 @@ fn v3_pausing_an_empty_sleeve_does_not_freeze_the_vault() {
 
     let alice = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(1000 * ONE));
-    s.vault.deposit(&(500 * ONE), &alice);
+    s.vault.deposit(&(500 * ONE), &alice, &alice, &alice);
     let mut sleeves = Vec::new(&s.env);
     sleeves.push_back(SleeveState {
         asset_id: String::from_str(&s.env, "USDC"),
@@ -425,8 +425,8 @@ fn v3_pausing_an_empty_sleeve_does_not_freeze_the_vault() {
     assert!(s.oracle.is_sleeve_paused(&gov_sleeve));
 
     // Original PoC: both of these failed. The cash sleeve must keep working.
-    assert!(s.vault.try_deposit(&(100 * ONE), &alice).is_ok(), "deposit blocked by an unrelated empty sleeve");
-    assert!(s.vault.try_redeem(&(10 * ONE), &alice, &alice).is_ok(), "redemption blocked by an unrelated empty sleeve");
+    assert!(s.vault.try_deposit(&(100 * ONE), &alice, &alice, &alice).is_ok(), "deposit blocked by an unrelated empty sleeve");
+    assert!(s.vault.try_redeem(&(10 * ONE), &alice, &alice, &alice).is_ok(), "redemption blocked by an unrelated empty sleeve");
     assert_eq!(s.usdc.balance(&alice), 410 * ONE);
 }
 
@@ -442,7 +442,7 @@ fn o4_deviation_pause_latches_when_the_price_is_pushed() {
     let vault_sleeve = Symbol::new(&s.env, "VAULT");
     let alice = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(100 * ONE));
-    s.vault.deposit(&(100 * ONE), &alice);
+    s.vault.deposit(&(100 * ONE), &alice, &alice, &alice);
 
     // A feed diverges 10% (threshold 2%). Nobody reads a price yet.
     s.oracle.update_price(&Symbol::new(&s.env, "USDC_B"), &(ONE * 11 / 10), &200_000, &T0);
@@ -453,7 +453,7 @@ fn o4_deviation_pause_latches_when_the_price_is_pushed() {
     assert_eq!(s.oracle.get_sleeve_config(&vault_sleeve).unwrap().pause_reason, Symbol::new(&s.env, "DEVIATION"));
 
     // A vault call that reverts afterwards cannot undo the pause.
-    assert!(s.vault.try_redeem(&(1_000 * ONE), &alice, &alice).is_err());
+    assert!(s.vault.try_redeem(&(1_000 * ONE), &alice, &alice, &alice).is_err());
     assert!(s.oracle.is_sleeve_paused(&vault_sleeve));
     assert!(s.oracle.get_deposit_nav(&vault_sleeve).is_none());
 }
@@ -717,10 +717,10 @@ fn p4_amendment_does_not_take_effect_before_the_notice_period() {
     // Holders can still exit under the old terms during the notice period.
     let holder = Address::generate(&s.env);
     s.usdc_admin.mint(&holder, &(100 * ONE));
-    s.vault.deposit(&(100 * ONE), &holder);
+    s.vault.deposit(&(100 * ONE), &holder, &holder, &holder);
     s.env.ledger().set_timestamp(T0 + constella_policy::PROTOCOL_MIN_NOTICE_SECONDS - 1);
     assert!(s.policy.try_activate_policy_update(&s.vault_id).is_err(), "one second early");
-    let out = s.vault.redeem(&(100 * ONE), &holder, &holder);
+    let out = s.vault.redeem(&(100 * ONE), &holder, &holder, &holder);
     assert_eq!(out, 100 * ONE, "holder exits in full under the old terms during the notice period");
 
     // After the notice period anyone may finalize it - no signatures needed.
@@ -743,7 +743,7 @@ fn w3_deposits_are_capped() {
     s.usdc_admin.mint(&whale, &huge);
 
     assert!(s.vault.max_deposit(&whale) < i128::MAX, "max_deposit must report a finite cap");
-    assert!(s.vault.try_deposit(&huge, &whale).is_err(), "a $10M deposit must exceed the caps");
+    assert!(s.vault.try_deposit(&huge, &whale, &whale, &whale).is_err(), "a $10M deposit must exceed the caps");
     assert_eq!(s.usdc.balance(&whale), huge, "rejected deposit moves no funds");
 }
 
@@ -758,7 +758,7 @@ fn w7_passport_is_derived_from_the_basket_not_hard_coded() {
     let s = deploy_stack_with(false);
     let alice = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(1000 * ONE));
-    s.vault.deposit(&(1000 * ONE), &alice);
+    s.vault.deposit(&(1000 * ONE), &alice, &alice, &alice);
 
     // A 100% USDC basket is a "High-Cash Basket": 10% haircut, 90% LTV.
     let sheet = s.vault.get_risk_sheet();
@@ -830,8 +830,8 @@ fn v5_share_price_comes_from_holdings_not_an_oracle_override() {
     assert_eq!(s.vault.get_nav_conservative().unwrap().price, ONE);
     let alice = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(100 * ONE));
-    assert_eq!(s.vault.deposit(&(100 * ONE), &alice), 100 * ONE, "100 USDC buys 100 shares, not 50");
-    assert_eq!(s.vault.redeem(&(100 * ONE), &alice, &alice), 100 * ONE);
+    assert_eq!(s.vault.deposit(&(100 * ONE), &alice, &alice, &alice), 100 * ONE, "100 USDC buys 100 shares, not 50");
+    assert_eq!(s.vault.redeem(&(100 * ONE), &alice, &alice, &alice), 100 * ONE);
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,7 +1001,7 @@ fn w2_share_ledger_is_persistent_per_holder_with_ttl() {
     let s = deploy_stack();
     let alice = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(100 * ONE));
-    s.vault.deposit(&(100 * ONE), &alice);
+    s.vault.deposit(&(100 * ONE), &alice, &alice, &alice);
     // OZ extends a balance entry's TTL whenever it is accessed (a new entry
     // starts at the network minimum: 4096 ledgers here, ~120 days on mainnet).
     assert_eq!(s.vault.balance(&alice), 100 * ONE);
@@ -1022,7 +1022,7 @@ fn w2_instance_storage_does_not_grow_with_the_number_of_holders() {
     let instance_len = |s: &Stack| s.env.as_contract(&s.vault_id, || s.env.storage().instance().all().len());
     let first = Address::generate(&s.env);
     s.usdc_admin.mint(&first, &(10 * ONE));
-    s.vault.deposit(&(10 * ONE), &first);
+    s.vault.deposit(&(10 * ONE), &first, &first, &first);
     let baseline = instance_len(&s);
 
     // Every call loads the whole instance entry, and entries are size-capped:
@@ -1030,7 +1030,7 @@ fn w2_instance_storage_does_not_grow_with_the_number_of_holders() {
     for _ in 0..20 {
         let holder = Address::generate(&s.env);
         s.usdc_admin.mint(&holder, &(10 * ONE));
-        s.vault.deposit(&(10 * ONE), &holder);
+        s.vault.deposit(&(10 * ONE), &holder, &holder, &holder);
         let until = s.env.ledger().sequence() + 1_000;
         s.vault.approve(&holder, &first, &ONE, &until);
     }
@@ -1082,7 +1082,7 @@ fn w6_holder_can_burn_and_spender_can_burn_from_within_allowance() {
     let spender = Address::generate(&s.env);
     let stranger = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(100 * ONE));
-    s.vault.deposit(&(100 * ONE), &alice);
+    s.vault.deposit(&(100 * ONE), &alice, &alice, &alice);
 
     // A stranger cannot burn someone else's shares.
     authorize(&s, &stranger, "burn", (alice.clone(), ONE).into_val(&s.env));
@@ -1132,7 +1132,7 @@ fn w6_fee_shares_are_announced_with_a_mint_event() {
     let alice = Address::generate(&s.env);
     let bob = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(1_000 * ONE));
-    s.vault.deposit(&(1_000 * ONE), &alice);
+    s.vault.deposit(&(1_000 * ONE), &alice, &alice, &alice);
     assert_eq!(s.vault.balance(&s.treasury), 0);
 
     s.env.ledger().set_timestamp(T0 + 30 * 86_400);
@@ -1163,7 +1163,7 @@ fn w6_transfer_accepts_a_muxed_destination_and_reports_its_id() {
     let s = deploy_stack();
     let alice = Address::generate(&s.env);
     s.usdc_admin.mint(&alice, &(100 * ONE));
-    s.vault.deposit(&(100 * ONE), &alice);
+    s.vault.deposit(&(100 * ONE), &alice, &alice, &alice);
 
     // Only accounts (G...) can be muxed; generate an account-based M... address.
     let muxed = soroban_sdk::MuxedAddress::new(soroban_sdk::MuxedAddress::generate(&s.env), 42);
@@ -1274,6 +1274,7 @@ fn sep56_operator_redeems_only_within_the_owners_share_allowance() {
     );
 
     let until = s.env.ledger().sequence() + 1_000;
+    s.env.mock_all_auths(); // setup: the owner grants the share allowance
     s.vault.approve(&owner, &operator, &(30 * ONE), &until);
     authorize_tree(&s, &operator, "redeem", args, &[]);
     let assets = s.vault.redeem(&(20 * ONE), &receiver, &owner, &operator);

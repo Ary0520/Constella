@@ -170,7 +170,7 @@ fn test_t40_deposit_and_mint_median_nav() {
     assert_eq!(ctx.numeraire_client.balance(&ctx.alice), 1000_0000000);
 
     // Alice deposits 500 USDC
-    let shares_minted = ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+    let shares_minted = ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(shares_minted, 500_0000000);
 
     // Verify balances after deposit
@@ -181,7 +181,7 @@ fn test_t40_deposit_and_mint_median_nav() {
     assert_eq!(ctx.numeraire_client.balance(&ctx.vault_id), 500_0000000);
 
     // Alice mints 250 shares
-    let assets_paid = ctx.vault_client.mint(&250_0000000, &ctx.alice);
+    let assets_paid = ctx.vault_client.mint(&250_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(assets_paid, 250_0000000);
 
     // Verify balances after mint
@@ -193,7 +193,7 @@ fn test_t40_deposit_and_mint_median_nav() {
 
     // Test convert functions
     assert_eq!(ctx.vault_client.convert_to_shares(&100_0000000), 100_0000000);
-    assert_eq!(ctx.vault_client.asset(), ctx.numeraire_address);
+    assert_eq!(ctx.vault_client.query_asset(), ctx.numeraire_address);
 }
 
 // -------------------------------------------------------------------------
@@ -205,7 +205,7 @@ fn test_t41_instant_redemption_conservative_nav() {
 
     // Deposit 1000 USDC by Alice at $1.00 NAV
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&1000_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 1000_0000000);
 
     // Verify Invariant: conservative_nav <= deposit_nav
@@ -217,14 +217,14 @@ fn test_t41_instant_redemption_conservative_nav() {
     assert_eq!(cons_nav.price, 10_000_000);
 
     // Alice redeems 100 shares for Bob: 100 shares * $1.00 = 100 USDC
-    let assets_out = ctx.vault_client.redeem(&100_0000000, &ctx.bob, &ctx.alice);
+    let assets_out = ctx.vault_client.redeem(&100_0000000, &ctx.bob, &ctx.alice, &ctx.alice);
     assert_eq!(assets_out, 100_0000000);
     assert_eq!(ctx.numeraire_client.balance(&ctx.bob), 100_0000000);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 900_0000000);
     assert_eq!(ctx.vault_client.total_supply(), 900_0000000);
 
     // Alice withdraws 99 USDC directly: burns exactly 99 shares at $1.00
-    let shares_burned = ctx.vault_client.withdraw(&99_0000000, &ctx.alice, &ctx.alice);
+    let shares_burned = ctx.vault_client.withdraw(&99_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(shares_burned, 99_0000000);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 801_0000000);
     assert_eq!(ctx.vault_client.total_supply(), 801_0000000);
@@ -240,7 +240,7 @@ fn test_t42_fee_dilution_calculation() {
 
     // Management fee = 100 bps = 1% / year
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&1000_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
 
     let initial_shares = ctx.vault_client.total_supply();
     let initial_assets = ctx.vault_client.total_assets();
@@ -274,7 +274,7 @@ fn test_t43_collateral_passport_views() {
 
     // Deposit initial capital
     ctx.numeraire_admin.mint(&ctx.alice, &500_0000000);
-    ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
 
     // 1. Dual NAV
     let cons_nav = ctx.vault_client.get_nav_conservative().unwrap();
@@ -350,10 +350,10 @@ fn test_t44_emergency_pause_and_unpause() {
     assert_eq!(ctx.vault_client.max_redeem(&ctx.alice), 0);
 
     // Operations must panic with VaultPaused
-    let res = ctx.vault_client.try_deposit(&50_0000000, &ctx.alice);
+    let res = ctx.vault_client.try_deposit(&50_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(res.unwrap_err().unwrap(), VaultError::VaultPaused.into());
 
-    let res_mint = ctx.vault_client.try_mint(&50_0000000, &ctx.alice);
+    let res_mint = ctx.vault_client.try_mint(&50_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(res_mint.unwrap_err().unwrap(), VaultError::VaultPaused.into());
 
     let res_transfer = ctx.vault_client.try_transfer(&ctx.alice, &ctx.bob, &10_0000000);
@@ -364,7 +364,7 @@ fn test_t44_emergency_pause_and_unpause() {
     assert!(!ctx.vault_client.is_paused());
 
     // Operations resume normally
-    let shares = ctx.vault_client.deposit(&50_0000000, &ctx.alice);
+    let shares = ctx.vault_client.deposit(&50_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(shares, 50_0000000);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 50_0000000);
 
@@ -392,7 +392,7 @@ fn test_t45_sep41_token_standard() {
     let ctx = setup_test_context();
 
     ctx.numeraire_admin.mint(&ctx.alice, &500_0000000);
-    ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
 
     // Metadata
     assert_eq!(ctx.vault_client.decimals(), 7);
@@ -523,7 +523,7 @@ fn test_t46_liquidity_sleeve_floor_protection() {
 
     // Initial setup: Admin deposits $100,000 to seed the vault
     ctx.numeraire_admin.mint(&ctx.admin, &100_000_0000000);
-    ctx.vault_client.deposit(&100_000_0000000, &ctx.admin);
+    ctx.vault_client.deposit(&100_000_0000000, &ctx.admin, &ctx.admin, &ctx.admin);
     assert_eq!(ctx.vault_client.total_supply(), 100_000_0000000);
 
     // Set multi-sleeve configuration on vault:
@@ -564,22 +564,22 @@ fn test_t46_liquidity_sleeve_floor_protection() {
 
     // Deposit 1,000 USDC by Alice
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&1000_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
 
     // Alice redeems within allowable instant capacity: 500 shares (~496 USDC < 11,200 USDC)
     let alice_bal = ctx.vault_client.balance(&ctx.alice);
     let shares_to_redeem = alice_bal / 2;
-    let redeemed = ctx.vault_client.redeem(&shares_to_redeem, &ctx.alice, &ctx.alice);
+    let redeemed = ctx.vault_client.redeem(&shares_to_redeem, &ctx.alice, &ctx.alice, &ctx.alice);
     assert!(redeemed > 0);
 
     // Attempt redemption that would breach the 10% liquidity floor:
     // Admin has ~100,000 shares. Trying to redeem 15,000 shares (~14,880 USDC > 11,200 max instant capacity)
-    let res = ctx.vault_client.try_redeem(&15_000_0000000, &ctx.admin, &ctx.admin);
+    let res = ctx.vault_client.try_redeem(&15_000_0000000, &ctx.admin, &ctx.admin, &ctx.admin);
     assert_eq!(res.unwrap_err().unwrap(), VaultError::LiquidityFloorBreached.into());
 
     // Attempt redemption that exceeds total cash physical balance ($21,000 - $496 = $20,504):
     // Trying to redeem 30,000 shares (~29,760 USDC > 20,504 cash)
-    let res_cap = ctx.vault_client.try_redeem(&30_000_0000000, &ctx.admin, &ctx.admin);
+    let res_cap = ctx.vault_client.try_redeem(&30_000_0000000, &ctx.admin, &ctx.admin, &ctx.admin);
     assert_eq!(res_cap.unwrap_err().unwrap(), VaultError::ExceedsRedemptionCapacity.into());
 
     // Verify oracle status returns BENJI sources via registry lookup
@@ -655,10 +655,10 @@ fn test_edge_cases_and_authorizations() {
     assert_eq!(weights_res.unwrap_err().unwrap(), VaultError::InvalidBps.into());
 
     // 4. Zero amount operations rejected
-    let zero_dep = ctx.vault_client.try_deposit(&0, &ctx.alice);
+    let zero_dep = ctx.vault_client.try_deposit(&0, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(zero_dep.unwrap_err().unwrap(), VaultError::ZeroAmount.into());
 
-    let zero_redeem = ctx.vault_client.try_redeem(&0, &ctx.alice, &ctx.alice);
+    let zero_redeem = ctx.vault_client.try_redeem(&0, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(zero_redeem.unwrap_err().unwrap(), VaultError::ZeroAmount.into());
 
     let zero_transfer = ctx.vault_client.try_transfer(&ctx.alice, &ctx.bob, &0);
@@ -741,7 +741,7 @@ fn test_exact_liquidity_floor_boundary() {
     // Seed vault with $10,000 cash and $90,000 BENJI = $100,000 total assets
     // Cash is exactly 10,000 / 100,000 = 10.00%
     ctx.numeraire_admin.mint(&ctx.admin, &100_000_0000000);
-    ctx.vault_client.deposit(&100_000_0000000, &ctx.admin);
+    ctx.vault_client.deposit(&100_000_0000000, &ctx.admin, &ctx.admin, &ctx.admin);
 
     let mut sleeves = SdkVec::new(&ctx.env);
     sleeves.push_back(SleeveState {
@@ -771,10 +771,10 @@ fn test_exact_liquidity_floor_boundary() {
     assert_eq!(ctx.vault_client.max_redeem(&ctx.admin), 0);
 
     // Any withdraw or redeem attempt must be rejected with LiquidityFloorBreached
-    let res = ctx.vault_client.try_withdraw(&1_0000000, &ctx.admin, &ctx.admin);
+    let res = ctx.vault_client.try_withdraw(&1_0000000, &ctx.admin, &ctx.admin, &ctx.admin);
     assert_eq!(res.unwrap_err().unwrap(), VaultError::LiquidityFloorBreached.into());
 
-    let res_redeem = ctx.vault_client.try_redeem(&1_0000000, &ctx.admin, &ctx.admin);
+    let res_redeem = ctx.vault_client.try_redeem(&1_0000000, &ctx.admin, &ctx.admin, &ctx.admin);
     assert_eq!(res_redeem.unwrap_err().unwrap(), VaultError::LiquidityFloorBreached.into());
 }
 
@@ -863,7 +863,7 @@ fn test_dual_nav_asymmetric_max_redeem() {
 
     // Initial deposit: 1000 USDC -> 1000 shares
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&1000_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
 
     // Configure sleeves: 500 USDC cash, 500 BENJI
     let mut sleeves = SdkVec::new(&ctx.env);
@@ -901,7 +901,7 @@ fn test_dual_nav_asymmetric_max_redeem() {
     assert_eq!(max_red, 666_6666666);
 
     // Alice redeems exactly max_redeem shares
-    let assets_out = ctx.vault_client.redeem(&max_red, &ctx.alice, &ctx.alice);
+    let assets_out = ctx.vault_client.redeem(&max_red, &ctx.alice, &ctx.alice, &ctx.alice);
     assert!(assets_out <= cap.instant);
     assert_eq!(assets_out, 499_9999999);
 }
@@ -913,7 +913,7 @@ fn test_mint_ceiling_rounding() {
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
 
     // When NAV is $1.00 (10_000_000), minting 1 share requires (1 * 10_000_000 + 10_000_000 - 1) / 10_000_000 = 1 stroop of assets
-    let assets_paid = ctx.vault_client.mint(&1, &ctx.alice);
+    let assets_paid = ctx.vault_client.mint(&1, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(assets_paid, 1);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 1);
 }
@@ -923,7 +923,7 @@ fn test_storage_cleanup_zero_balance_and_allowance() {
     let ctx = setup_test_context();
 
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 100_0000000);
 
     // Transfer entire balance to Bob
@@ -988,7 +988,7 @@ fn test_self_transfer_does_not_mint_shares() {
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let before = ctx.vault_client.balance(&ctx.alice);
     let supply = ctx.vault_client.total_supply();
 
@@ -1019,7 +1019,7 @@ fn test_self_transfer_more_than_balance_rejected() {
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let bal = ctx.vault_client.balance(&ctx.alice);
     ctx.env.mock_auths(&[MockAuth {
         address: &ctx.alice,
@@ -1040,7 +1040,7 @@ fn test_self_transfer_from_does_not_mint_shares() {
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let bal = ctx.vault_client.balance(&ctx.alice);
     let supply = ctx.vault_client.total_supply();
     ctx.vault_client.approve(&ctx.alice, &ctx.bob, &bal, &1000);
@@ -1067,7 +1067,7 @@ fn test_self_transfer_from_does_not_mint_shares() {
 fn test_transfer_conserves_total_supply() {
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let supply = ctx.vault_client.total_supply();
     ctx.vault_client.transfer(&ctx.alice, &ctx.bob, &40_0000000);
     ctx.vault_client.transfer(&ctx.bob, &ctx.alice, &15_0000000);
@@ -1135,7 +1135,7 @@ fn sleeve(ctx: &TestContext, id: &str, addr: &Address, st: SleeveType, bps: u32,
 fn test_v2_set_sleeves_rejects_balance_injection() {
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let gov = register_gov_fund(&ctx);
 
     let mut sleeves = SdkVec::new(&ctx.env);
@@ -1157,7 +1157,7 @@ fn test_v2_set_sleeves_rejects_balance_injection() {
 fn test_v2_set_sleeves_preserves_recorded_balances() {
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let gov = register_gov_fund(&ctx);
 
     let mut sleeves = SdkVec::new(&ctx.env);
@@ -1216,7 +1216,7 @@ fn test_v2_cannot_remove_sleeve_that_holds_tokens() {
 fn test_v2_unsolicited_transfers_do_not_move_nav() {
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let gov = register_gov_fund(&ctx);
     let mut sleeves = SdkVec::new(&ctx.env);
     sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 100_0000000));
@@ -1308,7 +1308,7 @@ mod v3 {
     fn vault_with_empty_gov_sleeve(ctx: &TestContext) -> Address {
         let gov = register_gov_fund(ctx);
         ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-        ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+        ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         let mut sleeves = SdkVec::new(&ctx.env);
         sleeves.push_back(sleeve(ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 500_0000000));
         sleeves.push_back(sleeve(ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
@@ -1322,17 +1322,21 @@ mod v3 {
     fn assert_vault_operates(ctx: &TestContext) {
         let dep_nav = ctx.vault_client.get_nav_deposit().expect("deposit NAV").price;
         let cons_nav = ctx.vault_client.get_nav_conservative().expect("conservative NAV").price;
-        // Only cash is held, so both NAVs equal total_assets / total_supply.
+        // Only cash is held, so both NAVs agree.
         assert_eq!(dep_nav, cons_nav);
+        // Views price pending management fees (W4.2b), so minting them must not
+        // move the NAV; afterwards NAV = total_assets / total_supply.
+        ctx.vault_client.accrue_fees();
+        assert_eq!(ctx.vault_client.get_nav_deposit().unwrap().price, dep_nav, "view NAV must include pending fees");
         let expected = ctx.vault_client.total_assets() * 10_000_000 / ctx.vault_client.total_supply();
         assert!((dep_nav - expected).abs() <= 1, "nav {dep_nav} vs assets/supply {expected}");
 
         let usdc_before = ctx.numeraire_client.balance(&ctx.alice);
-        let minted = ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+        let minted = ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         assert!(minted > 0);
-        let paid = ctx.vault_client.redeem(&50_0000000, &ctx.alice, &ctx.alice);
+        let paid = ctx.vault_client.redeem(&50_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         assert!(paid > 0);
-        let burned = ctx.vault_client.withdraw(&10_0000000, &ctx.alice, &ctx.alice);
+        let burned = ctx.vault_client.withdraw(&10_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         assert!(burned > 0);
         assert_eq!(
             ctx.numeraire_client.balance(&ctx.alice),
@@ -1380,7 +1384,7 @@ mod v3 {
             added_at: 1_000_000,
         });
         ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-        ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+        ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         let mut sleeves = SdkVec::new(&ctx.env);
         sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 8000, 500_0000000));
         sleeves.push_back(sleeve(&ctx, "SPIKO_EUR", &eur, SleeveType::EurSovereign, 2000, 0));
@@ -1402,7 +1406,7 @@ mod v4 {
     fn vault_with_empty_gov(ctx: &TestContext) {
         let gov = register_gov_fund(ctx);
         ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-        ctx.vault_client.deposit(&600_0000000, &ctx.alice);
+        ctx.vault_client.deposit(&600_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         let mut sleeves = SdkVec::new(&ctx.env);
         sleeves.push_back(sleeve(ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 4000, 600_0000000));
         sleeves.push_back(sleeve(ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 6000, 0));
@@ -1496,11 +1500,11 @@ mod w3 {
         ctx.numeraire_admin.mint(&ctx.bob, &(10 * ONE));
         // Feeds price the vault at $1.00 deposit NAV: 100k USDC = the cap.
         assert_eq!(ctx.vault_client.max_deposit(&ctx.alice), 100_000 * ONE);
-        ctx.vault_client.deposit(&(100_000 * ONE), &ctx.alice);
+        ctx.vault_client.deposit(&(100_000 * ONE), &ctx.alice, &ctx.alice, &ctx.alice);
         assert_eq!(ctx.vault_client.max_deposit(&ctx.alice), 0);
-        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
-        assert_eq!(ctx.vault_client.try_mint(&ONE, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
-        assert_eq!(ctx.vault_client.deposit(&(10 * ONE), &ctx.bob), 10 * ONE, "other users unaffected");
+        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.alice, &ctx.alice, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
+        assert_eq!(ctx.vault_client.try_mint(&ONE, &ctx.alice, &ctx.alice, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
+        assert_eq!(ctx.vault_client.deposit(&(10 * ONE), &ctx.bob, &ctx.bob, &ctx.bob), 10 * ONE, "other users unaffected");
     }
 
     #[test]
@@ -1509,14 +1513,14 @@ mod w3 {
         ctx.vault_client.lower_caps(&(150 * ONE), &(100 * ONE));
         ctx.numeraire_admin.mint(&ctx.alice, &(1000 * ONE));
         ctx.numeraire_admin.mint(&ctx.bob, &(1000 * ONE));
-        ctx.vault_client.deposit(&(100 * ONE), &ctx.alice);
+        ctx.vault_client.deposit(&(100 * ONE), &ctx.alice, &ctx.alice, &ctx.alice);
         assert_eq!(ctx.vault_client.max_deposit(&ctx.bob), 50 * ONE, "TVL room binds before bob's user room");
         let m = ctx.vault_client.max_mint(&ctx.bob);
-        ctx.vault_client.mint(&m, &ctx.bob);
+        ctx.vault_client.mint(&m, &ctx.bob, &ctx.bob, &ctx.bob);
         assert_eq!(ctx.vault_client.max_deposit(&ctx.bob), 0);
-        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.bob).err().unwrap().unwrap(), err(VaultError::TvlCapExceeded));
+        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.bob, &ctx.bob, &ctx.bob).err().unwrap().unwrap(), err(VaultError::TvlCapExceeded));
         // Withdrawals reopen room.
-        ctx.vault_client.redeem(&(10 * ONE), &ctx.alice, &ctx.alice);
+        ctx.vault_client.redeem(&(10 * ONE), &ctx.alice, &ctx.alice, &ctx.alice);
         assert!(ctx.vault_client.max_deposit(&ctx.bob) > 0);
     }
 
@@ -1683,7 +1687,7 @@ mod w7 {
         targets(&ctx, 1000, &gov, "SPIKO_USD", SleeveType::UsdGovFunds);
         assert_eq!(haircut(&ctx), 1450); // target-weighted while empty
         ctx.numeraire_admin.mint(&ctx.alice, &(100 * 10_000_000));
-        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice);
+        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice, &ctx.alice, &ctx.alice);
         assert_eq!(haircut(&ctx), 1000, "the vault actually holds only cash");
         assert_eq!(ctx.vault_client.get_listing_kit().liquidation_threshold_bps, 9000);
     }
@@ -1782,13 +1786,13 @@ mod m2 {
         let ctx = setup_test_context();
         ctx.numeraire_admin.mint(&ctx.alice, &(1000 * 10_000_000));
         let mut total = 0;
-        ctx.vault_client.deposit(&(500 * 10_000_000), &ctx.alice);
+        ctx.vault_client.deposit(&(500 * 10_000_000), &ctx.alice, &ctx.alice, &ctx.alice);
         total += check_names(&ctx);
         ctx.vault_client.transfer(&ctx.alice, &ctx.bob, &(10 * 10_000_000));
         total += check_names(&ctx);
         ctx.vault_client.approve(&ctx.alice, &ctx.bob, &(10 * 10_000_000), &500);
         total += check_names(&ctx);
-        ctx.vault_client.redeem(&(10 * 10_000_000), &ctx.alice, &ctx.alice);
+        ctx.vault_client.redeem(&(10 * 10_000_000), &ctx.alice, &ctx.alice, &ctx.alice);
         total += check_names(&ctx);
         ctx.env.ledger().set_timestamp(1_000_000 + 30 * 86_400);
         ctx.vault_client.accrue_fees();
@@ -1811,7 +1815,7 @@ mod m2 {
     fn deposit_and_withdraw_events_follow_sep56_layout() {
         let ctx = setup_test_context();
         ctx.numeraire_admin.mint(&ctx.alice, &(100 * 10_000_000));
-        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice);
+        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice, &ctx.alice, &ctx.alice);
         let dep = all_events(&ctx.env).iter()
             .find(|(c, t, _)| *c == ctx.vault_id && name_of(&ctx.env, &t.get(0).unwrap()) == "deposit")
             .expect("deposit event");
@@ -1819,10 +1823,14 @@ mod m2 {
         for i in 1..4 {
             assert_eq!(Address::try_from_val(&ctx.env, &dep.1.get(i).unwrap()).unwrap(), ctx.alice);
         }
-        let (assets, shares): (i128, i128) = <(i128, i128)>::try_from_val(&ctx.env, &dep.2).unwrap();
-        assert_eq!((assets, shares), (100 * 10_000_000, 100 * 10_000_000));
+        // SEP-56 v0.1.2 defines Deposit/Withdraw as #[contractevent] structs:
+        // data is the default map encoding {assets, shares} (W4.2b).
+        let data = soroban_sdk::Map::<Symbol, i128>::try_from_val(&ctx.env, &dep.2).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data.get(Symbol::new(&ctx.env, "assets")), Some(100 * 10_000_000));
+        assert_eq!(data.get(Symbol::new(&ctx.env, "shares")), Some(100 * 10_000_000));
 
-        ctx.vault_client.redeem(&(40 * 10_000_000), &ctx.bob, &ctx.alice);
+        ctx.vault_client.redeem(&(40 * 10_000_000), &ctx.bob, &ctx.alice, &ctx.alice);
         let wd = all_events(&ctx.env).iter()
             .find(|(c, t, _)| *c == ctx.vault_id && name_of(&ctx.env, &t.get(0).unwrap()) == "withdraw")
             .expect("withdraw event");
@@ -1830,6 +1838,10 @@ mod m2 {
         assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(1).unwrap()).unwrap(), ctx.alice, "operator");
         assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(2).unwrap()).unwrap(), ctx.bob, "receiver");
         assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(3).unwrap()).unwrap(), ctx.alice, "owner");
+        let data = soroban_sdk::Map::<Symbol, i128>::try_from_val(&ctx.env, &wd.2).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data.get(Symbol::new(&ctx.env, "shares")), Some(40 * 10_000_000));
+        assert!(data.get(Symbol::new(&ctx.env, "assets")).unwrap() > 0);
     }
 }
 
@@ -1897,13 +1909,13 @@ fn golden_events_vault() {
     g.capture(env, "constructor");
     let one = 10_000_000i128;
     ctx.numeraire_admin.mint(&ctx.alice, &(1000 * one));
-    v.deposit(&(300 * one), &ctx.alice); g.capture(env, "deposit");
-    v.mint(&(100 * one), &ctx.alice); g.capture(env, "mint");
+    v.deposit(&(300 * one), &ctx.alice, &ctx.alice, &ctx.alice); g.capture(env, "deposit");
+    v.mint(&(100 * one), &ctx.alice, &ctx.alice, &ctx.alice); g.capture(env, "mint");
     v.transfer(&ctx.alice, &ctx.bob, &(10 * one)); g.capture(env, "transfer");
     v.approve(&ctx.alice, &ctx.bob, &(20 * one), &1000); g.capture(env, "approve");
     v.transfer_from(&ctx.bob, &ctx.alice, &ctx.bob, &(5 * one)); g.capture(env, "transfer_from");
-    v.redeem(&(10 * one), &ctx.bob, &ctx.alice); g.capture(env, "redeem");
-    v.withdraw(&(10 * one), &ctx.alice, &ctx.alice); g.capture(env, "withdraw");
+    v.redeem(&(10 * one), &ctx.bob, &ctx.alice, &ctx.alice); g.capture(env, "redeem");
+    v.withdraw(&(10 * one), &ctx.alice, &ctx.alice, &ctx.alice); g.capture(env, "withdraw");
     env.ledger().set_timestamp(1_000_000 + 30 * 86_400);
     v.accrue_fees(); g.capture(env, "accrue_fees");
     v.lower_caps(&(500_000 * one), &(50_000 * one)); g.capture(env, "lower_caps");

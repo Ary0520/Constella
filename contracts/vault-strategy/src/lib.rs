@@ -17,6 +17,11 @@ use stellar_tokens::fungible::{
     total_supply::{decrease_total_supply, increase_total_supply, total_supply as share_supply},
     Base, INSTANCE_EXTEND_AMOUNT, INSTANCE_TTL_THRESHOLD,
 };
+// Audit W4.2b: SEP-56 asset movement and operator semantics come from the
+// OpenZeppelin vault module (`deposit_internal` / `withdraw_internal`). Its
+// single-NAV share maths is not used: deposits price at the median NAV and
+// redemptions at the conservative NAV (VAULT-DESIGN dual NAV).
+use stellar_tokens::vault::Vault as OzVault;
 
 // Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
 // Events::publish encodings; pinned by golden/events.txt). Lower-case names are
@@ -73,8 +78,10 @@ pub struct Burn {
     pub amount: i128,
 }
 
-/// SEP-56: topics [deposit, operator, from, receiver]; data (assets, shares).
-#[contractevent(topics = ["deposit"], data_format = "vec")]
+/// SEP-56 v0.1.2 `Deposit`: topics [deposit, operator, from, receiver]; data
+/// map {assets, shares} - the encoding of the standard's own #[contractevent]
+/// struct (default map format) and of the OpenZeppelin reference implementation.
+#[contractevent(topics = ["deposit"])]
 pub struct Deposit {
     #[topic]
     pub operator: Address,
@@ -86,8 +93,9 @@ pub struct Deposit {
     pub shares: i128,
 }
 
-/// SEP-56: topics [withdraw, operator, receiver, owner]; data (assets, shares).
-#[contractevent(topics = ["withdraw"], data_format = "vec")]
+/// SEP-56 v0.1.2 `Withdraw`: topics [withdraw, operator, receiver, owner]; data
+/// map {assets, shares} (see `Deposit`).
+#[contractevent(topics = ["withdraw"])]
 pub struct Withdraw {
     #[topic]
     pub operator: Address,
@@ -447,7 +455,10 @@ fn compute_sleeve_symbol(env: &Env, sleeve_type: SleeveType) -> Symbol {
     }
 }
 
-fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
+/// Management-fee shares owed right now and the accrual timestamp to store
+/// once they are minted. Pure: views use it to price pending fees exactly as
+/// the next state-changing call will mint them (SEP-56 previews).
+fn pending_fee_shares(env: &Env, config: &VaultConfig) -> (i128, u64) {
     let last_accrual: u64 = env
         .storage()
         .instance()
@@ -455,15 +466,13 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
         .unwrap_or(0);
     let now = env.ledger().timestamp();
     if now <= last_accrual || config.management_fee_bps == 0 {
-        return 0;
+        return (0, last_accrual);
     }
 
     let elapsed = now - last_accrual;
     let total_shares: i128 = share_supply(env);
-
     if total_shares == 0 {
-        env.storage().instance().set(&DataKey::LastFeeAccrual, &now);
-        return 0;
+        return (0, now);
     }
 
     let numerator = total_shares
@@ -475,34 +484,35 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
         (Some(num), Some(den)) if den > 0 => num / den,
         _ => 0,
     };
+    if d_shares <= 0 {
+        return (0, last_accrual);
+    }
 
+    // Carry the sub-share remainder of elapsed time into the next accrual.
+    let new_last = match (denominator, total_shares.checked_mul(config.management_fee_bps as i128)) {
+        (Some(den), Some(fee_rate)) if fee_rate > 0 => last_accrual + ((d_shares * den) / fee_rate) as u64,
+        _ => now,
+    };
+    (d_shares, new_last)
+}
+
+fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
+    let last_accrual: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::LastFeeAccrual)
+        .unwrap_or(0);
+    let (d_shares, new_last) = pending_fee_shares(env, config);
+    if new_last != last_accrual {
+        env.storage().instance().set(&DataKey::LastFeeAccrual, &new_last);
+    }
     if d_shares > 0 {
         // Audit W6: fee shares are minted like any other shares, with a SEP-41
         // mint event, so indexers can reconstruct every balance from events.
         mint_shares_internal(env, &config.treasury, d_shares);
-
-        if let (Some(den), Some(fee_rate)) = (
-            denominator,
-            total_shares.checked_mul(config.management_fee_bps as i128),
-        ) {
-            if fee_rate > 0 {
-                let accrued_time = (d_shares * den) / fee_rate;
-                let new_last = last_accrual + accrued_time as u64;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::LastFeeAccrual, &new_last);
-            } else {
-                env.storage().instance().set(&DataKey::LastFeeAccrual, &now);
-            }
-        } else {
-            env.storage().instance().set(&DataKey::LastFeeAccrual, &now);
-        }
-
         FeeAccrual { treasury: config.treasury.clone(), shares: d_shares }.publish(env);
-        d_shares
-    } else {
-        0
     }
+    d_shares
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -606,9 +616,9 @@ fn holdings_value(env: &Env, config: &VaultConfig, kind: NavKind) -> Result<(i12
     Ok((total, latest_ts))
 }
 
-fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> Option<PriceData> {
+/// NAV per share for `total_shares` outstanding shares.
+fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind, total_shares: i128) -> Option<PriceData> {
     let scale = share_scale(env);
-    let total_shares: i128 = share_supply(env);
     let has_sleeves = env
         .storage()
         .instance()
@@ -636,12 +646,110 @@ fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> Option<PriceDa
     })
 }
 
-fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
-    compute_nav(env, config, NavKind::Deposit)
+/// Shares outstanding once pending management fees are minted.
+fn supply_with_pending_fees(env: &Env, config: &VaultConfig) -> Option<i128> {
+    share_supply(env).checked_add(pending_fee_shares(env, config).0)
 }
 
+/// View NAV (median): includes pending fee shares, so it equals the NAV the
+/// next deposit/mint will execute at.
+fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
+    compute_nav(env, config, NavKind::Deposit, supply_with_pending_fees(env, config)?)
+}
+
+/// View NAV (conservative): includes pending fee shares.
 fn compute_conservative_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
-    compute_nav(env, config, NavKind::Collateral)
+    compute_nav(env, config, NavKind::Collateral, supply_with_pending_fees(env, config)?)
+}
+
+/// Execution NAV, read right after `accrue_fees_internal` (fees already minted).
+fn execution_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> i128 {
+    match compute_nav(env, config, kind, share_supply(env)) {
+        Some(pd) if pd.price > 0 => pd.price,
+        _ => panic_with_error!(env, VaultError::OracleUnavailable),
+    }
+}
+
+/// View NAV price, panicking when unpriced (as execution would).
+fn view_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> i128 {
+    let pd = match kind {
+        NavKind::Deposit => compute_deposit_nav(env, config),
+        NavKind::Collateral => compute_conservative_nav(env, config),
+    };
+    match pd {
+        Some(pd) if pd.price > 0 => pd.price,
+        _ => panic_with_error!(env, VaultError::OracleUnavailable),
+    }
+}
+
+fn mul_div(env: &Env, a: i128, b: i128, d: i128, round_up: bool) -> i128 {
+    let p = match a.checked_mul(b) {
+        Some(p) => p,
+        None => panic_with_error!(env, VaultError::MathOverflow),
+    };
+    if round_up { (p + d - 1) / d } else { p / d }
+}
+
+// SEP-56 conversions. Rounding always favours the vault (ERC-4626): deposit
+// and redeem round down, mint and withdraw round up.
+fn shares_for_deposit(env: &Env, assets: i128, nav: i128) -> i128 {
+    mul_div(env, assets, share_scale(env), nav, false)
+}
+fn assets_for_mint(env: &Env, shares: i128, nav: i128) -> i128 {
+    mul_div(env, shares, nav, share_scale(env), true)
+}
+fn assets_for_redeem(env: &Env, shares: i128, nav: i128) -> i128 {
+    mul_div(env, shares, nav, share_scale(env), false)
+}
+fn shares_for_withdraw(env: &Env, assets: i128, nav: i128) -> i128 {
+    mul_div(env, assets, share_scale(env), nav, true)
+}
+
+/// Moves `from`'s numeraire in (OZ `deposit_internal`: direct transfer when
+/// operator == from, otherwise `transfer_from` under `from`'s allowance to the
+/// operator), mints `shares` to `receiver`, books the cash sleeve, emits events.
+fn deposit_shares(env: &Env, receiver: &Address, from: &Address, operator: &Address, assets: i128, shares: i128) {
+    OzVault::deposit_internal(env, receiver, assets, shares, from, operator);
+    update_cash_sleeve_balance(env, assets, true);
+    Mint { to: receiver.clone(), amount: shares }.publish(env);
+    Deposit { operator: operator.clone(), from: from.clone(), receiver: receiver.clone(), assets, shares }.publish(env);
+}
+
+/// Instant-redemption guards: enough cash, and the policy liquidity floor holds.
+fn check_redemption_liquidity(env: &Env, config: &VaultConfig, assets: i128) {
+    let cash_balance = get_cash_sleeve_balance(env);
+    if assets > cash_balance {
+        panic_with_error!(env, VaultError::ExceedsRedemptionCapacity);
+    }
+    let total_a = StrategyVault::total_assets(env.clone());
+    let floor_bps = get_policy_floor_bps(env, config);
+    if total_a > assets && floor_bps > 0 {
+        let remaining_assets = total_a - assets;
+        let remaining_cash = cash_balance - assets;
+        let lhs = remaining_cash.checked_mul(10_000);
+        let rhs = remaining_assets.checked_mul(floor_bps as i128);
+        match (lhs, rhs) {
+            (Some(l), Some(r)) if l >= r => {}
+            (Some(_), Some(_)) => panic_with_error!(env, VaultError::LiquidityFloorBreached),
+            _ => panic_with_error!(env, VaultError::MathOverflow),
+        }
+    }
+}
+
+/// Burns `owner`'s shares and pays `receiver` (OZ `withdraw_internal`, which
+/// spends the owner's share allowance when operator != owner), books the cash
+/// sleeve, emits events. Shortfalls keep the vault's public error codes.
+fn withdraw_shares(env: &Env, receiver: &Address, owner: &Address, operator: &Address, assets: i128, shares: i128) {
+    if operator != owner && Base::allowance(env, owner, operator) < shares {
+        panic_with_error!(env, VaultError::InsufficientAllowance);
+    }
+    if Base::balance(env, owner) < shares {
+        panic_with_error!(env, VaultError::InsufficientBalance);
+    }
+    update_cash_sleeve_balance(env, assets, false);
+    OzVault::withdraw_internal(env, receiver, owner, assets, shares, operator);
+    Burn { from: owner.clone(), amount: shares }.publish(env);
+    Withdraw { operator: operator.clone(), receiver: receiver.clone(), owner: owner.clone(), assets, shares }.publish(env);
 }
 
 /// Tokens of `asset` actually held by this vault right now.
@@ -846,6 +954,7 @@ impl StrategyVault {
         }
 
         env.storage().instance().set(&DataKey::Config, &config);
+        OzVault::set_asset(&env, config.numeraire.clone());
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
@@ -870,8 +979,11 @@ impl StrategyVault {
     }
 
     // SEP-56 Vault Operations
-    pub fn deposit(env: Env, assets: i128, receiver: Address) -> i128 {
-        receiver.require_auth();
+    /// SEP-56 deposit: `operator` authorizes; `from` pays (directly when it is
+    /// the operator, otherwise via its numeraire allowance to the operator);
+    /// `receiver` gets the shares, priced at the median (deposit) NAV.
+    pub fn deposit(env: Env, assets: i128, receiver: Address, from: Address, operator: Address) -> i128 {
+        operator.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
         }
@@ -881,47 +993,19 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let deposit_nav = match compute_deposit_nav(&env, &config) {
-            Some(pd) => pd.price,
-            None => panic_with_error!(&env, VaultError::OracleUnavailable),
-        };
-        if deposit_nav <= 0 {
-            panic_with_error!(&env, VaultError::OracleUnavailable);
-        }
-
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-
-        let shares = (assets.checked_mul(scale).unwrap()) / deposit_nav;
+        let nav = execution_nav(&env, &config, NavKind::Deposit);
+        let shares = shares_for_deposit(&env, assets, nav);
         if shares <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-        enforce_caps(&env, &config, &receiver, assets, deposit_nav, scale);
-
-        token::Client::new(&env, &config.numeraire).transfer(
-            &receiver,
-            env.current_contract_address(),
-            &assets,
-        );
-
-        update_cash_sleeve_balance(&env, assets, true);
-        mint_shares_internal(&env, &receiver, shares);
-
-        // SEP-56 Deposit. The receiver authorizes and pays, so it is also operator and from.
-        Deposit {
-            operator: receiver.clone(),
-            from: receiver.clone(),
-            receiver,
-            assets,
-            shares,
-        }
-        .publish(&env);
-
+        enforce_caps(&env, &config, &receiver, assets, nav, share_scale(&env));
+        deposit_shares(&env, &receiver, &from, &operator, assets, shares);
         shares
     }
 
-    pub fn mint(env: Env, shares: i128, receiver: Address) -> i128 {
-        receiver.require_auth();
+    /// SEP-56 mint: exactly `shares` to `receiver`; returns the assets paid.
+    pub fn mint(env: Env, shares: i128, receiver: Address, from: Address, operator: Address) -> i128 {
+        operator.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
         }
@@ -931,183 +1015,93 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let deposit_nav = match compute_deposit_nav(&env, &config) {
-            Some(pd) => pd.price,
-            None => panic_with_error!(&env, VaultError::OracleUnavailable),
-        };
-        if deposit_nav <= 0 {
-            panic_with_error!(&env, VaultError::OracleUnavailable);
-        }
-
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-
-        let assets = (shares.checked_mul(deposit_nav).unwrap() + scale - 1) / scale;
+        let nav = execution_nav(&env, &config, NavKind::Deposit);
+        let assets = assets_for_mint(&env, shares, nav);
         if assets <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-        enforce_caps(&env, &config, &receiver, assets, deposit_nav, scale);
-
-        token::Client::new(&env, &config.numeraire).transfer(
-            &receiver,
-            env.current_contract_address(),
-            &assets,
-        );
-
-        update_cash_sleeve_balance(&env, assets, true);
-        mint_shares_internal(&env, &receiver, shares);
-
-        // SEP-56 Deposit. The receiver authorizes and pays, so it is also operator and from.
-        Deposit {
-            operator: receiver.clone(),
-            from: receiver.clone(),
-            receiver,
-            assets,
-            shares,
-        }
-        .publish(&env);
-
+        enforce_caps(&env, &config, &receiver, assets, nav, share_scale(&env));
+        deposit_shares(&env, &receiver, &from, &operator, assets, shares);
         assets
     }
 
-    pub fn redeem(env: Env, shares: i128, receiver: Address, owner: Address) -> i128 {
-        owner.require_auth();
+    /// SEP-56 redeem: burns exactly `shares` of `owner` (operator == owner, or
+    /// within the owner's share allowance), pays `receiver` at the
+    /// conservative NAV, subject to cash and the policy liquidity floor.
+    pub fn redeem(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> i128 {
+        operator.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
         }
         if shares <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-
-        let owner_bal: i128 = Base::balance(&env, &owner);
-        if owner_bal < shares {
-            panic_with_error!(&env, VaultError::InsufficientBalance);
-        }
-
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let conservative_nav = match compute_conservative_nav(&env, &config) {
-            Some(pd) => pd.price,
-            None => panic_with_error!(&env, VaultError::OracleUnavailable),
-        };
-        if conservative_nav <= 0 {
-            panic_with_error!(&env, VaultError::OracleUnavailable);
-        }
-
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-
-        let assets = (shares.checked_mul(conservative_nav).unwrap()) / scale;
+        let nav = execution_nav(&env, &config, NavKind::Collateral);
+        let assets = assets_for_redeem(&env, shares, nav);
         if assets <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-
-        let cash_balance = get_cash_sleeve_balance(&env);
-        if assets > cash_balance {
-            panic_with_error!(&env, VaultError::ExceedsRedemptionCapacity);
-        }
-
-        let total_a = Self::total_assets(env.clone());
-        let floor_bps = get_policy_floor_bps(&env, &config);
-        if total_a > assets && floor_bps > 0 {
-            let remaining_assets = total_a - assets;
-            let remaining_cash = cash_balance - assets;
-            if remaining_cash.checked_mul(10000).unwrap()
-                < remaining_assets.checked_mul(floor_bps as i128).unwrap()
-            {
-                panic_with_error!(&env, VaultError::LiquidityFloorBreached);
-            }
-        }
-
-        burn_shares_internal(&env, &owner, shares);
-        update_cash_sleeve_balance(&env, assets, false);
-
-        token::Client::new(&env, &config.numeraire).transfer(
-            &env.current_contract_address(),
-            &receiver,
-            &assets,
-        );
-
-        // SEP-56 Withdraw. The owner authorizes, so it is the operator.
-        Withdraw {
-            operator: owner.clone(),
-            receiver,
-            owner,
-            assets,
-            shares,
-        }
-        .publish(&env);
-
+        check_redemption_liquidity(&env, &config, assets);
+        withdraw_shares(&env, &receiver, &owner, &operator, assets, shares);
         assets
     }
 
-    pub fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address) -> i128 {
-        owner.require_auth();
+    /// SEP-56 withdraw: pays exactly `assets`; returns the shares burned.
+    pub fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address, operator: Address) -> i128 {
+        operator.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
         }
         if assets <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let conservative_nav = match compute_conservative_nav(&env, &config) {
-            Some(pd) => pd.price,
-            None => panic_with_error!(&env, VaultError::OracleUnavailable),
-        };
-        if conservative_nav <= 0 {
-            panic_with_error!(&env, VaultError::OracleUnavailable);
-        }
-
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-
-        let shares = (assets.checked_mul(scale).unwrap() + (conservative_nav - 1)) / conservative_nav;
-        let owner_bal: i128 = Base::balance(&env, &owner);
-        if owner_bal < shares {
-            panic_with_error!(&env, VaultError::InsufficientBalance);
-        }
-
-        let cash_balance = get_cash_sleeve_balance(&env);
-        if assets > cash_balance {
-            panic_with_error!(&env, VaultError::ExceedsRedemptionCapacity);
-        }
-
-        let total_a = Self::total_assets(env.clone());
-        let floor_bps = get_policy_floor_bps(&env, &config);
-        if total_a > assets && floor_bps > 0 {
-            let remaining_assets = total_a - assets;
-            let remaining_cash = cash_balance - assets;
-            if remaining_cash.checked_mul(10000).unwrap()
-                < remaining_assets.checked_mul(floor_bps as i128).unwrap()
-            {
-                panic_with_error!(&env, VaultError::LiquidityFloorBreached);
-            }
-        }
-
-        burn_shares_internal(&env, &owner, shares);
-        update_cash_sleeve_balance(&env, assets, false);
-
-        token::Client::new(&env, &config.numeraire).transfer(
-            &env.current_contract_address(),
-            &receiver,
-            &assets,
-        );
-
-        // SEP-56 Withdraw. The owner authorizes, so it is the operator.
-        Withdraw {
-            operator: owner.clone(),
-            receiver,
-            owner,
-            assets,
-            shares,
-        }
-        .publish(&env);
-
+        let nav = execution_nav(&env, &config, NavKind::Collateral);
+        let shares = shares_for_withdraw(&env, assets, nav);
+        check_redemption_liquidity(&env, &config, assets);
+        withdraw_shares(&env, &receiver, &owner, &operator, assets, shares);
         shares
+    }
+
+    /// SEP-56: shares `deposit(assets)` would mint now (fees included).
+    pub fn preview_deposit(env: Env, assets: i128) -> i128 {
+        if assets <= 0 {
+            return 0;
+        }
+        let config = get_config(&env);
+        shares_for_deposit(&env, assets, view_nav(&env, &config, NavKind::Deposit))
+    }
+
+    /// SEP-56: assets `mint(shares)` would cost now.
+    pub fn preview_mint(env: Env, shares: i128) -> i128 {
+        if shares <= 0 {
+            return 0;
+        }
+        let config = get_config(&env);
+        assets_for_mint(&env, shares, view_nav(&env, &config, NavKind::Deposit))
+    }
+
+    /// SEP-56: shares `withdraw(assets)` would burn now.
+    pub fn preview_withdraw(env: Env, assets: i128) -> i128 {
+        if assets <= 0 {
+            return 0;
+        }
+        let config = get_config(&env);
+        shares_for_withdraw(&env, assets, view_nav(&env, &config, NavKind::Collateral))
+    }
+
+    /// SEP-56: assets `redeem(shares)` would pay now.
+    pub fn preview_redeem(env: Env, shares: i128) -> i128 {
+        if shares <= 0 {
+            return 0;
+        }
+        let config = get_config(&env);
+        assets_for_redeem(&env, shares, view_nav(&env, &config, NavKind::Collateral))
     }
 
     pub fn total_assets(env: Env) -> i128 {
@@ -1156,7 +1150,8 @@ impl StrategyVault {
         (shares.checked_mul(conservative_nav).unwrap()) / scale
     }
 
-    pub fn asset(env: Env) -> Address {
+    /// SEP-56 `query_asset`: the numéraire.
+    pub fn query_asset(env: Env) -> Address {
         get_config(&env).numeraire
     }
 
