@@ -1646,3 +1646,94 @@ mod p3 {
     }
 }
 
+// -------------------------------------------------------------------------
+// Audit P1 (2026-11-15): slippage is measured in value using oracle prices,
+// not raw token units. EUR/USD = 1.08, cap = 50 bps.
+// -------------------------------------------------------------------------
+mod p1 {
+    use super::*;
+
+    const ONE: i128 = 10_000_000;
+
+    /// Registers FX_EURC (priced 1.08 by two feeds) and a USDC/FX_EURC policy.
+    fn fx_setup(ctx: &TestContext) -> Address {
+        let eur = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
+        register_registry_asset(&ctx.env, &AssetRegistryClient::new(&ctx.env, &ctx.registry_address), &eur, "FX_EURC", SleeveType::Cash);
+        price_asset(&ctx.env, &NavOracleClient::new(&ctx.env, &ctx.oracle_address), &eur, "P_FX", ONE * 108 / 100);
+        let sleeves = vec![
+            &ctx.env,
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"), target_weight_bps: 5000, min_band_bps: 0, max_band_bps: 10000, sleeve_type: Symbol::new(&ctx.env, "cash") },
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "FX_EURC"), target_weight_bps: 5000, min_band_bps: 0, max_band_bps: 10000, sleeve_type: Symbol::new(&ctx.env, "cash") },
+        ];
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(
+            &ctx.vault, &ctx.owner, &sample_hash(&ctx.env, 0x01), &ctx.registry_address,
+            &1000, &10000, &10000, &50, &500, &sleeves,
+        );
+        eur
+    }
+
+    fn check(ctx: &TestContext, a_in: &Address, a_out: &Address, amount_in: i128, min_out: i128) -> ValidationResult {
+        let proposal = RebalanceProposal {
+            vault: ctx.vault.clone(),
+            operations: vec![&ctx.env, TradeOperation { asset_in: a_in.clone(), asset_out: a_out.clone(), amount_in, min_amount_out: min_out, route: TradeRoute::Soroswap }],
+            weights_after: vec![&ctx.env, (Symbol::new(&ctx.env, "CIRCLE_USDC"), 5000u32), (Symbol::new(&ctx.env, "FX_EURC"), 5000u32)],
+            deadline: ctx.env.ledger().timestamp() + 600,
+            proposer: ctx.proposer.clone(),
+        };
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).validate_rebalance(&ctx.vault, &proposal)
+    }
+
+    #[test]
+    fn fair_trades_accepted_in_both_directions() {
+        let ctx = setup_test_context();
+        let eur = fx_setup(&ctx);
+        // 1000 USDC = 925.93 EUR; 925 EUR is ~0.1% slippage.
+        assert!(check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 925 * ONE).is_valid);
+        // 1000 EUR = 1080 USDC; 1076 USDC is ~0.37% slippage.
+        assert!(check(&ctx, &eur, &ctx.usdc_addr, 1000 * ONE, 1076 * ONE).is_valid);
+    }
+
+    #[test]
+    fn losses_beyond_cap_rejected_in_both_directions() {
+        let ctx = setup_test_context();
+        let eur = fx_setup(&ctx);
+        let r = check(&ctx, &eur, &ctx.usdc_addr, 1000 * ONE, 1070 * ONE); // 0.93% loss
+        assert_eq!((r.is_valid, r.code), (false, PolicyError::SlippageLimitExceeded as u32));
+        assert_eq!(r.message, Symbol::new(&ctx.env, "SLIPPAGE_EXCEEDED"));
+        let r = check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 915 * ONE); // 1.2% loss
+        assert!(!r.is_valid);
+        // The old raw-unit check accepted this 7.4% loss:
+        assert!(!check(&ctx, &eur, &ctx.usdc_addr, 1000 * ONE, 1000 * ONE).is_valid);
+    }
+
+    #[test]
+    fn exact_cap_boundary() {
+        let ctx = setup_test_context();
+        let eur = fx_setup(&ctx);
+        // value_in = 1000 USDC; at 50 bps the minimum value out is 995 USDC,
+        // i.e. 995 / 1.08 = 921.2962962... EUR -> 9_212_962_963 units.
+        assert!(check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 9_212_962_963).is_valid);
+        assert!(!check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 9_212_962_962).is_valid);
+    }
+
+    #[test]
+    fn unpriced_asset_makes_proposal_invalid() {
+        let ctx = setup_test_context();
+        let eur = fx_setup(&ctx);
+        let oracle = NavOracleClient::new(&ctx.env, &ctx.oracle_address);
+        oracle.trigger_circuit_breaker(&ctx.admin, &Symbol::new(&ctx.env, "P_FX"), &Symbol::new(&ctx.env, "MANUAL"));
+        let r = check(&ctx, &ctx.usdc_addr, &eur, 1000 * ONE, 925 * ONE);
+        assert_eq!((r.is_valid, r.code), (false, PolicyError::PriceUnavailable as u32));
+        assert_eq!(r.message, Symbol::new(&ctx.env, "PRICE_UNAVAILABLE"));
+    }
+
+    #[test]
+    fn oracle_is_fixed_at_initialization() {
+        let ctx = setup_test_context();
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        assert_eq!(policy.get_oracle(), ctx.oracle_address);
+        // Re-initializing (the only way to set it) is refused.
+        assert!(policy.try_initialize(&ctx.admin, &Address::generate(&ctx.env)).is_err());
+        assert_eq!(policy.get_oracle(), ctx.oracle_address);
+    }
+}
