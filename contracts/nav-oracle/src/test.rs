@@ -1843,3 +1843,183 @@ mod o7b {
         assert!(s.oracle.try_update_price(&Symbol::new(&env, "RFL"), &99_000_000, &0, &T).is_err());
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit O7c (2026-11-15): RedStone as an on-chain pull source, tested with
+// the REAL RedStone adapter (testdata/redstone_adapter_mainnet.wasm, fetched
+// read-only from mainnet CA526Y2N...XUSG, sha256 f0ccdffc...542e) and REAL
+// signed price payloads replayed from two mainnet write_prices transactions:
+//   USDC  : tx 4bed8f74...3a31, ledger 65493578, closed 1794753932
+//   EUROC : tx 089303b5...69fa, ledger 65493639, closed 1794754237
+// The adapter verifies RedStone's 3-of-5 signer signatures itself.
+// -------------------------------------------------------------------------
+mod redstone_wasm {
+    soroban_sdk::contractimport!(file = "testdata/redstone_adapter_mainnet.wasm");
+}
+
+mod o7c {
+    use super::redstone_wasm as rs;
+    use super::*;
+    use soroban_sdk::{Bytes, String as SStr};
+
+    const USDC_CLOSE: u64 = 1_794_753_932;
+    const EUROC_CLOSE: u64 = 1_794_754_237;
+    const USDC_SIGNED: u64 = 1_794_753_928; // package timestamp (s)
+    const UPDATER: &str = "GASNOA72CECDUZ5GEUK6WFINSASEG6R3WYZB2DE2CGDU7YI7GC2QPSFX"; // RedStone relayer
+
+    fn hex(env: &Env, h: &str) -> Bytes {
+        let h = h.trim();
+        let v: std::vec::Vec<u8> = (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).unwrap()).collect();
+        Bytes::from_slice(env, &v)
+    }
+
+    fn feeds(env: &Env, ids: &[&str]) -> soroban_sdk::Vec<SStr> {
+        let mut v = soroban_sdk::Vec::new(env);
+        for id in ids { v.push_back(SStr::from_str(env, id)); }
+        v
+    }
+
+    /// The real adapter with the two real mainnet writes replayed in order.
+    fn adapter(env: &Env) -> rs::Client<'static> {
+        let id = env.register(rs::WASM, ());
+        let a = rs::Client::new(env, &id);
+        env.mock_all_auths(); // the relayer's transaction signature; payload signatures are verified for real
+        a.init(&Address::generate(env));
+        let updater = Address::from_str(env, UPDATER);
+        env.ledger().set_timestamp(USDC_CLOSE);
+        a.write_prices(&updater, &feeds(env, &["USDC", "BTC"]), &hex(env, include_str!("../testdata/redstone_write_usdc.hex")));
+        env.ledger().set_timestamp(EUROC_CLOSE);
+        a.write_prices(&updater, &feeds(env, &["SolvBTC.BBN_FUNDAMENTAL/USD", "SolvBTC_FUNDAMENTAL/USD", "XLM", "EUROC"]),
+            &hex(env, include_str!("../testdata/redstone_write_euroc.hex")));
+        a
+    }
+
+    struct S<'a> {
+        env: &'a Env,
+        oracle: NavOracleClient<'a>,
+        eurc: Address,
+        adapter: rs::Client<'static>,
+    }
+
+    fn setup(env: &Env) -> S<'_> {
+        let (oracle, _admin, _base) = setup_oracle(env);
+        let adapter = adapter(env);
+        oracle.configure_sleeve(&Symbol::new(env, "CASH"), &200, &2);
+        S { env, oracle, eurc: Address::generate(env), adapter }
+    }
+
+    fn register(s: &S, id: &str, feed: &str, usdc: &str) -> bool {
+        let mut src = create_source(s.env, id, &s.eurc, "CASH", 0, 0, EUROC_CLOSE);
+        src.min_liquidity_depth_usd = 0;
+        src.staleness_limit_seconds = 900;
+        let cfg = RedStoneConfig {
+            adapter: s.adapter.address.clone(),
+            feed_id: SStr::from_str(s.env, feed),
+            usdc_feed_id: SStr::from_str(s.env, usdc),
+        };
+        s.oracle.try_register_redstone_source(&src, &cfg).is_ok()
+    }
+
+    #[test]
+    fn the_replayed_payloads_are_genuine_and_the_adapter_aggregates_them() {
+        let env = Env::default();
+        let s = setup(&env);
+        // Values independently decoded from the signed payloads (3 signers each):
+        // USDC 0.99975479 / 0.99975978 / 0.99975978 -> median 0.99975978; EUROC 1.09853605.
+        let u = s.adapter.read_price_data_for_feed(&SStr::from_str(&env, "USDC"));
+        let e = s.adapter.read_price_data_for_feed(&SStr::from_str(&env, "EUROC"));
+        assert_eq!((u.price.to_u128(), u.package_timestamp), (Some(99_975_978), USDC_SIGNED * 1000));
+        assert_eq!((e.price.to_u128(), e.package_timestamp), (Some(109_853_605), 1_794_754_230_000));
+        // Observed behaviour of the real adapter: signatures are checked PER FEED.
+        // Corrupting one USDC package (its signature, or a signed value byte)
+        // leaves USDC with < 3 valid signers: the call still succeeds and BTC
+        // (3 intact signatures) is stored, but USDC is silently NOT stored and
+        // reads fail. A successful write_prices does not mean every feed updated.
+        for byte in [100usize /* signature of USDC package 1 */, 63 /* its signed value */] {
+            let e3 = Env::default();
+            let id3 = e3.register(rs::WASM, ());
+            let a3 = rs::Client::new(&e3, &id3);
+            e3.mock_all_auths();
+            a3.init(&Address::generate(&e3));
+            e3.ledger().set_timestamp(USDC_CLOSE);
+            let mut forged: std::vec::Vec<u8> = hex(&e3, include_str!("../testdata/redstone_write_usdc.hex")).iter().collect();
+            forged[byte] ^= 0x01;
+            let res = a3.try_write_prices(&Address::from_str(&e3, UPDATER), &feeds(&e3, &["USDC", "BTC"]), &Bytes::from_slice(&e3, &forged));
+            assert!(res.is_ok());
+            assert!(a3.try_read_price_data_for_feed(&SStr::from_str(&e3, "USDC")).is_err(), "forged USDC must never be served (byte {byte})");
+            assert!(a3.try_read_price_data_for_feed(&SStr::from_str(&e3, "BTC")).is_ok());
+        }
+    }
+
+    #[test]
+    fn eurc_is_priced_in_usdc_through_redstones_own_usdc_feed() {
+        let env = Env::default();
+        let s = setup(&env);
+        assert!(register(&s, "RS_EURC", "EUROC", "USDC"));
+        // floor(1.09853605 * 1e7 / 0.99975978) = floor(10_988_000.037...) = 10_988_000
+        let p = s.oracle.pull_price(&Symbol::new(&env, "RS_EURC")).unwrap();
+        assert_eq!(p.price, 10_988_000);
+        assert_eq!(p.timestamp, USDC_SIGNED, "stamped with the older SIGNED time (ms -> s)");
+    }
+
+    #[test]
+    fn our_staleness_limit_applies_not_redstones_30_hours() {
+        let env = Env::default();
+        let s = setup(&env);
+        assert!(register(&s, "RS_EURC", "EUROC", "USDC"));
+        env.ledger().set_timestamp(USDC_SIGNED + 900);
+        assert!(s.oracle.pull_price(&Symbol::new(&env, "RS_EURC")).is_some());
+        // 901 s after the USDC leg was signed: invalid for us, although the
+        // adapter itself would keep serving it for 30 hours.
+        env.ledger().set_timestamp(USDC_SIGNED + 901);
+        assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RS_EURC")), None);
+        assert!(s.adapter.try_read_price_data_for_feed(&SStr::from_str(&env, "USDC")).is_ok());
+    }
+
+    #[test]
+    fn registration_requires_readable_feeds_and_rejects_the_eurc_name_trap() {
+        let env = Env::default();
+        let s = setup(&env);
+        // RedStone's EURC/USD feed id is "EUROC"; "EURC" does not exist.
+        assert!(!register(&s, "BAD_NAME", "EURC", "USDC"));
+        assert!(!register(&s, "BAD_QUOTE", "EUROC", "USDT"));
+        let mut src = create_source(&env, "DEPTH", &s.eurc, "CASH", 0, 0, EUROC_CLOSE);
+        src.min_liquidity_depth_usd = 100_000;
+        let cfg = RedStoneConfig { adapter: s.adapter.address.clone(), feed_id: SStr::from_str(&env, "EUROC"), usdc_feed_id: SStr::from_str(&env, "USDC") };
+        assert!(s.oracle.try_register_redstone_source(&src, &cfg).is_err(), "no depth floor on a source without depth");
+        assert!(register(&s, "OK", "EUROC", "USDC"));
+        assert!(s.oracle.try_update_price(&Symbol::new(&env, "OK"), &10_000_000, &0, &EUROC_CLOSE).is_err(), "pull sources cannot be pushed");
+    }
+
+    #[test]
+    fn reflector_and_redstone_together_price_eurc_as_two_independent_sources() {
+        use super::reflector_wasm as rw;
+        let env = Env::default();
+        let s = setup(&env);
+        assert!(register(&s, "RS_EURC", "EUROC", "USDC"));
+        // A real Reflector feed (CEX/DEX-style, base USD) with 3 rounds near the same prices.
+        let rid = env.register(rw::WASM, ());
+        let r = rw::Client::new(&env, &rid);
+        let mut list = soroban_sdk::Vec::new(&env);
+        list.push_back(rw::Asset::Other(Symbol::new(&env, "EURC")));
+        list.push_back(rw::Asset::Other(Symbol::new(&env, "USDC")));
+        r.config(&rw::ConfigData { admin: Address::generate(&env), assets: list, base_asset: rw::Asset::Other(Symbol::new(&env, "USD")),
+            cache_size: 0, decimals: 14, fee_config: rw::FeeConfig::None, history_retention_period: 86_400_000, resolution: 300_000 });
+        let t0 = EUROC_CLOSE / 300 * 300;
+        for k in [2u64, 1, 0] {
+            let mut p = soroban_sdk::Vec::new(&env);
+            p.push_back(109_870_000_000_000i128); // EURC 1.0987 USD
+            p.push_back(99_990_000_000_000i128); // USDC 0.9999 USD
+            r.set_price(&rw::PriceUpdate { mask: Bytes::from_array(&env, &[0b11]), prices: p }, &((t0 - k * 300) * 1000));
+        }
+        let mut src = create_source(&env, "RFL_EURC", &s.eurc, "CASH", 0, 0, EUROC_CLOSE);
+        src.min_liquidity_depth_usd = 0;
+        src.staleness_limit_seconds = 900;
+        s.oracle.register_reflector_source(&src, &ReflectorConfig { contract: rid, asset: Asset::Other(Symbol::new(&env, "EURC")),
+            quote: PriceQuote::ViaUsdc(Asset::Other(Symbol::new(&env, "USDC"))), rounds: 3 });
+        // Reflector: floor(1.0987e14*1e7/0.9999e14) = 10_988_098 ; RedStone: 10_988_000
+        assert_eq!(s.oracle.pull_price(&Symbol::new(&env, "RFL_EURC")).unwrap().price, 10_988_098);
+        assert_eq!(s.oracle.asset_price(&s.eurc).unwrap().price, 10_988_049, "median of the two independent providers");
+        assert_eq!(s.oracle.collateral_price(&s.eurc).unwrap().price, 10_988_000, "collateral = the lower");
+    }
+}
