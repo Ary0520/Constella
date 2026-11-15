@@ -1190,3 +1190,139 @@ fn w6_transfer_accepts_a_muxed_destination_and_reports_its_id() {
     assert_eq!(s.vault.balance(&alice), 90 * ONE);
     assert_eq!(s.vault.total_supply(), 100 * ONE);
 }
+
+// ---------------------------------------------------------------------------
+// W4.2b — SEP-56 v0.1.2 conformance: deposit/mint take (receiver, from,
+// operator), withdraw/redeem take (receiver, owner, operator), operator
+// authorizes; preview_* and query_asset exist. A third-party operator may only
+// move `from`'s numeraire under an allowance `from` granted on the numeraire,
+// and may only burn `owner`'s shares under an allowance on the vault shares.
+// ---------------------------------------------------------------------------
+fn authorize_tree(s: &Stack, who: &Address, fn_name: &'static str, args: Vec<soroban_sdk::Val>, subs: &[MockAuthInvoke]) {
+    s.env.mock_auths(&[MockAuth {
+        address: who,
+        invoke: &MockAuthInvoke { contract: &s.vault_id, fn_name, args, sub_invokes: subs },
+    }]);
+}
+
+fn assets_shares_map(assets: i128, shares: i128) -> soroban_sdk::xdr::ScVal {
+    use soroban_sdk::xdr::{ScMap, ScMapEntry, ScVal};
+    ScVal::Map(Some(ScMap(
+        std::vec![
+            ScMapEntry { key: sym("assets"), val: i128_val(assets) },
+            ScMapEntry { key: sym("shares"), val: i128_val(shares) },
+        ]
+        .try_into()
+        .unwrap(),
+    )))
+}
+
+#[test]
+fn sep56_operator_deposits_only_from_a_payer_who_approved_it() {
+    let s = deploy_stack();
+    assert_eq!(s.vault.query_asset(), s.usdc_addr);
+    let payer = Address::generate(&s.env);
+    let operator = Address::generate(&s.env);
+    let receiver = Address::generate(&s.env);
+    s.usdc_admin.mint(&payer, &(100 * ONE));
+    let amt = 100 * ONE;
+    let pull: Vec<soroban_sdk::Val> = (operator.clone(), payer.clone(), s.vault_id.clone(), amt).into_val(&s.env);
+    let sub = [MockAuthInvoke { contract: &s.usdc_addr, fn_name: "transfer_from", args: pull, sub_invokes: &[] }];
+    let args: Vec<soroban_sdk::Val> = (amt, receiver.clone(), payer.clone(), operator.clone()).into_val(&s.env);
+
+    // No numeraire allowance from the payer: the operator cannot spend its funds.
+    authorize_tree(&s, &operator, "deposit", args.clone(), &sub);
+    assert!(s.vault.try_deposit(&amt, &receiver, &payer, &operator).is_err());
+    assert_eq!(s.usdc.balance(&payer), amt);
+
+    let until = s.env.ledger().sequence() + 1_000;
+    s.env.mock_all_auths();
+    s.usdc.approve(&payer, &operator, &amt, &until);
+
+    // Only the operator signs this call.
+    authorize_tree(&s, &operator, "deposit", args, &sub);
+    let shares = s.vault.deposit(&amt, &receiver, &payer, &operator);
+    assert!(s.env.auths().iter().all(|(a, _)| *a == operator), "only the operator may sign");
+    assert_eq!(
+        vault_events(&s).into_iter().filter(|(t, _)| t[0] == sym("deposit")).collect::<std::vec::Vec<_>>(),
+        std::vec![(
+            std::vec![sym("deposit"), sc(&s.env, &operator), sc(&s.env, &payer), sc(&s.env, &receiver)],
+            assets_shares_map(amt, shares)
+        )]
+    );
+    assert_eq!(s.vault.balance(&receiver), shares);
+    assert_eq!(s.vault.balance(&operator), 0);
+    assert_eq!(s.usdc.balance(&payer), 0);
+    assert_eq!(s.usdc.balance(&s.vault_id), amt);
+}
+
+#[test]
+fn sep56_operator_redeems_only_within_the_owners_share_allowance() {
+    let s = deploy_stack();
+    let owner = Address::generate(&s.env);
+    let operator = Address::generate(&s.env);
+    let receiver = Address::generate(&s.env);
+    s.usdc_admin.mint(&owner, &(100 * ONE));
+    s.vault.deposit(&(100 * ONE), &owner, &owner, &owner);
+
+    // No share allowance: rejected with the vault's allowance error.
+    let args: Vec<soroban_sdk::Val> = (20 * ONE, receiver.clone(), owner.clone(), operator.clone()).into_val(&s.env);
+    authorize_tree(&s, &operator, "redeem", args.clone(), &[]);
+    assert_eq!(
+        s.vault.try_redeem(&(20 * ONE), &receiver, &owner, &operator).err().unwrap().unwrap(),
+        contract_error(7)
+    );
+
+    let until = s.env.ledger().sequence() + 1_000;
+    s.vault.approve(&owner, &operator, &(30 * ONE), &until);
+    authorize_tree(&s, &operator, "redeem", args, &[]);
+    let assets = s.vault.redeem(&(20 * ONE), &receiver, &owner, &operator);
+    assert_eq!(s.env.auths().len(), 1);
+    assert_eq!(s.env.auths()[0].0, operator);
+    assert_eq!(
+        vault_events(&s).into_iter().filter(|(t, _)| t[0] == sym("withdraw")).collect::<std::vec::Vec<_>>(),
+        std::vec![(
+            std::vec![sym("withdraw"), sc(&s.env, &operator), sc(&s.env, &receiver), sc(&s.env, &owner)],
+            assets_shares_map(assets, 20 * ONE)
+        )]
+    );
+    assert_eq!(s.usdc.balance(&receiver), assets);
+    assert_eq!(s.vault.balance(&owner), 80 * ONE);
+    assert_eq!(s.vault.allowance(&owner, &operator), 10 * ONE);
+
+    // withdraw also spends the allowance; 10 shares left cannot cover 11 assets' worth.
+    let wargs: Vec<soroban_sdk::Val> = (11 * ONE, receiver.clone(), owner.clone(), operator.clone()).into_val(&s.env);
+    authorize_tree(&s, &operator, "withdraw", wargs, &[]);
+    assert_eq!(
+        s.vault.try_withdraw(&(11 * ONE), &receiver, &owner, &operator).err().unwrap().unwrap(),
+        contract_error(7)
+    );
+}
+
+#[test]
+fn sep56_previews_equal_execution_even_with_pending_fees() {
+    // FIXTURE: 25 bps/year, the ceiling in docs/build-spec/README.md.
+    let s = deploy_stack_cfg(true, 25);
+    let a = Address::generate(&s.env);
+    s.usdc_admin.mint(&a, &(10_000 * ONE));
+    s.vault.deposit(&(5_000 * ONE), &a, &a, &a);
+    let mut t = T0;
+    let mut later = |s: &Stack| {
+        t += 37 * 86_400;
+        s.env.ledger().set_timestamp(t);
+    };
+
+    later(&s);
+    let p = s.vault.preview_deposit(&(1_000 * ONE));
+    assert_eq!(s.vault.deposit(&(1_000 * ONE), &a, &a, &a), p, "preview_deposit");
+    later(&s);
+    let p = s.vault.preview_mint(&(500 * ONE));
+    assert_eq!(s.vault.mint(&(500 * ONE), &a, &a, &a), p, "preview_mint");
+    later(&s);
+    let p = s.vault.preview_redeem(&(700 * ONE));
+    assert_eq!(s.vault.redeem(&(700 * ONE), &a, &a, &a), p, "preview_redeem");
+    later(&s);
+    let p = s.vault.preview_withdraw(&(300 * ONE));
+    assert_eq!(s.vault.withdraw(&(300 * ONE), &a, &a, &a), p, "preview_withdraw");
+    assert!(s.vault.balance(&s.treasury) > 0, "fees must actually have accrued");
+}
