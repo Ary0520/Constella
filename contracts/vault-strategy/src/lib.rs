@@ -359,12 +359,20 @@ fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
         if sleeve.sleeve_type == SleeveType::CashStable {
             total_value = total_value.checked_add(sleeve_holdings(env, &sleeve))?;
         } else {
+            // Audit V3: a sleeve that holds nothing contributes exactly 0, so an
+            // unpriced (paused / stale / unconfigured) empty sleeve must not
+            // block pricing. A FUNDED sleeve with no valid price still makes
+            // this return None (hard stop) until queued in-kind claims exist (V6).
+            let held = sleeve_holdings(env, &sleeve);
+            if held == 0 {
+                continue;
+            }
             let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
             let pd = oracle.get_deposit_nav(&sym)?;
             if pd.timestamp > latest_ts {
                 latest_ts = pd.timestamp;
             }
-            let val = sleeve_holdings(env, &sleeve).checked_mul(pd.price)? / scale;
+            let val = held.checked_mul(pd.price)? / scale;
             total_value = total_value.checked_add(val)?;
         }
     }
@@ -414,12 +422,20 @@ fn compute_conservative_nav(env: &Env, config: &VaultConfig) -> Option<PriceData
         if sleeve.sleeve_type == SleeveType::CashStable {
             total_value = total_value.checked_add(sleeve_holdings(env, &sleeve))?;
         } else {
+            // Audit V3: a sleeve that holds nothing contributes exactly 0, so an
+            // unpriced (paused / stale / unconfigured) empty sleeve must not
+            // block pricing. A FUNDED sleeve with no valid price still makes
+            // this return None (hard stop) until queued in-kind claims exist (V6).
+            let held = sleeve_holdings(env, &sleeve);
+            if held == 0 {
+                continue;
+            }
             let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
             let pd = oracle.get_collateral_nav(&sym)?;
             if pd.timestamp > latest_ts {
                 latest_ts = pd.timestamp;
             }
-            let val = sleeve_holdings(env, &sleeve).checked_mul(pd.price)? / scale;
+            let val = held.checked_mul(pd.price)? / scale;
             total_value = total_value.checked_add(val)?;
         }
     }
