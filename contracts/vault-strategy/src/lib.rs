@@ -350,7 +350,7 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
         }
 
         env.events().publish(
-            (Symbol::new(env, "fee_accrued"), config.treasury.clone()),
+            (Symbol::new(env, "FEE_ACCRUAL"), config.treasury.clone()),
             d_shares,
         );
         d_shares
@@ -783,7 +783,7 @@ impl StrategyVault {
         env.storage().instance().set(&DataKey::Sleeves, &sleeves);
 
         env.events().publish(
-            (Symbol::new(&env, "vault_initialized"), admin),
+            (Symbol::new(&env, "VAULT_INITIALIZED"), admin),
             env.ledger().timestamp(),
         );
     }
@@ -827,7 +827,9 @@ impl StrategyVault {
         mint_shares_internal(&env, &receiver, shares);
 
         env.events().publish(
-            (Symbol::new(&env, "deposit"), receiver),
+            // SEP-56 Deposit: [deposit, operator, from, receiver] (assets, shares).
+            // The receiver authorizes and pays, so it is also operator and from.
+            (Symbol::new(&env, "deposit"), receiver.clone(), receiver.clone(), receiver),
             (assets, shares),
         );
 
@@ -872,7 +874,9 @@ impl StrategyVault {
         mint_shares_internal(&env, &receiver, shares);
 
         env.events().publish(
-            (Symbol::new(&env, "deposit"), receiver),
+            // SEP-56 Deposit: [deposit, operator, from, receiver] (assets, shares).
+            // The receiver authorizes and pays, so it is also operator and from.
+            (Symbol::new(&env, "deposit"), receiver.clone(), receiver.clone(), receiver),
             (assets, shares),
         );
 
@@ -943,7 +947,9 @@ impl StrategyVault {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "withdraw"), receiver, owner),
+            // SEP-56 Withdraw: [withdraw, operator, receiver, owner] (assets, shares).
+            // The owner authorizes, so it is the operator.
+            (Symbol::new(&env, "withdraw"), owner.clone(), receiver, owner),
             (assets, shares),
         );
 
@@ -1010,7 +1016,9 @@ impl StrategyVault {
         );
 
         env.events().publish(
-            (Symbol::new(&env, "withdraw"), receiver, owner),
+            // SEP-56 Withdraw: [withdraw, operator, receiver, owner] (assets, shares).
+            // The owner authorizes, so it is the operator.
+            (Symbol::new(&env, "withdraw"), owner.clone(), receiver, owner),
             (assets, shares),
         );
 
@@ -1616,7 +1624,7 @@ impl StrategyVault {
 
         env.storage().instance().set(&DataKey::Sleeves, &sleeves);
         env.events().publish(
-            (Symbol::new(&env, "sleeves_updated"), config.admin),
+            (Symbol::new(&env, "SLEEVES_UPDATED"), config.admin),
             sleeves.len(),
         );
     }
@@ -1645,7 +1653,7 @@ impl StrategyVault {
 
         env.storage().instance().set(&DataKey::IsPaused, &true);
         env.events().publish(
-            (Symbol::new(&env, "vault_paused"), config.pause_authority),
+            (Symbol::new(&env, "VAULT_PAUSED"), config.pause_authority),
             env.ledger().timestamp(),
         );
     }
@@ -1656,7 +1664,7 @@ impl StrategyVault {
 
         env.storage().instance().set(&DataKey::IsPaused, &false);
         env.events().publish(
-            (Symbol::new(&env, "vault_unpaused"), config.admin),
+            (Symbol::new(&env, "VAULT_UNPAUSED"), config.admin),
             env.ledger().timestamp(),
         );
     }
@@ -1727,7 +1735,7 @@ impl StrategyVault {
 
         env.storage().instance().set(&DataKey::IsPaused, &true);
         env.events().publish(
-            (Symbol::new(&env, "vault_paused"), config.admin),
+            (Symbol::new(&env, "VAULT_PAUSED"), config.admin),
             env.ledger().timestamp(),
         );
     }

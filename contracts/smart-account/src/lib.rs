@@ -180,7 +180,7 @@ impl SmartAccountContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "account_initialized"),
+                Symbol::new(&env, "ACCOUNT_INITIALIZED"),
                 env.current_contract_address(),
             ),
             admin_public_key,
@@ -227,7 +227,7 @@ impl SmartAccountContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "signer_added"),
+                Symbol::new(&env, "SIGNER_ADDED"),
                 env.current_contract_address(),
             ),
             signer.public_key,
@@ -298,7 +298,7 @@ impl SmartAccountContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "signer_updated"),
+                Symbol::new(&env, "SIGNER_UPDATED"),
                 env.current_contract_address(),
             ),
             signer.public_key,
@@ -368,7 +368,7 @@ impl SmartAccountContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "signer_removed"),
+                Symbol::new(&env, "SIGNER_REMOVED"),
                 env.current_contract_address(),
             ),
             public_key,
@@ -416,7 +416,7 @@ impl SmartAccountContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "threshold_updated"),
+                Symbol::new(&env, "THRESHOLD_UPDATED"),
                 env.current_contract_address(),
             ),
             new_threshold,

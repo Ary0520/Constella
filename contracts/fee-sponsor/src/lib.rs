@@ -103,7 +103,7 @@ impl FeeSponsorContract {
             .set(&DataKey::WhitelistList, &empty_list);
 
         env.events().publish(
-            (Symbol::new(&env, "sponsor_initialized"), admin),
+            (Symbol::new(&env, "SPONSOR_INITIALIZED"), admin),
             daily_budget_stroops,
         );
 
@@ -134,7 +134,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::WhitelistList, &list);
 
         env.events().publish(
-            (Symbol::new(&env, "contract_whitelisted"), config.admin),
+            (Symbol::new(&env, "CONTRACT_WHITELISTED"), config.admin),
             target,
         );
 
@@ -175,7 +175,7 @@ impl FeeSponsorContract {
             .set(&DataKey::WhitelistList, &new_list);
 
         env.events().publish(
-            (Symbol::new(&env, "contract_unwhitelisted"), config.admin),
+            (Symbol::new(&env, "CONTRACT_UNWHITELISTED"), config.admin),
             target,
         );
 
@@ -281,7 +281,7 @@ impl FeeSponsorContract {
 
         env.events().publish(
             (
-                Symbol::new(&env, "sponsored_op"),
+                Symbol::new(&env, "SPONSORED_OP"),
                 user,
                 target_contract,
             ),
@@ -314,7 +314,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events().publish(
-            (Symbol::new(&env, "limits_updated"), config.admin),
+            (Symbol::new(&env, "LIMITS_UPDATED"), config.admin),
             daily_budget_stroops,
         );
 
@@ -329,7 +329,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events().publish(
-            (Symbol::new(&env, "sponsor_admin_transferred"), old_admin),
+            (Symbol::new(&env, "SPONSOR_ADMIN_TRANSFERRED"), old_admin),
             new_admin,
         );
 
@@ -343,7 +343,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events()
-            .publish((Symbol::new(&env, "sponsor_paused"), config.admin), ());
+            .publish((Symbol::new(&env, "SPONSOR_PAUSED"), config.admin), ());
 
         Ok(())
     }
@@ -355,7 +355,7 @@ impl FeeSponsorContract {
         env.storage().instance().set(&DataKey::Config, &config);
 
         env.events()
-            .publish((Symbol::new(&env, "sponsor_unpaused"), config.admin), ());
+            .publish((Symbol::new(&env, "SPONSOR_UNPAUSED"), config.admin), ());
 
         Ok(())
     }
