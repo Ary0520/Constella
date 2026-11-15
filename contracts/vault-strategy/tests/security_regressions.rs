@@ -508,6 +508,12 @@ fn o3_single_source_configuration_is_refused() {
 // EXECUTION.md: "estimated slippage <= cap per route" (value-based).
 // ---------------------------------------------------------------------------
 fn usdc_eurc_policy(s: &Stack) -> Address {
+    usdc_eurc_policy_with(s, (0, 10_000), (0, 10_000), "cash", 1000)
+}
+
+/// USDC + EURC policy with signed bands `(min, max)` per sleeve, EURC's policy
+/// sleeve type and the liquidity floor (bps).
+fn usdc_eurc_policy_with(s: &Stack, usdc_band: (u32, u32), eurc_band: (u32, u32), eurc_type: &str, floor_bps: u32) -> Address {
     let registry = AssetRegistryClient::new(&s.env, &s.registry_id);
     let eurc = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
     registry.add_asset(&AssetEntry {
@@ -533,19 +539,19 @@ fn usdc_eurc_policy(s: &Stack) -> Address {
         s.oracle.register_source(&src);
     }
     let mut targets = Vec::new(&s.env);
-    for id in ["USDC", "EURC"] {
+    for (id, (lo, hi), kind) in [("USDC", usdc_band, "cash"), ("EURC", eurc_band, eurc_type)] {
         targets.push_back(SleeveTarget {
             asset_id: Symbol::new(&s.env, id),
             target_weight_bps: 5000,
-            min_band_bps: 0,
-            max_band_bps: 10_000,
-            sleeve_type: Symbol::new(&s.env, "cash"),
+            min_band_bps: lo,
+            max_band_bps: hi,
+            sleeve_type: Symbol::new(&s.env, kind),
         });
     }
     let owner = Address::generate(&s.env);
     s.policy.register_policy(
         &s.vault_id, &owner, &soroban_sdk::BytesN::from_array(&s.env, &[0x77; 32]), &s.registry_id,
-        &1000, &10_000, &10_000, &50, &500, &targets,
+        &floor_bps, &10_000, &10_000, &50, &500, &targets,
     );
     eurc
 }
@@ -1353,22 +1359,27 @@ mod w1 {
 
     const DELAY: u64 = 48 * 3600;
 
-    struct R {
-        s: Stack<'static>,
-        eurc: Address,
-        eurc_admin: token::StellarAssetClient<'static>,
-        router: soroswap_router::Client<'static>,
-        keeper: Address,
-        now: u64,
+    pub(super) struct R {
+        pub(super) s: Stack<'static>,
+        pub(super) eurc: Address,
+        pub(super) eurc_admin: token::StellarAssetClient<'static>,
+        pub(super) router: soroswap_router::Client<'static>,
+        pub(super) keeper: Address,
+        pub(super) now: u64,
     }
 
     /// Full stack + EURC sleeve + a real Soroswap USDC/EURC pool at 1.08 with
     /// 1.08M / 1M liquidity, the router configured through the 48h delay,
     /// oracle feeds refreshed, a keeper, and 10_000 USDC deposited.
-    fn setup() -> R {
+    pub(super) fn setup() -> R {
+        setup_with(|s| usdc_eurc_policy(s))
+    }
+
+    /// `setup` with a caller-chosen signed policy (W1b band / floor tests).
+    pub(super) fn setup_with(policy: impl FnOnce(&Stack<'static>) -> Address) -> R {
         let s = deploy_stack();
         let env = &s.env;
-        let eurc = usdc_eurc_policy(&s);
+        let eurc = policy(&s);
         let eurc_admin = token::StellarAssetClient::new(env, &eurc);
 
         // Vault sleeves: USDC (cash, numéraire) + EURC.
@@ -1409,7 +1420,7 @@ mod w1 {
         r
     }
 
-    fn proposal(r: &R, amount_in: i128, min_out: i128) -> VaultProposal {
+    pub(super) fn proposal(r: &R, amount_in: i128, min_out: i128) -> VaultProposal {
         let env = &r.s.env;
         let mut w = Vec::new(env);
         w.push_back((Symbol::new(env, "USDC"), 9000u32));
@@ -1426,16 +1437,16 @@ mod w1 {
         }
     }
 
-    fn quote(r: &R, amount_in: i128) -> i128 {
+    pub(super) fn quote(r: &R, amount_in: i128) -> i128 {
         let path = Vec::from_array(&r.s.env, [r.s.usdc_addr.clone(), r.eurc.clone()]);
         r.router.router_get_amounts_out(&amount_in, &path).get(1).unwrap()
     }
 
-    fn as_keeper(r: &R, p: &VaultProposal) {
+    pub(super) fn as_keeper(r: &R, p: &VaultProposal) {
         authorize(&r.s, &r.keeper, "rebalance", (p.clone(),).into_val(&r.s.env));
     }
 
-    fn holdings(r: &R) -> (i128, i128) {
+    pub(super) fn holdings(r: &R) -> (i128, i128) {
         let sl = r.s.vault.get_sleeves();
         (sl.get(0).unwrap().current_balance, sl.get(1).unwrap().current_balance)
     }
@@ -1537,5 +1548,106 @@ mod w1 {
         let p = proposal(&r, 1_000 * ONE, quote(&r, 1_000 * ONE));
         as_keeper(&r, &p);
         assert!(r.s.vault.try_rebalance(&p).is_err());
+    }
+}
+
+/// Audit W1b: after the trades, the vault's ACTUAL holdings (measured
+/// balances x per-asset median prices) must satisfy the signed policy's
+/// bands, caps and liquidity floor - not merely the weights the keeper claims.
+mod w1b {
+    use super::w1::*;
+    use super::*;
+
+    const ALLOCATION_OUT_OF_POLICY: u32 = 27;
+    const ORACLE_UNAVAILABLE: u32 = 10;
+
+    fn claim(r: &R, usdc_bps: u32, eurc_bps: u32, amount_in: i128) -> constella_vault_strategy::RebalanceProposal {
+        let env = &r.s.env;
+        let mut p = proposal(r, amount_in, quote(r, amount_in));
+        p.weights_after = Vec::from_array(env, [(Symbol::new(env, "USDC"), usdc_bps), (Symbol::new(env, "EURC"), eurc_bps)]);
+        p
+    }
+
+    #[test]
+    fn a_claim_inside_the_bands_cannot_hide_an_actual_breach() {
+        // Signed bands: USDC 85-95 %, EURC 5-15 %.
+        let r = setup_with(|s| usdc_eurc_policy_with(s, (8500, 9500), (500, 1500), "cash", 1000));
+        // The keeper CLAIMS 90/10 (valid) but trades half the vault (~50/50).
+        let p = claim(&r, 9000, 1000, 5_000 * ONE);
+        as_keeper(&r, &p);
+        r.s.env.cost_estimate().budget().reset_unlimited();
+        let res = r.s.vault.try_rebalance(&p);
+        assert_eq!(res.unwrap_err().unwrap(), contract_error(ALLOCATION_OUT_OF_POLICY));
+        // Atomic: the swap is reverted with everything else.
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+        assert_eq!(r.s.usdc.balance(&r.s.vault_id), 10_000 * ONE);
+    }
+
+    #[test]
+    fn an_actual_result_inside_the_bands_is_accepted() {
+        let r = setup_with(|s| usdc_eurc_policy_with(s, (8500, 9500), (500, 1500), "cash", 1000));
+        let p = claim(&r, 9000, 1000, 1_000 * ONE);
+        as_keeper(&r, &p);
+        r.s.env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        let used = r.s.env.cost_estimate().resources();
+        assert!(used.instructions < 100_000_000, "rebalance + post-trade check needs {} instructions", used.instructions);
+        assert!(used.mem_bytes < 40 * 1024 * 1024, "rebalance + post-trade check needs {} bytes", used.mem_bytes);
+        assert_eq!(holdings(&r).0, 9_000 * ONE);
+    }
+
+    #[test]
+    fn an_actual_breach_of_a_band_maximum_is_refused_too() {
+        // EURC may be at most 15 %; trading 20 % of the vault breaches it.
+        let r = setup_with(|s| usdc_eurc_policy_with(s, (0, 10_000), (0, 1500), "cash", 1000));
+        let p = claim(&r, 9000, 1000, 2_000 * ONE);
+        as_keeper(&r, &p);
+        r.s.env.cost_estimate().budget().reset_unlimited();
+        assert_eq!(r.s.vault.try_rebalance(&p).unwrap_err().unwrap(), contract_error(ALLOCATION_OUT_OF_POLICY));
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+    }
+
+    #[test]
+    fn the_liquidity_floor_is_checked_on_actual_holdings() {
+        // EURC is not cash under this policy; cash (USDC) must stay >= 60 %.
+        let r = setup_with(|s| usdc_eurc_policy_with(s, (0, 10_000), (0, 10_000), "eur_sovereign", 6000));
+        // Claims 70/30 (floor met) but actually trades to ~50/50.
+        let p = claim(&r, 7000, 3000, 5_000 * ONE);
+        as_keeper(&r, &p);
+        r.s.env.cost_estimate().budget().reset_unlimited();
+        assert_eq!(r.s.vault.try_rebalance(&p).unwrap_err().unwrap(), contract_error(ALLOCATION_OUT_OF_POLICY));
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+        // The same policy accepts a trade that keeps the floor (~70/30).
+        let ok = claim(&r, 7000, 3000, 3_000 * ONE);
+        as_keeper(&r, &ok);
+        r.s.vault.rebalance(&ok);
+        assert_eq!(holdings(&r).0, 7_000 * ONE);
+    }
+
+    /// Audit V4 regression on a REAL acquisition: once a sleeve holds EURC
+    /// bought through Soroswap, losing its price stops every valuation path
+    /// with OracleUnavailable - nothing falls back to par or to zero.
+    #[test]
+    fn a_funded_sleeve_without_a_valid_price_stops_valuation() {
+        let r = setup();
+        let p = proposal(&r, 1_000 * ONE, quote(&r, 1_000 * ONE));
+        as_keeper(&r, &p);
+        r.s.env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        assert!(holdings(&r).1 > 0, "EURC sleeve funded by a real swap");
+
+        // Both EURC feeds go stale (staleness limit 1h); USDC is cash.
+        r.s.env.ledger().set_timestamp(r.now + 3_601);
+        let err = contract_error(ORACLE_UNAVAILABLE);
+        assert_eq!(r.s.vault.try_total_assets().unwrap_err().unwrap(), err);
+        assert_eq!(r.s.vault.try_get_redemption_capacity().unwrap_err().unwrap(), err);
+        assert_eq!(r.s.vault.try_get_risk_sheet().unwrap_err().unwrap(), err);
+        assert_eq!(r.s.vault.try_preview_deposit(&(100 * ONE)).unwrap_err().unwrap(), err);
+        assert_eq!(r.s.vault.try_convert_to_assets(&ONE).unwrap_err().unwrap(), err);
+        assert!(r.s.vault.get_nav_deposit().is_none() && r.s.vault.get_nav_conservative().is_none());
+        r.s.env.mock_all_auths();
+        let bob = Address::generate(&r.s.env);
+        r.s.usdc_admin.mint(&bob, &(100 * ONE));
+        assert!(r.s.vault.try_deposit(&(100 * ONE), &bob, &bob, &bob).is_err(), "no deposit at an unknown price");
     }
 }
