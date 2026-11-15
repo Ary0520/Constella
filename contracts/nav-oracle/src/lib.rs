@@ -87,6 +87,15 @@ pub struct OracleSource {
     pub feeder: Address,
 }
 
+/// A sleeve loosening waiting out the delay (audit O5).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingSleeveConfig {
+    pub deviation_threshold_bps: u32,
+    pub min_valid_sources: u32,
+    pub effective_at: u64,
+}
+
 /// A source change waiting out `SOURCE_CHANGE_DELAY_SECONDS` (audit O7a).
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -291,6 +300,14 @@ pub struct SourceChangeCancelled {
     pub effective_at: u64,
 }
 
+/// Topics: [SLEEVE_CONFIG_PROPOSED, sleeve_id]. Data: effective_at (audit O5).
+#[contractevent(topics = ["SLEEVE_CONFIG_PROPOSED"], data_format = "single-value")]
+pub struct SleeveConfigProposed {
+    #[topic]
+    pub sleeve_id: Symbol,
+    pub effective_at: u64,
+}
+
 /// Topics: [SOURCE_DEACTIVATED, source_id]. Data: ledger timestamp.
 #[contractevent(topics = ["SOURCE_DEACTIVATED"], data_format = "single-value")]
 pub struct SourceDeactivated {
@@ -320,6 +337,8 @@ pub enum DataKey {
     PullFeed(Symbol),
     /// RedStone pull configuration of a source (audit O7c).
     RedStoneFeed(Symbol),
+    /// Sleeve loosening waiting for its delay (audit O5).
+    PendingSleeveConfig(Symbol),
     PauseAuthority,
 }
 
@@ -426,6 +445,13 @@ pub trait NavOracleTrait {
     fn register_redstone_source(env: Env, source: OracleSource, config: RedStoneConfig);
     /// RedStone configuration of a source, if it is a RedStone source.
     fn get_redstone_feed(env: Env, source_id: Symbol) -> Option<RedStoneConfig>;
+
+    /// Apply a pending sleeve loosening once its 48h delay has passed (anyone).
+    fn activate_sleeve_config(env: Env, sleeve_id: Symbol);
+    /// Cancel a pending sleeve loosening (admin).
+    fn cancel_sleeve_config(env: Env, sleeve_id: Symbol);
+    /// Pending loosening for a sleeve, if any.
+    fn get_pending_sleeve_config(env: Env, sleeve_id: Symbol) -> Option<PendingSleeveConfig>;
 }
 
 /// A source is fresh only if its timestamp is not in the future and is within
@@ -433,6 +459,11 @@ pub trait NavOracleTrait {
 /// NAV-ORACLE Rule 5 / AGENT-RULES Rule 3: fewer than 2 valid sources is a
 /// hard stop, so no sleeve may be configured to accept fewer (audit O3).
 pub const MIN_VALID_SOURCES_FLOOR: u32 = 2;
+
+/// Widest allowed cross-source deviation threshold (audit O5, decision D-G):
+/// 5 %. Defaults: 200 bps for stablecoins/cash, 300 bps for money-market
+/// funds (NAV-ORACLE Rule 4). The breaker can never be effectively disabled.
+pub const MAX_DEVIATION_THRESHOLD_BPS: u32 = 500;
 
 fn is_fresh(now: u64, source: &OracleSource) -> bool {
     source.timestamp <= now && now - source.timestamp <= source.staleness_limit_seconds
@@ -890,6 +921,14 @@ fn register_or_queue(env: &Env, source: OracleSource, kind: PendingKind) {
     apply_source(env, &source);
 }
 
+/// Set a sleeve's thresholds, preserving its pause state.
+fn apply_sleeve_config(env: &Env, sleeve_id: &Symbol, deviation_threshold_bps: u32, min_valid_sources: u32) {
+    let mut config = sleeve_config(env, sleeve_id);
+    config.deviation_threshold_bps = deviation_threshold_bps;
+    config.min_valid_sources = min_valid_sources;
+    env.storage().instance().set(&DataKey::SleeveConfig(sleeve_id.clone()), &config);
+}
+
 /// Delay before a change to an already-priced asset's sources takes effect
 /// (audit O7a): 48 h, the same window as upgrades, policy amendments and
 /// account recovery, so watchers can react before prices can be affected.
@@ -1012,36 +1051,27 @@ impl NavOracleTrait for NavOracle {
         deviation_threshold_bps: u32,
         min_valid_sources: u32,
     ) {
-        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
-            Some(a) => a,
-            None => panic_with_error!(&env, OracleError::NotInitialized),
-        };
-        admin.require_auth();
-
+        admin_of(&env).require_auth();
         if deviation_threshold_bps == 0
-            || deviation_threshold_bps > 10000
+            || deviation_threshold_bps > MAX_DEVIATION_THRESHOLD_BPS
             || min_valid_sources < MIN_VALID_SOURCES_FLOOR
         {
             panic_with_error!(&env, OracleError::InvalidThreshold);
         }
-
-        let mut config: SleeveOracleConfig = env
-            .storage()
-            .instance()
-            .get(&DataKey::SleeveConfig(sleeve_id.clone()))
-            .unwrap_or(SleeveOracleConfig {
-                sleeve_id: sleeve_id.clone(),
-                deviation_threshold_bps,
-                min_valid_sources,
-                is_paused: false,
-                pause_reason: Symbol::new(&env, ""),
-            });
-
-        config.deviation_threshold_bps = deviation_threshold_bps;
-        config.min_valid_sources = min_valid_sources;
-        env.storage()
-            .instance()
-            .set(&DataKey::SleeveConfig(sleeve_id), &config);
+        // Audit O5: loosening an existing sleeve (wider threshold or fewer
+        // required sources) waits 48 h, publicly; tightening is immediate.
+        if let Some(current) = env.storage().instance().get::<_, SleeveOracleConfig>(&DataKey::SleeveConfig(sleeve_id.clone())) {
+            if deviation_threshold_bps > current.deviation_threshold_bps || min_valid_sources < current.min_valid_sources {
+                let effective_at = env.ledger().timestamp().saturating_add(SOURCE_CHANGE_DELAY_SECONDS);
+                env.storage().instance().set(
+                    &DataKey::PendingSleeveConfig(sleeve_id.clone()),
+                    &PendingSleeveConfig { deviation_threshold_bps, min_valid_sources, effective_at },
+                );
+                SleeveConfigProposed { sleeve_id, effective_at }.publish(&env);
+                return;
+            }
+        }
+        apply_sleeve_config(&env, &sleeve_id, deviation_threshold_bps, min_valid_sources);
     }
 
     fn register_source(env: Env, source: OracleSource) {
@@ -1555,6 +1585,28 @@ impl NavOracleTrait for NavOracle {
 
     fn get_redstone_feed(env: Env, source_id: Symbol) -> Option<RedStoneConfig> {
         env.storage().instance().get(&DataKey::RedStoneFeed(source_id))
+    }
+
+    fn activate_sleeve_config(env: Env, sleeve_id: Symbol) {
+        let pending: PendingSleeveConfig = env.storage().instance().get(&DataKey::PendingSleeveConfig(sleeve_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingSourceChange));
+        if env.ledger().timestamp() < pending.effective_at {
+            panic_with_error!(&env, OracleError::SourceChangeNotReady);
+        }
+        env.storage().instance().remove(&DataKey::PendingSleeveConfig(sleeve_id.clone()));
+        apply_sleeve_config(&env, &sleeve_id, pending.deviation_threshold_bps, pending.min_valid_sources);
+    }
+
+    fn cancel_sleeve_config(env: Env, sleeve_id: Symbol) {
+        admin_of(&env).require_auth();
+        if !env.storage().instance().has(&DataKey::PendingSleeveConfig(sleeve_id.clone())) {
+            panic_with_error!(&env, OracleError::NoPendingSourceChange);
+        }
+        env.storage().instance().remove(&DataKey::PendingSleeveConfig(sleeve_id));
+    }
+
+    fn get_pending_sleeve_config(env: Env, sleeve_id: Symbol) -> Option<PendingSleeveConfig> {
+        env.storage().instance().get(&DataKey::PendingSleeveConfig(sleeve_id))
     }
 
     fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource> {
