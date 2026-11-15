@@ -711,16 +711,16 @@ pub struct StrategyVault;
 
 #[contractimpl]
 impl StrategyVault {
-    pub fn initialize(
+    /// Runs atomically as part of deployment, so no one can claim an
+    /// uninitialized vault (audit M3). There is no `initialize` entrypoint;
+    /// invalid settings make the deployment itself fail.
+    pub fn __constructor(
         env: Env,
         config: VaultConfig,
         name: String,
         symbol: String,
         decimals: u32,
     ) {
-        if env.storage().instance().has(&DataKey::Config) {
-            panic_with_error!(&env, VaultError::AlreadyInitialized);
-        }
         if config.management_fee_bps > 10000 || decimals > 18 {
             panic_with_error!(&env, VaultError::InvalidBps);
         }

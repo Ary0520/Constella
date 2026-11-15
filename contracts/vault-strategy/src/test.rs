@@ -84,10 +84,7 @@ fn setup_test_context() -> TestContext<'static> {
     let policy_id = env.register(PolicyContract, (admin.clone(), oracle_id.clone()));
     let policy_client = PolicyContractClient::new(&env, &policy_id);
 
-    // Deploy Vault
-    let vault_id = env.register(StrategyVault, ());
-    let vault_client = StrategyVaultClient::new(&env, &vault_id);
-
+    // Deploy Vault (configured by its constructor, atomically - audit M3)
     let config = VaultConfig {
         admin: admin.clone(),
         pause_authority: pause_authority.clone(),
@@ -101,12 +98,16 @@ fn setup_test_context() -> TestContext<'static> {
         per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
     };
 
-    vault_client.initialize(
-        &config,
-        &String::from_str(&env, "Constella Strategy Vault"),
-        &String::from_str(&env, "CONST"),
-        &7,
+    let vault_id = env.register(
+        StrategyVault,
+        (
+            config,
+            String::from_str(&env, "Constella Strategy Vault"),
+            String::from_str(&env, "CONST"),
+            7u32,
+        ),
     );
+    let vault_client = StrategyVaultClient::new(&env, &vault_id);
 
     TestContext {
         env,
@@ -578,18 +579,18 @@ fn test_t46_liquidity_sleeve_floor_protection() {
 fn test_edge_cases_and_authorizations() {
     let ctx = setup_test_context();
 
-    // 1. Double initialization rejected
+    // 1. Audit M3: configuration is fixed at deployment; there is no
+    //    `initialize` entrypoint a stranger could use to replace it.
     let config = ctx.vault_client.get_config();
-    let reinit_res = ctx.vault_client.try_initialize(
-        &config,
-        &String::from_str(&ctx.env, "New Name"),
-        &String::from_str(&ctx.env, "NEW"),
-        &7,
+    let mut hostile = config.clone();
+    hostile.admin = ctx.bob.clone();
+    let r = ctx.env.try_invoke_contract::<(), soroban_sdk::Error>(
+        &ctx.vault_id,
+        &Symbol::new(&ctx.env, "initialize"),
+        soroban_sdk::IntoVal::into_val(&(hostile, String::from_str(&ctx.env, "Evil"), String::from_str(&ctx.env, "EVIL"), 7u32), &ctx.env),
     );
-    assert_eq!(
-        reinit_res.unwrap_err().unwrap(),
-        VaultError::AlreadyInitialized.into()
-    );
+    assert!(!matches!(r, Ok(Ok(()))));
+    assert_eq!(ctx.vault_client.get_config(), config);
 
     // 2. Closed universe check: adding unregistered asset in set_sleeves fails
     let unregistered_asset = Address::generate(&ctx.env);
@@ -1454,10 +1455,16 @@ mod w3 {
         for (tvl, user) in [(0, 0), (100, 0), (0, 100), (100, 101)] {
             cfg.tvl_cap = tvl;
             cfg.per_user_cap = user;
-            let fresh = ctx.env.register(StrategyVault, ());
-            let c = StrategyVaultClient::new(&ctx.env, &fresh);
-            let r = c.try_initialize(&cfg, &String::from_str(&ctx.env, "V"), &String::from_str(&ctx.env, "V"), &7);
-            assert_eq!(r.err().unwrap().unwrap(), err(VaultError::InvalidCaps), "tvl {tvl} user {user}");
+            // With a constructor, invalid caps make the deployment itself fail.
+            let env = Env::default();
+            let cfg2 = cfg.clone();
+            let deployed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                env.register(
+                    StrategyVault,
+                    (cfg2, String::from_str(&env, "V"), String::from_str(&env, "V"), 7u32),
+                )
+            }));
+            assert!(deployed.is_err(), "tvl {tvl} user {user} must be rejected at deployment");
         }
     }
 

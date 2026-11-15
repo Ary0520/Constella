@@ -715,8 +715,6 @@ fn test_t55_sponsored_passkey_vault_deposit() {
     oracle_client.register_source(&s3);
 
     // 5. Deploy Strategy Vault
-    let vault_id = env.register(constella_vault_strategy::StrategyVault, ());
-    let vault_client = constella_vault_strategy::StrategyVaultClient::new(&env, &vault_id);
     let vault_config = constella_vault_strategy::VaultConfig {
         admin: admin.clone(),
         pause_authority: pause_authority.clone(),
@@ -729,12 +727,16 @@ fn test_t55_sponsored_passkey_vault_deposit() {
         tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
         per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
     };
-    vault_client.initialize(
-        &vault_config,
-        &String::from_str(&env, "Constella Strategy Vault"),
-        &String::from_str(&env, "CONST"),
-        &7,
+    let vault_id = env.register(
+        constella_vault_strategy::StrategyVault,
+        (
+            vault_config,
+            String::from_str(&env, "Constella Strategy Vault"),
+            String::from_str(&env, "CONST"),
+            7u32,
+        ),
     );
+    let vault_client = constella_vault_strategy::StrategyVaultClient::new(&env, &vault_id);
 
     // 6. Deploy Fee Sponsor Engine
     let sponsor_id = env.register(constella_fee_sponsor::FeeSponsorContract, ());

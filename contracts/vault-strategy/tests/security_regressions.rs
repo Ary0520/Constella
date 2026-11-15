@@ -94,10 +94,10 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
         oracle.register_source(&oracle_source(&env, "USDC_B", &usdc_addr, ONE));
     }
 
-    let vault_id = env.register(StrategyVault, ());
-    let vault = StrategyVaultClient::new(&env, &vault_id);
-    vault.initialize(
-        &VaultConfig {
+    let vault_id = env.register(
+        StrategyVault,
+        (
+        VaultConfig {
             admin: admin.clone(),
             pause_authority: Address::generate(&env),
             numeraire: usdc_addr.clone(),
@@ -109,10 +109,12 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
             tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
             per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
         },
-        &String::from_str(&env, "Constella Strategy Vault"),
-        &String::from_str(&env, "cVAULT"),
-        &7,
+        String::from_str(&env, "Constella Strategy Vault"),
+        String::from_str(&env, "cVAULT"),
+        7u32,
+        ),
     );
+    let vault = StrategyVaultClient::new(&env, &vault_id);
 
     Stack {
         usdc_admin: token::StellarAssetClient::new(&env, &usdc_addr),
@@ -857,19 +859,24 @@ fn m3_fresh_deployments_cannot_be_taken_over() {
     let policy = env.register(PolicyContract, (owner.clone(), oracle.clone()));
     assert!(!stranger_initializes(&env, &policy, (attacker.clone(), oracle.clone()).into_val(&env)), "policy hijack");
 
-    let vault = env.register(StrategyVault, ());
-    let cfg = VaultConfig {
-        admin: attacker.clone(),
-        pause_authority: attacker.clone(),
+    let legit = VaultConfig {
+        admin: owner.clone(),
+        pause_authority: owner.clone(),
         numeraire: usdc,
         policy_contract: policy,
         oracle_contract: oracle,
         registry_contract: registry,
-        treasury: attacker.clone(),
-        management_fee_bps: 10_000,
-        tvl_cap: i128::MAX,
-        per_user_cap: i128::MAX,
+        treasury: owner.clone(),
+        management_fee_bps: 10,
+        tvl_cap: 1_000_000 * ONE,
+        per_user_cap: 100_000 * ONE,
     };
-    let args = (cfg, String::from_str(&env, "Evil"), String::from_str(&env, "EVIL"), 7u32).into_val(&env);
+    let vault = env.register(StrategyVault, (legit.clone(), String::from_str(&env, "V"), String::from_str(&env, "V"), 7u32));
+    let mut hostile = legit.clone();
+    hostile.admin = attacker.clone();
+    hostile.treasury = attacker.clone();
+    hostile.management_fee_bps = 10_000;
+    let args = (hostile, String::from_str(&env, "Evil"), String::from_str(&env, "EVIL"), 7u32).into_val(&env);
     assert!(!stranger_initializes(&env, &vault, args), "vault hijack");
+    assert_eq!(StrategyVaultClient::new(&env, &vault).get_config(), legit, "configuration unchanged");
 }
