@@ -741,3 +741,42 @@ fn m3_fresh_account_cannot_be_claimed_by_a_stranger() {
     assert_eq!(signers.len(), 1);
     assert_eq!(signers.get(0).unwrap().public_key, owner.public_key_bytes);
 }
+
+// -------------------------------------------------------------------------
+// Audit M2 (2026-11-15): custom events use SCREAMING_SNAKE_CASE (Rule 8).
+// -------------------------------------------------------------------------
+#[test]
+fn m2_every_account_event_follows_rule_8() {
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{FromVal, SymbolStr, TryFromVal};
+    let env = Env::default();
+    env.mock_all_auths();
+    let owner = generate_keypair(&env);
+    let id = env.register(SmartAccountContract, (owner.public_key_bytes.clone(), 1u32, String::from_str(&env, "owner")));
+    let client = SmartAccountContractClient::new(&env, &id);
+    let check = |env: &Env| -> usize {
+        let mut n = 0;
+        for (c, topics, _) in env.events().all().iter() {
+            if c != id { continue; }
+            let sym = Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap();
+            let s = SymbolStr::from_val(env, &sym.to_symbol_val());
+            let bytes: &[u8] = s.as_ref();
+            assert!(bytes.iter().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_'),
+                "event `{}` violates Rule 8", std::str::from_utf8(bytes).unwrap());
+            n += 1;
+        }
+        n
+    };
+    let backup = generate_keypair(&env);
+    let mut n = 0;
+    client.add_signer(&Signer { public_key: backup.public_key_bytes.clone(), weight: 1, role: SignerRole::Backup, name: String::from_str(&env, "b") });
+    n += check(&env);
+    client.update_signer(&Signer { public_key: backup.public_key_bytes.clone(), weight: 2, role: SignerRole::Backup, name: String::from_str(&env, "b") });
+    n += check(&env);
+    client.update_threshold(&2);
+    n += check(&env);
+    client.update_threshold(&1);
+    client.remove_signer(&backup.public_key_bytes);
+    n += check(&env);
+    assert!(n >= 4, "saw {n} events");
+}

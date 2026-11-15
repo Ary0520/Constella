@@ -1719,3 +1719,96 @@ mod m4 {
         assert_eq!(ctx.vault_client.get_sleeves().get(1).unwrap().asset_id, String::from_str(&ctx.env, "SPIKO_USD"));
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit M2 (2026-11-15): event names follow AGENT-RULES Rule 8 -
+// SCREAMING_SNAKE_CASE, except names defined by SEP-41 (transfer, approve,
+// mint, burn) and SEP-56 (deposit, withdraw). SEP-56 topic layouts:
+//   deposit:  [deposit, operator, from, receiver]   data (assets, shares)
+//   withdraw: [withdraw, operator, receiver, owner] data (assets, shares)
+// -------------------------------------------------------------------------
+mod m2 {
+    use super::*;
+    use soroban_sdk::testutils::Events;
+    use soroban_sdk::{FromVal, SymbolStr, TryFromVal, Val};
+
+    const STANDARD: [&str; 6] = ["transfer", "approve", "mint", "burn", "deposit", "withdraw"];
+
+    fn name_of(env: &Env, v: &Val) -> std::string::String {
+        let sym = Symbol::try_from_val(env, v).expect("event topic 0 must be a symbol");
+        let s = SymbolStr::from_val(env, &sym.to_symbol_val());
+        let bytes: &[u8] = s.as_ref();
+        std::string::String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    /// Every event the vault emitted in the last call follows Rule 8.
+    fn check_names(ctx: &TestContext) -> usize {
+        let mut seen = 0;
+        for (contract, topics, _) in ctx.env.events().all().iter() {
+            if contract != ctx.vault_id {
+                continue;
+            }
+            let name = name_of(&ctx.env, &topics.get(0).unwrap());
+            let ok = STANDARD.contains(&name.as_str())
+                || name.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_');
+            assert!(ok, "event `{name}` violates Rule 8");
+            seen += 1;
+        }
+        seen
+    }
+
+    #[test]
+    fn every_vault_event_follows_rule_8() {
+        let ctx = setup_test_context();
+        ctx.numeraire_admin.mint(&ctx.alice, &(1000 * 10_000_000));
+        let mut total = 0;
+        ctx.vault_client.deposit(&(500 * 10_000_000), &ctx.alice);
+        total += check_names(&ctx);
+        ctx.vault_client.transfer(&ctx.alice, &ctx.bob, &(10 * 10_000_000));
+        total += check_names(&ctx);
+        ctx.vault_client.approve(&ctx.alice, &ctx.bob, &(10 * 10_000_000), &500);
+        total += check_names(&ctx);
+        ctx.vault_client.redeem(&(10 * 10_000_000), &ctx.alice, &ctx.alice);
+        total += check_names(&ctx);
+        ctx.env.ledger().set_timestamp(1_000_000 + 30 * 86_400);
+        ctx.vault_client.accrue_fees();
+        total += check_names(&ctx);
+        ctx.vault_client.pause();
+        total += check_names(&ctx);
+        ctx.vault_client.unpause();
+        total += check_names(&ctx);
+        let gov = register_gov_fund(&ctx);
+        let mut sleeves = SdkVec::new(&ctx.env);
+        let cash_bal = ctx.vault_client.get_sleeves().get(0).unwrap().current_balance;
+        sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, cash_bal));
+        sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+        ctx.vault_client.set_sleeves(&sleeves);
+        total += check_names(&ctx);
+        assert!(total >= 8, "expected events to be checked, saw {total}");
+    }
+
+    #[test]
+    fn deposit_and_withdraw_events_follow_sep56_layout() {
+        let ctx = setup_test_context();
+        ctx.numeraire_admin.mint(&ctx.alice, &(100 * 10_000_000));
+        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice);
+        let dep = ctx.env.events().all().iter()
+            .find(|(c, t, _)| *c == ctx.vault_id && name_of(&ctx.env, &t.get(0).unwrap()) == "deposit")
+            .expect("deposit event");
+        assert_eq!(dep.1.len(), 4, "deposit topics: [deposit, operator, from, receiver]");
+        for i in 1..4 {
+            assert_eq!(Address::try_from_val(&ctx.env, &dep.1.get(i).unwrap()).unwrap(), ctx.alice);
+        }
+        let (assets, shares): (i128, i128) = <(i128, i128)>::try_from_val(&ctx.env, &dep.2).unwrap();
+        assert_eq!((assets, shares), (100 * 10_000_000, 100 * 10_000_000));
+
+        ctx.vault_client.redeem(&(40 * 10_000_000), &ctx.bob, &ctx.alice);
+        let wd = ctx.env.events().all().iter()
+            .find(|(c, t, _)| *c == ctx.vault_id && name_of(&ctx.env, &t.get(0).unwrap()) == "withdraw")
+            .expect("withdraw event");
+        assert_eq!(wd.1.len(), 4, "withdraw topics: [withdraw, operator, receiver, owner]");
+        assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(1).unwrap()).unwrap(), ctx.alice, "operator");
+        assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(2).unwrap()).unwrap(), ctx.bob, "receiver");
+        assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(3).unwrap()).unwrap(), ctx.alice, "owner");
+    }
+}

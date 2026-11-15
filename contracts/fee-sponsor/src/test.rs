@@ -293,3 +293,41 @@ fn m3_fresh_sponsor_cannot_be_claimed_by_a_stranger() {
     assert!(!matches!(r, Ok(Ok(()))), "a stranger must not be able to claim the sponsor");
     assert_eq!(FeeSponsorContractClient::new(&env, &sponsor).get_config().admin, owner);
 }
+
+// -------------------------------------------------------------------------
+// Audit M2 (2026-11-15): custom events use SCREAMING_SNAKE_CASE (Rule 8).
+// -------------------------------------------------------------------------
+#[test]
+fn m2_every_sponsor_event_follows_rule_8() {
+    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::{FromVal, Symbol, SymbolStr, TryFromVal};
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &id);
+    let check = |env: &Env| -> usize {
+        let mut n = 0;
+        for (c, topics, _) in env.events().all().iter() {
+            if c != id { continue; }
+            let sym = Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap();
+            let s = SymbolStr::from_val(env, &sym.to_symbol_val());
+            let bytes: &[u8] = s.as_ref();
+            assert!(bytes.iter().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || *b == b'_'),
+                "event `{}` violates Rule 8", core::str::from_utf8(bytes).unwrap());
+            n += 1;
+        }
+        n
+    };
+    let vault = Address::generate(&env);
+    let user = Address::generate(&env);
+    let mut n = 0;
+    client.whitelist_contract(&vault); n += check(&env);
+    client.record_sponsored_op(&user, &vault, &100); n += check(&env);
+    client.set_limits(&20, &60, &2_000_000); n += check(&env);
+    client.pause(); n += check(&env);
+    client.unpause(); n += check(&env);
+    client.remove_contract(&vault); n += check(&env);
+    client.set_admin(&Address::generate(&env)); n += check(&env);
+    assert!(n >= 7, "saw {n} events");
+}
