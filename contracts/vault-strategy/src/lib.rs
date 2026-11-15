@@ -510,6 +510,49 @@ fn mint_shares_internal(env: &Env, receiver: &Address, shares: i128) {
     );
 }
 
+/// Moves `amount` shares from `from` to `to` (SEP-41 transfer semantics).
+///
+/// Audit V1: the previous inline implementation read `to`'s balance before
+/// debiting `from`, so `from == to` credited a stale balance and minted
+/// `amount` new shares. Here the sender is always debited first and a
+/// self-transfer is a balance no-op (the caller still had to authorize it and
+/// must own at least `amount`).
+fn move_shares(env: &Env, from: &Address, to: &Address, amount: i128) {
+    let from_bal: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::Balance(from.clone()))
+        .unwrap_or(0);
+    if from_bal < amount {
+        panic_with_error!(env, VaultError::InsufficientBalance);
+    }
+    if from == to {
+        return;
+    }
+
+    let new_from_bal = from_bal - amount;
+    if new_from_bal == 0 {
+        env.storage().instance().remove(&DataKey::Balance(from.clone()));
+    } else {
+        env.storage()
+            .instance()
+            .set(&DataKey::Balance(from.clone()), &new_from_bal);
+    }
+
+    let to_bal: i128 = env
+        .storage()
+        .instance()
+        .get(&DataKey::Balance(to.clone()))
+        .unwrap_or(0);
+    let new_to_bal = match to_bal.checked_add(amount) {
+        Some(v) => v,
+        None => panic_with_error!(env, VaultError::MathOverflow),
+    };
+    env.storage()
+        .instance()
+        .set(&DataKey::Balance(to.clone()), &new_to_bal);
+}
+
 fn burn_shares_internal(env: &Env, owner: &Address, shares: i128) {
     let total_shares: i128 = env
         .storage()
@@ -983,31 +1026,7 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let from_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(from.clone()))
-            .unwrap_or(0);
-        if from_bal < amount {
-            panic_with_error!(&env, VaultError::InsufficientBalance);
-        }
-        let to_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(to.clone()))
-            .unwrap_or(0);
-
-        let new_from_bal = from_bal - amount;
-        if new_from_bal == 0 {
-            env.storage().instance().remove(&DataKey::Balance(from.clone()));
-        } else {
-            env.storage()
-                .instance()
-                .set(&DataKey::Balance(from.clone()), &new_from_bal);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(to.clone()), &(to_bal + amount));
+        move_shares(&env, &from, &to, amount);
 
         env.events().publish(
             (Symbol::new(&env, "transfer"), from, to),
@@ -1086,31 +1105,7 @@ impl StrategyVault {
             env.storage().instance().set(&key, &val);
         }
 
-        let from_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(from.clone()))
-            .unwrap_or(0);
-        if from_bal < amount {
-            panic_with_error!(&env, VaultError::InsufficientBalance);
-        }
-        let to_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(to.clone()))
-            .unwrap_or(0);
-
-        let new_from_bal = from_bal - amount;
-        if new_from_bal == 0 {
-            env.storage().instance().remove(&DataKey::Balance(from.clone()));
-        } else {
-            env.storage()
-                .instance()
-                .set(&DataKey::Balance(from.clone()), &new_from_bal);
-        }
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(to.clone()), &(to_bal + amount));
+        move_shares(&env, &from, &to, amount);
 
         env.events().publish(
             (Symbol::new(&env, "transfer"), from, to),
