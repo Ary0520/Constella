@@ -782,3 +782,94 @@ mod o1 {
         assert!(!client.is_sleeve_paused(&sleeve));
     }
 }
+
+// -------------------------------------------------------------------------
+// Audit O4 (2026-11-15): deviation must latch (and NAV_PAUSE must be emitted)
+// in the successful call that changes prices, not only on reads that may be
+// rolled back by a reverting caller.
+// -------------------------------------------------------------------------
+mod o4 {
+    use super::*;
+
+    fn deviation_event_bps(env: &Env, sleeve: &Symbol) -> Option<u32> {
+        let nav_pause = Symbol::new(env, "NAV_PAUSE");
+        for (_cid, topics, data) in env.events().all().iter() {
+            if topics.len() >= 2
+                && Symbol::try_from_val(env, &topics.get(0).unwrap()) == Ok(nav_pause.clone())
+                && Symbol::try_from_val(env, &topics.get(1).unwrap()) == Ok(sleeve.clone())
+            {
+                let d = NavPauseData::try_from_val(env, &data).unwrap();
+                assert_eq!(d.reason, Symbol::new(env, "DEVIATION"));
+                return Some(d.deviation_bps);
+            }
+        }
+        None
+    }
+
+    fn two_feed_sleeve(env: &Env) -> (NavOracleClient<'_>, Address, Symbol) {
+        let (client, admin, _base) = setup_oracle(env);
+        let sleeve = Symbol::new(env, "USD_GOV_FUNDS");
+        client.configure_sleeve(&sleeve, &200, &2);
+        env.ledger().set_timestamp(1000);
+        let asset = Address::generate(env);
+        client.register_source(&create_source(env, "NAV", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000));
+        client.register_source(&create_source(env, "RFL", &asset, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000));
+        (client, admin, sleeve)
+    }
+
+    #[test]
+    fn deviating_price_update_latches_pause_and_emits_event() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        client.update_price(&Symbol::new(&env, "RFL"), &1_030_000, &200_000, &1000);
+        assert_eq!(deviation_event_bps(&env, &sleeve), Some(300));
+        assert!(client.is_sleeve_paused(&sleeve));
+        // The new price is still recorded so data stays current while paused.
+        assert_eq!(client.get_source(&Symbol::new(&env, "RFL")).unwrap().price, 1_030_000);
+        assert!(client.get_collateral_nav(&sleeve).is_none());
+    }
+
+    #[test]
+    fn update_within_threshold_does_not_pause() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        client.update_price(&Symbol::new(&env, "RFL"), &1_015_000, &200_000, &1000);
+        assert_eq!(deviation_event_bps(&env, &sleeve), None);
+        assert!(!client.is_sleeve_paused(&sleeve));
+        assert_eq!(client.get_collateral_nav(&sleeve).unwrap().price, 1_000_000);
+    }
+
+    #[test]
+    fn registering_a_deviating_source_latches_pause() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        let asset = client.get_source(&Symbol::new(&env, "NAV")).unwrap().asset;
+        client.register_source(&create_source(&env, "THIRD", &asset, "USD_GOV_FUNDS", 1_050_000, 200_000, 1000));
+        assert_eq!(deviation_event_bps(&env, &sleeve), Some(500));
+        assert!(client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn clearing_while_still_deviating_relatches_on_next_update() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        client.update_price(&Symbol::new(&env, "RFL"), &1_030_000, &200_000, &1000);
+        client.clear_circuit_breaker(&sleeve);
+        assert!(!client.is_sleeve_paused(&sleeve));
+        client.update_price(&Symbol::new(&env, "NAV"), &1_000_000, &200_000, &1000);
+        assert!(client.is_sleeve_paused(&sleeve));
+    }
+
+    #[test]
+    fn insufficient_sources_at_update_time_does_not_latch() {
+        let env = Env::default();
+        let (client, _admin, sleeve) = two_feed_sleeve(&env);
+        // Depth drops below the floor: the feed becomes invalid (live hard stop),
+        // but that is not a latched deviation pause.
+        client.update_price(&Symbol::new(&env, "RFL"), &1_030_000, &10_000, &1000);
+        assert!(!client.is_sleeve_paused(&sleeve));
+        assert!(client.get_collateral_nav(&sleeve).is_none());
+        client.update_price(&Symbol::new(&env, "RFL"), &1_000_000, &200_000, &1000);
+        assert_eq!(client.get_collateral_nav(&sleeve).unwrap().price, 1_000_000);
+    }
+}
