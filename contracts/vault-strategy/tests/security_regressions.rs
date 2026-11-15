@@ -1150,3 +1150,41 @@ fn w6_fee_shares_are_announced_with_a_mint_event() {
         "sum of balances must equal total supply"
     );
 }
+
+// ---------------------------------------------------------------------------
+// W4.2b — SEP-41 v0.5 `transfer(from, to: MuxedAddress, amount)`: exchanges
+// and custodians credit customers by muxed id; a plain-Address-only transfer
+// cannot receive to them.
+// ---------------------------------------------------------------------------
+#[test]
+fn w6_transfer_accepts_a_muxed_destination_and_reports_its_id() {
+    use soroban_sdk::testutils::MuxedAddress as _;
+    use soroban_sdk::xdr::{ScMap, ScMapEntry, ScVal};
+    let s = deploy_stack();
+    let alice = Address::generate(&s.env);
+    s.usdc_admin.mint(&alice, &(100 * ONE));
+    s.vault.deposit(&(100 * ONE), &alice);
+
+    let custodian = Address::generate(&s.env);
+    let muxed = soroban_sdk::MuxedAddress::new(&custodian, 42);
+    authorize(&s, &alice, "transfer", (alice.clone(), muxed.clone(), 10 * ONE).into_val(&s.env));
+    s.vault.transfer(&alice, &muxed, &(10 * ONE));
+    assert_eq!(s.env.auths()[0].0, alice);
+
+    let data = ScVal::Map(Some(ScMap(
+        std::vec![
+            ScMapEntry { key: sym("amount"), val: i128_val(10 * ONE) },
+            ScMapEntry { key: sym("to_muxed_id"), val: ScVal::U64(42) },
+        ]
+        .try_into()
+        .unwrap(),
+    )));
+    assert_eq!(
+        vault_events(&s),
+        std::vec![(std::vec![sym("transfer"), sc(&s.env, &alice), sc(&s.env, &custodian)], data)]
+    );
+    // Shares land on the underlying account; the id is routing metadata only.
+    assert_eq!(s.vault.balance(&custodian), 10 * ONE);
+    assert_eq!(s.vault.balance(&alice), 90 * ONE);
+    assert_eq!(s.vault.total_supply(), 100 * ONE);
+}
