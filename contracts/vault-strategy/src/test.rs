@@ -321,8 +321,10 @@ fn test_t43_collateral_passport_views() {
 
     // 3. Risk Sheet
     let risk = ctx.vault_client.get_risk_sheet();
-    assert_eq!(risk.recommended_ltv_bps, 9800); // 98%
-    assert_eq!(risk.recommended_haircut_bps, 200); // 2%
+    // Audit W7: 100% USDC is a Pillar 3 "High-Cash Basket": 90% LTV / 10% haircut
+    // (previously a hard-coded 98% / 2% for every basket).
+    assert_eq!(risk.recommended_ltv_bps, 9000);
+    assert_eq!(risk.recommended_haircut_bps, 1000);
     assert_eq!(risk.weighted_avg_redemption_hours, 0); // cash instant
 
     // 4. Liquidator Eligibility
@@ -333,9 +335,9 @@ fn test_t43_collateral_passport_views() {
     let kit = ctx.vault_client.get_listing_kit();
     assert_eq!(kit.share_token, ctx.vault_id);
     assert_eq!(kit.numeraire, ctx.numeraire_address);
-    assert_eq!(kit.recommended_ltv_bps, 9800);
-    assert_eq!(kit.recommended_haircut_bps, 200);
-    assert_eq!(kit.liquidation_threshold_bps, 9900);
+    assert_eq!(kit.recommended_ltv_bps, 9000);
+    assert_eq!(kit.recommended_haircut_bps, 1000);
+    assert_eq!(kit.liquidation_threshold_bps, 9000); // = LTV (Blend single collateral factor)
 
     // 6. Oracle Status
     let oracle_status = ctx.vault_client.get_oracle_status();
@@ -1626,3 +1628,4 @@ mod w3 {
         assert!(ctx.vault_client.get_pending_upgrade().is_some());
     }
 }
+

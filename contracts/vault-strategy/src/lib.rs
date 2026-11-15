@@ -367,6 +367,20 @@ enum NavKind {
     Collateral,
 }
 
+/// Collateral haircut per sleeve type, from COLLATERAL-PASSPORT.md Pillar 3:
+/// cash 10%, T-bill funds (USD/EUR) 15%, yield-dollar 25%, lending 30% (upper
+/// bound of the 25-30% band). The spec gives no figure for equity or XLM, so
+/// they carry no borrowing power (100%) rather than an invented number.
+fn sleeve_haircut_bps(sleeve_type: SleeveType) -> i128 {
+    match sleeve_type {
+        SleeveType::CashStable => 1000,
+        SleeveType::UsdGovFunds | SleeveType::EurSovereign => 1500,
+        SleeveType::YieldDollar => 2500,
+        SleeveType::Lending => 3000,
+        SleeveType::Equity | SleeveType::Xlm => 10000,
+    }
+}
+
 fn share_scale(env: &Env) -> i128 {
     let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
     10i128.pow(decimals)
@@ -1327,6 +1341,9 @@ impl StrategyVault {
         }
     }
 
+    /// Collateral Passport risk sheet (audit W7). The haircut is the
+    /// value-weighted Pillar 3 haircut of the basket (target-weighted while the
+    /// vault is empty), rounded UP so it always errs on the conservative side.
     pub fn get_risk_sheet(env: Env) -> RiskSheet {
         let config = get_config(&env);
         let sleeves: Vec<SleeveState> = env
@@ -1334,47 +1351,84 @@ impl StrategyVault {
             .instance()
             .get(&DataKey::Sleeves)
             .unwrap_or_else(|| Vec::new(&env));
-        let total_a = Self::total_assets(env.clone());
         let scale = share_scale(&env);
         let oracle = NavOracleClient::new(&env, &config.oracle_contract);
-
-        let mut weighted_hours = 0u64;
-        if total_a > 0 {
-            let mut total_val_hours = 0i128;
-            for sleeve in sleeves.iter() {
-                let tier_hours: i128 = match sleeve.liquidity_tier {
-                    0 => 0,
-                    1 => 24,
-                    2 => 168,
-                    _ => 720,
-                };
-                let value = match sleeve_value(&env, &oracle, &sleeve, NavKind::Collateral, scale) {
-                    Ok((v, _)) => v,
-                    Err(e) => panic_with_error!(&env, e),
-                };
-                total_val_hours = match value
-                    .checked_mul(tier_hours)
-                    .and_then(|vh| total_val_hours.checked_add(vh))
-                {
-                    Some(x) => x,
-                    None => panic_with_error!(&env, VaultError::MathOverflow),
-                };
+        let overflow = |v: Option<i128>| -> i128 {
+            match v {
+                Some(x) => x,
+                None => panic_with_error!(&env, VaultError::MathOverflow),
             }
-            weighted_hours = (total_val_hours / total_a) as u64;
+        };
+
+        let mut values: Vec<i128> = Vec::new(&env);
+        let mut total = 0i128;
+        let mut value_hours = 0i128;
+        for sleeve in sleeves.iter() {
+            let value = match sleeve_value(&env, &oracle, &sleeve, NavKind::Collateral, scale) {
+                Ok((v, _)) => v,
+                Err(e) => panic_with_error!(&env, e),
+            };
+            let tier_hours: i128 = match sleeve.liquidity_tier {
+                0 => 0,
+                1 => 24,
+                2 => 168,
+                _ => 720,
+            };
+            total = overflow(total.checked_add(value));
+            value_hours = overflow(value.checked_mul(tier_hours).and_then(|vh| value_hours.checked_add(vh)));
+            values.push_back(value);
         }
 
-        let haircut = 200u32;
-        let recommended_ltv = 10000u32 - haircut;
+        let mut weight_sum = 0i128;
+        let mut weighted_haircut = 0i128;
+        for i in 0..sleeves.len() {
+            let sleeve = sleeves.get(i).unwrap();
+            let weight = if total > 0 {
+                values.get(i).unwrap()
+            } else {
+                sleeve.target_weight_bps as i128
+            };
+            weight_sum = overflow(weight_sum.checked_add(weight));
+            weighted_haircut = overflow(
+                weight
+                    .checked_mul(sleeve_haircut_bps(sleeve.sleeve_type))
+                    .and_then(|x| weighted_haircut.checked_add(x)),
+            );
+        }
+        let haircut = if weight_sum == 0 {
+            10000i128
+        } else {
+            (weighted_haircut + weight_sum - 1) / weight_sum
+        };
+        let haircut = haircut.clamp(0, 10000) as u32;
 
         RiskSheet {
-            recommended_ltv_bps: recommended_ltv,
+            recommended_ltv_bps: 10000 - haircut,
             recommended_haircut_bps: haircut,
-            weighted_avg_redemption_hours: weighted_hours as u32,
+            weighted_avg_redemption_hours: if total > 0 { (value_hours / total) as u32 } else { 0 },
             computed_at: env.ledger().timestamp(),
         }
     }
 
-    pub fn is_eligible_liquidator(_env: Env, _liquidator: Address) -> bool {
+    /// Pillar 4 (audit W7): an open share class (every constituent
+    /// permissionless in the registry) may be liquidated by anyone. If any
+    /// constituent is permissioned, only SEP-57-verified liquidators qualify;
+    /// that verifier is a Phase 3 deliverable, so until it exists no address
+    /// is eligible. Assets missing from the registry count as permissioned.
+    pub fn is_eligible_liquidator(env: Env, _liquidator: Address) -> bool {
+        let config = get_config(&env);
+        let registry = AssetRegistryClient::new(&env, &config.registry_contract);
+        let sleeves: Vec<SleeveState> = env
+            .storage()
+            .instance()
+            .get(&DataKey::Sleeves)
+            .unwrap_or_else(|| Vec::new(&env));
+        for sleeve in sleeves.iter() {
+            match registry.get_asset_by_address(&sleeve.contract_address) {
+                Some(entry) if entry.permissionless => {}
+                _ => return false,
+            }
+        }
         true
     }
 
@@ -1387,7 +1441,9 @@ impl StrategyVault {
             oracle_contract: config.oracle_contract,
             recommended_ltv_bps: risk.recommended_ltv_bps,
             recommended_haircut_bps: risk.recommended_haircut_bps,
-            liquidation_threshold_bps: 9900,
+            // Blend-style single collateral factor: the recommended LTV is
+            // both the borrow limit and the liquidation point.
+            liquidation_threshold_bps: risk.recommended_ltv_bps,
         }
     }
 
