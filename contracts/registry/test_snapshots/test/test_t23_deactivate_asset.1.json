@@ -82,6 +82,14 @@
                     },
                     {
                       "key": {
+                        "symbol": "issuer"
+                      },
+                      "val": {
+                        "symbol": "CIRCLE"
+                      }
+                    },
+                    {
+                      "key": {
                         "symbol": "liquidity_tier"
                       },
                       "val": {
@@ -197,6 +205,14 @@
                       },
                       "val": {
                         "bool": true
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "issuer"
+                      },
+                      "val": {
+                        "symbol": "CIRCLE"
                       }
                     },
                     {
@@ -341,6 +357,14 @@
                       },
                       "val": {
                         "bool": true
+                      }
+                    },
+                    {
+                      "key": {
+                        "symbol": "issuer"
+                      },
+                      "val": {
+                        "symbol": "CIRCLE"
                       }
                     },
                     {
@@ -515,6 +539,14 @@
                             },
                             {
                               "key": {
+                                "symbol": "issuer"
+                              },
+                              "val": {
+                                "symbol": "CIRCLE"
+                              }
+                            },
+                            {
+                              "key": {
                                 "symbol": "liquidity_tier"
                               },
                               "val": {
@@ -626,6 +658,14 @@
                               },
                               "val": {
                                 "bool": true
+                              }
+                            },
+                            {
+                              "key": {
+                                "symbol": "issuer"
+                              },
+                              "val": {
+                                "symbol": "CIRCLE"
                               }
                             },
                             {

@@ -25,6 +25,7 @@ pub enum RegistrySleeveType {
 pub struct RegistryAssetEntry {
     pub contract_address: Address,
     pub asset_id: Symbol,
+    pub issuer: Symbol,
     pub sleeve_type: RegistrySleeveType,
     pub liquidity_tier: u32,
     pub permissionless: bool,
@@ -221,26 +222,6 @@ pub trait PolicyContractTrait {
 
 #[contract]
 pub struct PolicyContract;
-
-fn get_issuer_prefix(env: &Env, asset_id: &Symbol) -> Symbol {
-    let sym_str: SymbolStr = SymbolStr::from_val(env, &asset_id.to_symbol_val());
-    let bytes: &[u8] = sym_str.as_ref();
-    let mut idx = 0;
-    let mut found_sep = false;
-    while idx < bytes.len() {
-        if bytes[idx] == b'_' {
-            found_sep = true;
-            break;
-        }
-        idx += 1;
-    }
-    if found_sep && idx > 0 {
-        if let Ok(issuer_str) = core::str::from_utf8(&bytes[..idx]) {
-            return Symbol::new(env, issuer_str);
-        }
-    }
-    asset_id.clone()
-}
 
 fn is_cash_sleeve(env: &Env, st: &Symbol) -> bool {
     let sym_str: SymbolStr = SymbolStr::from_val(env, &st.to_symbol_val());
@@ -660,19 +641,47 @@ impl PolicyContractTrait for PolicyContract {
             }
         }
 
-        // 5. Verify issuer caps: no single issuer exceeds max_issuer_bps
+        // 5. Closed universe + issuer caps (audit P2). Every asset carrying
+        // weight must be an active registry entry, and issuer concentration is
+        // summed by the issuer recorded in the registry (e.g. USDC and EURC
+        // both count toward CIRCLE) - never inferred from the asset_id text.
+        let registry_client = AssetRegistryClient::new(&env, &config.registry_address);
+        let mut issuer_weights: Vec<(Symbol, u32)> = Vec::new(&env);
         for j in 0..proposal.weights_after.len() {
-            let (asset_id, _) = proposal.weights_after.get(j).unwrap();
-            let issuer = get_issuer_prefix(&env, &asset_id);
-            let mut total_issuer_weight = 0u32;
-            for k in 0..proposal.weights_after.len() {
-                let (other_asset_id, other_weight) = proposal.weights_after.get(k).unwrap();
-                let other_issuer = get_issuer_prefix(&env, &other_asset_id);
-                if issuer == other_issuer {
-                    total_issuer_weight = total_issuer_weight.saturating_add(other_weight);
+            let (asset_id, weight) = proposal.weights_after.get(j).unwrap();
+            if weight == 0 {
+                continue;
+            }
+            let entry = match registry_client.get_asset(&asset_id) {
+                Some(entry) if entry.is_active => entry,
+                _ => {
+                    let res = ValidationResult {
+                        is_valid: false,
+                        code: PolicyError::AssetNotRegistered as u32,
+                        message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
+                    };
+                    env.events().publish(
+                        (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
+                        (res.is_valid, res.code),
+                    );
+                    return res;
+                }
+            };
+            let mut found = false;
+            for k in 0..issuer_weights.len() {
+                let (issuer, total) = issuer_weights.get(k).unwrap();
+                if issuer == entry.issuer {
+                    issuer_weights.set(k, (issuer, total.saturating_add(weight)));
+                    found = true;
+                    break;
                 }
             }
-            if total_issuer_weight > config.max_issuer_bps {
+            if !found {
+                issuer_weights.push_back((entry.issuer, weight));
+            }
+        }
+        for (_, total) in issuer_weights.iter() {
+            if total > config.max_issuer_bps {
                 let res = ValidationResult {
                     is_valid: false,
                     code: PolicyError::IssuerCapExceeded as u32,
@@ -743,31 +752,7 @@ impl PolicyContractTrait for PolicyContract {
 
         }
 
-        // 8. Cross-contract call to constella-registry
-        let registry_client = AssetRegistryClient::new(&env, &config.registry_address);
-
-        // 8a. Verify all assets with positive weight in weights_after are registered and active
-        for j in 0..proposal.weights_after.len() {
-            let (asset_id, weight) = proposal.weights_after.get(j).unwrap();
-            if weight > 0 {
-                match registry_client.get_asset(&asset_id) {
-                    Some(entry) if entry.is_active => {}
-                    _ => {
-                        let res = ValidationResult {
-                            is_valid: false,
-                            code: PolicyError::AssetNotRegistered as u32,
-                            message: Symbol::new(&env, "ASSET_NOT_REGISTERED"),
-                        };
-                        env.events().publish(
-                            (Symbol::new(&env, "REBALANCE_VALIDATED"), vault),
-                            (res.is_valid, res.code),
-                        );
-                        return res;
-                    }
-                }
-            }
-        }
-
+        // 8. (weighted assets were verified against the registry in step 5)
         // 8b. Verify all traded assets in operations are registered and active
         for i in 0..proposal.operations.len() {
             let op = proposal.operations.get(i).unwrap();

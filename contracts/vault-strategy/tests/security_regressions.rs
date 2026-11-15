@@ -71,6 +71,7 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
     registry.add_asset(&AssetEntry {
         contract_address: usdc_addr.clone(),
         asset_id: Symbol::new(&env, "USDC"),
+        issuer: Symbol::new(&env, "CIRCLE"),
         sleeve_type: RegSleeve::Cash,
         liquidity_tier: 0,
         permissionless: true,
@@ -368,6 +369,7 @@ fn v3_pausing_an_empty_sleeve_does_not_freeze_the_vault() {
     registry.add_asset(&AssetEntry {
         contract_address: gov.clone(),
         asset_id: Symbol::new(&s.env, "SPIKO_USD"),
+        issuer: Symbol::new(&s.env, "SPIKO"),
         sleeve_type: RegSleeve::UsdGovFund,
         liquidity_tier: 1,
         permissionless: true,
@@ -501,6 +503,7 @@ fn usdc_eurc_policy(s: &Stack) -> Address {
     registry.add_asset(&AssetEntry {
         contract_address: eurc.clone(),
         asset_id: Symbol::new(&s.env, "EURC"),
+        issuer: Symbol::new(&s.env, "CIRCLE"),
         sleeve_type: RegSleeve::Cash,
         liquidity_tier: 0,
         permissionless: true,
@@ -607,6 +610,7 @@ fn usdc_eurc_policy_with_caps(s: &Stack, max_issuer_bps: u32) -> Address {
         registry.add_asset(&AssetEntry {
             contract_address: addr,
             asset_id: Symbol::new(&s.env, id),
+            issuer: Symbol::new(&s.env, if id == "EURC" { "CIRCLE" } else { "BLEND" }),
             sleeve_type: st,
             liquidity_tier: 0,
             permissionless: true,

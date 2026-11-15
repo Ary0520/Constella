@@ -15,6 +15,8 @@ pub enum RegistryError {
     AddressAlreadyRegistered = 4,
     InvalidLiquidityTier = 5,
     EmptyOracleSources = 6,
+    /// Every asset must name its issuer (used for issuer concentration caps).
+    EmptyIssuer = 7,
 }
 
 #[contracttype]
@@ -35,6 +37,8 @@ pub enum SleeveType {
 pub struct AssetEntry {
     pub contract_address: Address,
     pub asset_id: Symbol,
+    /// Legal issuer, e.g. CIRCLE for both USDC and EURC (audit P2).
+    pub issuer: Symbol,
     pub sleeve_type: SleeveType,
     pub liquidity_tier: u32, // 0=instant, 1=24h, 2=1week, 3=illiquid
     pub permissionless: bool,
@@ -106,6 +110,9 @@ impl AssetRegistryTrait for AssetRegistry {
         }
         if entry.oracle_sources.is_empty() {
             panic_with_error!(&env, RegistryError::EmptyOracleSources);
+        }
+        if entry.issuer == Symbol::new(&env, "") {
+            panic_with_error!(&env, RegistryError::EmptyIssuer);
         }
 
         // Validate contract address uniqueness:

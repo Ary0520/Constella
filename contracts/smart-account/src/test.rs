@@ -656,6 +656,7 @@ fn test_t55_sponsored_passkey_vault_deposit() {
     registry_client.add_asset(&constella_registry::AssetEntry {
         contract_address: numeraire_address.clone(),
         asset_id: Symbol::new(&env, "USDC"),
+        issuer: Symbol::new(&env, "CIRCLE"),
         sleeve_type: constella_registry::SleeveType::Cash,
         liquidity_tier: 0,
         permissionless: true,

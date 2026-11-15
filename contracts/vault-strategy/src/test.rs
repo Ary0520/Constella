@@ -65,6 +65,7 @@ fn setup_test_context() -> TestContext<'static> {
     registry_client.add_asset(&AssetEntry {
         contract_address: numeraire_address.clone(),
         asset_id: Symbol::new(&env, "USDC"),
+        issuer: Symbol::new(&env, "CIRCLE"),
         sleeve_type: RegSleeveType::Cash,
         liquidity_tier: 0,
         permissionless: true,
@@ -471,6 +472,7 @@ fn test_t46_liquidity_sleeve_floor_protection() {
     ctx.registry_client.add_asset(&AssetEntry {
         contract_address: benji_address.clone(),
         asset_id: Symbol::new(&ctx.env, "BENJI"),
+        issuer: Symbol::new(&ctx.env, "FRANKLIN_TEMPLETON"),
         sleeve_type: RegSleeveType::UsdGovFund,
         liquidity_tier: 1, // 24h liquidity
         permissionless: true,
@@ -701,6 +703,7 @@ fn test_exact_liquidity_floor_boundary() {
     ctx.registry_client.add_asset(&AssetEntry {
         contract_address: benji_address.clone(),
         asset_id: Symbol::new(&ctx.env, "BENJI"),
+        issuer: Symbol::new(&ctx.env, "FRANKLIN_TEMPLETON"),
         sleeve_type: RegSleeveType::UsdGovFund,
         liquidity_tier: 1,
         permissionless: true,
@@ -811,6 +814,7 @@ fn test_dual_nav_asymmetric_max_redeem() {
     ctx.registry_client.add_asset(&AssetEntry {
         contract_address: benji_address.clone(),
         asset_id: Symbol::new(&ctx.env, "BENJI"),
+        issuer: Symbol::new(&ctx.env, "FRANKLIN_TEMPLETON"),
         sleeve_type: RegSleeveType::UsdGovFund,
         liquidity_tier: 1,
         permissionless: true,
@@ -1113,6 +1117,7 @@ fn register_gov_fund(ctx: &TestContext) -> Address {
     ctx.registry_client.add_asset(&AssetEntry {
         contract_address: gov.clone(),
         asset_id: Symbol::new(&ctx.env, "SPIKO_USD"),
+        issuer: Symbol::new(&ctx.env, "SPIKO"),
         sleeve_type: RegSleeveType::UsdGovFund,
         liquidity_tier: 1,
         permissionless: true,
@@ -1390,6 +1395,7 @@ mod v3 {
         ctx.registry_client.add_asset(&AssetEntry {
             contract_address: eur.clone(),
             asset_id: Symbol::new(&ctx.env, "SPIKO_EUR"),
+            issuer: Symbol::new(&ctx.env, "SPIKO"),
             sleeve_type: RegSleeveType::EurSovereign,
             liquidity_tier: 1,
             permissionless: true,

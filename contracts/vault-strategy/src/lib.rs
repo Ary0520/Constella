@@ -165,6 +165,7 @@ pub trait NavOracleInterface {
 pub struct RegistryAssetEntryRef {
     pub contract_address: Address,
     pub asset_id: Symbol,
+    pub issuer: Symbol,
     pub sleeve_type: u32,
     pub liquidity_tier: u32,
     pub permissionless: bool,

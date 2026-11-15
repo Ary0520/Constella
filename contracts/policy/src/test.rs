@@ -36,11 +36,13 @@ fn register_registry_asset(
     registry_client: &AssetRegistryClient,
     contract_addr: &Address,
     asset_id: &str,
+    issuer: &str,
     sleeve: SleeveType,
 ) {
     let entry = AssetEntry {
         contract_address: contract_addr.clone(),
         asset_id: Symbol::new(env, asset_id),
+        issuer: Symbol::new(env, issuer),
         sleeve_type: sleeve,
         liquidity_tier: 0,
         permissionless: true,
@@ -80,13 +82,13 @@ fn setup_test_context() -> TestContext {
     let deactivated_addr = token(&env);
     let unregistered_addr = token(&env);
 
-    register_registry_asset(&env, &reg_client, &usdc_addr, "CIRCLE_USDC", SleeveType::Cash);
-    register_registry_asset(&env, &reg_client, &eurc_addr, "CIRCLE_EURC", SleeveType::Cash);
-    register_registry_asset(&env, &reg_client, &benji_addr, "FRANKLIN_BENJI", SleeveType::UsdGovFund);
-    register_registry_asset(&env, &reg_client, &eustbl_addr, "SPIKO_EUSTBL", SleeveType::EurSovereign);
-    register_registry_asset(&env, &reg_client, &blend_addr, "BLEND_BLND", SleeveType::UsdGovFund);
-    register_registry_asset(&env, &reg_client, &usdf_addr, "FRANKLIN_USDF", SleeveType::UsdGovFund);
-    register_registry_asset(&env, &reg_client, &deactivated_addr, "RISKY_TOKEN", SleeveType::YieldUsd);
+    register_registry_asset(&env, &reg_client, &usdc_addr, "CIRCLE_USDC", "CIRCLE", SleeveType::Cash);
+    register_registry_asset(&env, &reg_client, &eurc_addr, "CIRCLE_EURC", "CIRCLE", SleeveType::Cash);
+    register_registry_asset(&env, &reg_client, &benji_addr, "FRANKLIN_BENJI", "FRANKLIN_TEMPLETON", SleeveType::UsdGovFund);
+    register_registry_asset(&env, &reg_client, &eustbl_addr, "SPIKO_EUSTBL", "SPIKO", SleeveType::EurSovereign);
+    register_registry_asset(&env, &reg_client, &blend_addr, "BLEND_BLND", "BLEND", SleeveType::UsdGovFund);
+    register_registry_asset(&env, &reg_client, &usdf_addr, "FRANKLIN_USDF", "FRANKLIN_TEMPLETON", SleeveType::UsdGovFund);
+    register_registry_asset(&env, &reg_client, &deactivated_addr, "RISKY_TOKEN", "RISKY_ISSUER", SleeveType::YieldUsd);
 
     // Deactivate the deactivated asset
     reg_client.deactivate_asset(&Symbol::new(&env, "RISKY_TOKEN"));
@@ -1658,7 +1660,7 @@ mod p1 {
     /// Registers FX_EURC (priced 1.08 by two feeds) and a USDC/FX_EURC policy.
     fn fx_setup(ctx: &TestContext) -> Address {
         let eur = ctx.env.register_stellar_asset_contract_v2(Address::generate(&ctx.env)).address();
-        register_registry_asset(&ctx.env, &AssetRegistryClient::new(&ctx.env, &ctx.registry_address), &eur, "FX_EURC", SleeveType::Cash);
+        register_registry_asset(&ctx.env, &AssetRegistryClient::new(&ctx.env, &ctx.registry_address), &eur, "FX_EURC", "CIRCLE", SleeveType::Cash);
         price_asset(&ctx.env, &NavOracleClient::new(&ctx.env, &ctx.oracle_address), &eur, "P_FX", ONE * 108 / 100);
         let sleeves = vec![
             &ctx.env,
@@ -1737,3 +1739,4 @@ mod p1 {
         assert_eq!(policy.get_oracle(), ctx.oracle_address);
     }
 }
+

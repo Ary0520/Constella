@@ -8,6 +8,17 @@ use soroban_sdk::{
     vec, Address, Env, Symbol,
 };
 
+/// Issuer per REGISTRY.md (USDC and EURC are both Circle).
+fn issuer_of(asset_id: &str) -> &'static str {
+    match asset_id {
+        "USDC" | "EURC" => "CIRCLE",
+        "BENJI" | "FRANKLIN_BENJI" => "FRANKLIN_TEMPLETON",
+        _ if asset_id.starts_with("SPIKO") => "SPIKO",
+        _ if asset_id.starts_with("BLEND") => "BLEND",
+        _ => "TEST_ISSUER",
+    }
+}
+
 fn create_sample_entry(
     env: &Env,
     contract_address: &Address,
@@ -19,6 +30,7 @@ fn create_sample_entry(
     AssetEntry {
         contract_address: contract_address.clone(),
         asset_id: Symbol::new(env, asset_id_str),
+        issuer: Symbol::new(env, issuer_of(asset_id_str)),
         sleeve_type: sleeve,
         liquidity_tier: tier,
         permissionless: true,
@@ -406,3 +418,4 @@ fn test_t25_event_emissions_verification() {
     }
     assert!(found_deactivated, "ASSET_DEACTIVATED event not found");
 }
+
