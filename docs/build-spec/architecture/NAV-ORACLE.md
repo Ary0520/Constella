@@ -40,6 +40,14 @@ The fix is not complex: never price from a single thin source, enforce multi-sou
 
 This means collateral NAV is always conservative (protects lenders). Deposit NAV is fair (protects depositors from being diluted).
 
+### Who can move a price (audit O7a, 15 Nov 2026)
+- Each pushed source has its own **feeder** key, and only that key can call `update_price` for the source. The admin cannot write prices.
+- **Delayed changes:** any change to the sources of an asset that already has a valid price waits **48 hours**, publicly (`SOURCE_CHANGE_PROPOSED`). This covers adding a source and changing an existing one (feeder rotation, looser staleness or depth limits). Anyone may activate the change after the delay; the admin may cancel it.
+- Bootstrapping an asset that has no price yet is immediate, because nothing can consume a price that does not exist.
+- Registration never sets a price: activating a change to an existing source keeps its price, timestamp and depth.
+- `deactivate_source` is immediate (it can only halt pricing).
+- Verified provider facts for the pull sources (Reflector, RedStone) are in `references/ORACLE-SOURCES.md`.
+
 ### Per-asset evaluation (audit O6, 15 Nov 2026)
 - Every rule below is evaluated **per asset**, among that asset's own sources. A sleeve may hold several assets at different prices (USDC and EURC in cash; BENJI and USDY in USD gov funds), and comparing them would be meaningless.
 - The **sleeve** is the configuration and pause domain: deviation threshold, minimum valid sources, and the pause flag / `NAV_PAUSE` event.

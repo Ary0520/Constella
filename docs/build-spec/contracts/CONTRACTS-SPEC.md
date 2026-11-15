@@ -316,7 +316,12 @@ fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice>     // s
 fn get_sources(env: Env) -> Vec<OracleSource>
 fn is_halted(env: Env) -> bool
 fn is_sleeve_paused(env: Env, sleeve_id: String) -> bool
-fn update_source(env: Env, source_id: String, price: i128, timestamp: u64)  // oracle feeds only
+fn update_price(env: Env, source_id: Symbol, price: i128, liquidity_depth_usd: i128, timestamp: u64)  // the source's own feeder only (O7a)
+fn register_source(env: Env, source: OracleSource)   // admin; immediate for an unpriced asset, else pending 48h
+fn activate_source(env: Env, source_id: Symbol)      // anyone, after the delay; never changes an existing source's price
+fn cancel_source_change(env: Env, source_id: Symbol) // admin
+fn deactivate_source(env: Env, source_id: Symbol)    // admin; immediate (fails safe)
+fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource>
 // caller must sign AND be the pause authority or the admin (audit O1)
 fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol)
 fn clear_circuit_breaker(env: Env, sleeve_id: Symbol)  // admin (multisig) only
