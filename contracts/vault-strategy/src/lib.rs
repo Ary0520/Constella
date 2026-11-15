@@ -5,6 +5,16 @@ use soroban_sdk::{
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
     token, Address, BytesN, Env, FromVal, String, Symbol, SymbolStr, Vec,
 };
+// Audit W2/W4.2: the share ledger (balances, allowances, total supply) uses the
+// OpenZeppelin stellar-tokens storage primitives: per-holder persistent
+// balance entries and a persistent total supply with TTL extension, and
+// temporary allowance entries whose `live_until_ledger` is validated. Only the
+// non-emitting primitives are used; events stay the golden-pinned SEP-41 shapes
+// below (OZ 0.8.0 encodes mint/burn/approve data as maps, not SEP-41's values).
+use stellar_tokens::fungible::{
+    total_supply::{decrease_total_supply, increase_total_supply, total_supply as share_supply},
+    Base, INSTANCE_EXTEND_AMOUNT, INSTANCE_TTL_THRESHOLD,
+};
 
 // Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
 // Events::publish encodings; pinned by golden/events.txt). Lower-case names are
@@ -21,15 +31,15 @@ pub struct Transfer {
     pub amount: i128,
 }
 
-/// SEP-41: topics [approve, from, spender]; data amount (live_until_ledger is
-/// added with the OpenZeppelin token in W4.2 / audit W6).
-#[contractevent(topics = ["approve"], data_format = "single-value")]
+/// SEP-41: topics [approve, from, spender]; data [amount, live_until_ledger] (audit W6).
+#[contractevent(topics = ["approve"], data_format = "vec")]
 pub struct Approve {
     #[topic]
     pub from: Address,
     #[topic]
     pub spender: Address,
     pub amount: i128,
+    pub live_until_ledger: u32,
 }
 
 /// SEP-41: topics [mint, to]; data amount.
@@ -300,28 +310,11 @@ pub struct OracleSource {
 
 #[derive(Clone, Debug, PartialEq)]
 #[contracttype]
-pub struct AllowanceDataKey {
-    pub from: Address,
-    pub spender: Address,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct AllowanceValue {
-    pub amount: i128,
-    pub expiration_ledger: u32,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
 pub enum DataKey {
     Config,
     Name,
     Symbol,
     Decimals,
-    TotalShares,
-    Balance(Address),
-    Allowance(AllowanceDataKey),
     Sleeves,
     IsPaused,
     LastFeeAccrual,
@@ -411,7 +404,11 @@ const SECONDS_PER_YEAR: u64 = 31_536_000;
 
 fn get_config(env: &Env) -> VaultConfig {
     match env.storage().instance().get(&DataKey::Config) {
-        Some(c) => c,
+        Some(c) => {
+            // Audit W2: keep the vault's instance entry live while it is used.
+            env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_EXTEND_AMOUNT);
+            c
+        }
         None => panic_with_error!(env, VaultError::NotInitialized),
     }
 }
@@ -447,11 +444,7 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
     }
 
     let elapsed = now - last_accrual;
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
+    let total_shares: i128 = share_supply(env);
 
     if total_shares == 0 {
         env.storage().instance().set(&DataKey::LastFeeAccrual, &now);
@@ -469,18 +462,9 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
     };
 
     if d_shares > 0 {
-        let treasury_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(config.treasury.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(config.treasury.clone()), &(treasury_bal + d_shares));
-        let new_total_shares = total_shares + d_shares;
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalShares, &new_total_shares);
+        // Audit W6: fee shares are minted like any other shares, with a SEP-41
+        // mint event, so indexers can reconstruct every balance from events.
+        mint_shares_internal(env, &config.treasury, d_shares);
 
         if let (Some(den), Some(fee_rate)) = (
             denominator,
@@ -609,11 +593,7 @@ fn holdings_value(env: &Env, config: &VaultConfig, kind: NavKind) -> Result<(i12
 
 fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> Option<PriceData> {
     let scale = share_scale(env);
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
+    let total_shares: i128 = share_supply(env);
     let has_sleeves = env
         .storage()
         .instance()
@@ -747,23 +727,8 @@ fn update_cash_sleeve_balance(env: &Env, amount: i128, is_deposit: bool) {
 }
 
 fn mint_shares_internal(env: &Env, receiver: &Address, shares: i128) {
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
-    let bal: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(receiver.clone()))
-        .unwrap_or(0);
-
-    env.storage()
-        .instance()
-        .set(&DataKey::TotalShares, &(total_shares + shares));
-    env.storage()
-        .instance()
-        .set(&DataKey::Balance(receiver.clone()), &(bal + shares));
+    increase_total_supply(env, shares);
+    Base::update(env, None, Some(receiver), shares);
 
     Mint { to: receiver.clone(), amount: shares }.publish(env);
 }
@@ -776,64 +741,32 @@ fn mint_shares_internal(env: &Env, receiver: &Address, shares: i128) {
 /// self-transfer is a balance no-op (the caller still had to authorize it and
 /// must own at least `amount`).
 fn move_shares(env: &Env, from: &Address, to: &Address, amount: i128) {
-    let from_bal: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(from.clone()))
-        .unwrap_or(0);
-    if from_bal < amount {
+    if Base::balance(env, from) < amount {
         panic_with_error!(env, VaultError::InsufficientBalance);
     }
     if from == to {
         return;
     }
-
-    let new_from_bal = from_bal - amount;
-    if new_from_bal == 0 {
-        env.storage().instance().remove(&DataKey::Balance(from.clone()));
-    } else {
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(from.clone()), &new_from_bal);
-    }
-
-    let to_bal: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(to.clone()))
-        .unwrap_or(0);
-    let new_to_bal = match to_bal.checked_add(amount) {
-        Some(v) => v,
-        None => panic_with_error!(env, VaultError::MathOverflow),
-    };
-    env.storage()
-        .instance()
-        .set(&DataKey::Balance(to.clone()), &new_to_bal);
+    Base::update(env, Some(from), Some(to), amount);
 }
 
 fn burn_shares_internal(env: &Env, owner: &Address, shares: i128) {
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
-    let bal: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(owner.clone()))
-        .unwrap_or(0);
-
-    let new_total = total_shares - shares;
-    let new_bal = bal - shares;
-
-    env.storage().instance().set(&DataKey::TotalShares, &new_total);
-    if new_bal == 0 {
-        env.storage().instance().remove(&DataKey::Balance(owner.clone()));
-    } else {
-        env.storage().instance().set(&DataKey::Balance(owner.clone()), &new_bal);
+    if Base::balance(env, owner) < shares {
+        panic_with_error!(env, VaultError::InsufficientBalance);
     }
+    Base::update(env, Some(owner), None, shares);
+    decrease_total_supply(env, shares);
 
     Burn { from: owner.clone(), amount: shares }.publish(env);
+}
+
+/// Consumes `amount` of `spender`'s allowance over `owner`'s shares, keeping
+/// the vault's public error code for a shortfall (expired counts as zero).
+fn spend_share_allowance(env: &Env, owner: &Address, spender: &Address, amount: i128) {
+    if Base::allowance(env, owner, spender) < amount {
+        panic_with_error!(env, VaultError::InsufficientAllowance);
+    }
+    Base::spend_allowance(env, owner, spender, amount);
 }
 
 /// Remaining room under (tvl_cap, per_user_cap) for `receiver`, in numéraire
@@ -843,11 +776,7 @@ fn cap_room(env: &Env, config: &VaultConfig, receiver: &Address, deposit_nav: i1
         Ok((v, _)) => v,
         Err(e) => panic_with_error!(env, e),
     };
-    let held_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(receiver.clone()))
-        .unwrap_or(0);
+    let held_shares: i128 = Base::balance(env, receiver);
     let position = match held_shares.checked_mul(deposit_nav) {
         Some(v) => v / scale,
         None => panic_with_error!(env, VaultError::MathOverflow),
@@ -905,7 +834,6 @@ impl StrategyVault {
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
-        env.storage().instance().set(&DataKey::TotalShares, &0i128);
         env.storage().instance().set(&DataKey::IsPaused, &false);
         env.storage()
             .instance()
@@ -1036,11 +964,7 @@ impl StrategyVault {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
 
-        let owner_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(owner.clone()))
-            .unwrap_or(0);
+        let owner_bal: i128 = Base::balance(&env, &owner);
         if owner_bal < shares {
             panic_with_error!(&env, VaultError::InsufficientBalance);
         }
@@ -1127,11 +1051,7 @@ impl StrategyVault {
         let scale = 10i128.pow(decimals);
 
         let shares = (assets.checked_mul(scale).unwrap() + (conservative_nav - 1)) / conservative_nav;
-        let owner_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(owner.clone()))
-            .unwrap_or(0);
+        let owner_bal: i128 = Base::balance(&env, &owner);
         if owner_bal < shares {
             panic_with_error!(&env, VaultError::InsufficientBalance);
         }
@@ -1184,10 +1104,7 @@ impl StrategyVault {
     }
 
     pub fn total_supply(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::TotalShares)
-            .unwrap_or(0)
+        share_supply(&env)
     }
 
     pub fn convert_to_shares(env: Env, assets: i128) -> i128 {
@@ -1284,11 +1201,7 @@ impl StrategyVault {
         if is_vault_paused(&env) {
             return 0;
         }
-        let owner_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(owner))
-            .unwrap_or(0);
+        let owner_bal: i128 = Base::balance(&env, &owner);
         let owner_assets = Self::convert_to_assets(env.clone(), owner_bal);
         let cap = Self::get_redemption_capacity(env);
         if owner_assets < cap.instant {
@@ -1302,11 +1215,7 @@ impl StrategyVault {
         if is_vault_paused(&env) {
             return 0;
         }
-        let owner_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(owner))
-            .unwrap_or(0);
+        let owner_bal: i128 = Base::balance(&env, &owner);
         let cap = Self::get_redemption_capacity(env.clone());
         let config = get_config(&env);
         let conservative_nav = match compute_conservative_nav(&env, &config) {
@@ -1331,10 +1240,7 @@ impl StrategyVault {
 
     // SEP-41 Fungible Token Standard
     pub fn balance(env: Env, id: Address) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Balance(id))
-            .unwrap_or(0)
+        Base::balance(&env, &id)
     }
 
     pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
@@ -1353,6 +1259,10 @@ impl StrategyVault {
         Transfer { from, to, amount }.publish(&env);
     }
 
+    /// SEP-41 approve. `expiration_ledger` (SEP-41 `live_until_ledger`) is
+    /// validated by the OpenZeppelin allowance storage (audit W6): a non-zero
+    /// allowance cannot already be expired, and none may outlive the network's
+    /// maximum entry TTL (error #102 `InvalidLiveUntilLedger`).
     pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
         from.require_auth();
         if is_vault_paused(&env) {
@@ -1361,35 +1271,14 @@ impl StrategyVault {
         if amount < 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
+        get_config(&env);
+        Base::set_allowance(&env, &from, &spender, amount, expiration_ledger);
 
-        let key = DataKey::Allowance(AllowanceDataKey {
-            from: from.clone(),
-            spender: spender.clone(),
-        });
-        if amount == 0 {
-            env.storage().instance().remove(&key);
-        } else {
-            let val = AllowanceValue {
-                amount,
-                expiration_ledger,
-            };
-            env.storage().instance().set(&key, &val);
-        }
-
-        Approve { from, spender, amount }.publish(&env);
+        Approve { from, spender, amount, live_until_ledger: expiration_ledger }.publish(&env);
     }
 
     pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
-        let key = DataKey::Allowance(AllowanceDataKey { from, spender });
-        if let Some(val) = env.storage().instance().get::<_, AllowanceValue>(&key) {
-            if env.ledger().sequence() <= val.expiration_ledger {
-                val.amount
-            } else {
-                0
-            }
-        } else {
-            0
-        }
+        Base::allowance(&env, &from, &spender)
     }
 
     pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
@@ -1403,27 +1292,42 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let key = DataKey::Allowance(AllowanceDataKey {
-            from: from.clone(),
-            spender: spender.clone(),
-        });
-        let mut val: AllowanceValue = match env.storage().instance().get(&key) {
-            Some(v) => v,
-            None => panic_with_error!(&env, VaultError::InsufficientAllowance),
-        };
-        if env.ledger().sequence() > val.expiration_ledger || val.amount < amount {
-            panic_with_error!(&env, VaultError::InsufficientAllowance);
-        }
-        val.amount -= amount;
-        if val.amount == 0 {
-            env.storage().instance().remove(&key);
-        } else {
-            env.storage().instance().set(&key, &val);
-        }
-
+        spend_share_allowance(&env, &from, &spender, amount);
         move_shares(&env, &from, &to, amount);
 
         Transfer { from, to, amount }.publish(&env);
+    }
+
+    /// SEP-41 burn: destroys `amount` of the caller's own shares. No assets
+    /// leave the vault, so the remaining holders' NAV per share rises.
+    pub fn burn(env: Env, from: Address, amount: i128) {
+        from.require_auth();
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, VaultError::ZeroAmount);
+        }
+        let config = get_config(&env);
+        accrue_fees_internal(&env, &config);
+
+        burn_shares_internal(&env, &from, amount);
+    }
+
+    /// SEP-41 burn_from: `spender` burns `from`'s shares within its allowance.
+    pub fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
+        spender.require_auth();
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, VaultError::ZeroAmount);
+        }
+        let config = get_config(&env);
+        accrue_fees_internal(&env, &config);
+
+        spend_share_allowance(&env, &from, &spender, amount);
+        burn_shares_internal(&env, &from, amount);
     }
 
     pub fn decimals(env: Env) -> u32 {
