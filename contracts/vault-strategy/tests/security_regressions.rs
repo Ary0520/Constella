@@ -326,9 +326,25 @@ fn o1_stranger_cannot_trip_a_circuit_breaker() {
     let user = Address::generate(&s.env);
     s.usdc_admin.mint(&user, &(100 * ONE));
 
-    // Attack: a caller with no role and no signatures at all.
+    let griefer = Address::generate(&s.env);
+    let reason = Symbol::new(&s.env, "GRIEF");
+
+    // Attack 1: no signatures at all, impersonating the admin as caller.
     s.env.set_auths(&[]);
-    let res = s.oracle.try_trigger_circuit_breaker(&vault_sleeve, &Symbol::new(&s.env, "GRIEF"));
+    let res = s.oracle.try_trigger_circuit_breaker(&s.admin, &vault_sleeve, &reason);
+    assert!(res.is_err(), "an unsigned call must not be able to pause a sleeve");
+
+    // Attack 2: the griefer signs, but holds no pause role.
+    s.env.mock_auths(&[MockAuth {
+        address: &griefer,
+        invoke: &MockAuthInvoke {
+            contract: &s.oracle.address,
+            fn_name: "trigger_circuit_breaker",
+            args: (griefer.clone(), vault_sleeve.clone(), reason.clone()).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    let res = s.oracle.try_trigger_circuit_breaker(&griefer, &vault_sleeve, &reason);
     assert!(res.is_err(), "an unauthorized caller must not be able to pause a sleeve");
     assert!(!s.oracle.is_sleeve_paused(&vault_sleeve));
 

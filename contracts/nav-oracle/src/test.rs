@@ -234,7 +234,7 @@ fn test_t37_deviation_circuit_breaker() {
 #[test]
 fn test_t38_per_sleeve_isolation() {
     let env = Env::default();
-    let (client, _admin, _base) = setup_oracle(&env);
+    let (client, admin, _base) = setup_oracle(&env);
 
     let sleeve_gov = Symbol::new(&env, "USD_GOV_FUNDS");
     let sleeve_cash = Symbol::new(&env, "CASH_STABLE");
@@ -259,7 +259,7 @@ fn test_t38_per_sleeve_isolation() {
     client.register_source(&c2);
 
     // Trigger pause exclusively on USD_GOV_FUNDS
-    client.trigger_circuit_breaker(&sleeve_gov, &Symbol::new(&env, "EMERGENCY_HALT"));
+    client.trigger_circuit_breaker(&admin, &sleeve_gov, &Symbol::new(&env, "EMERGENCY_HALT"));
 
     assert!(client.is_sleeve_paused(&sleeve_gov));
     assert!(!client.is_sleeve_paused(&sleeve_cash));
@@ -426,7 +426,7 @@ fn test_uninitialized_and_authorization_checks() {
         )))
     );
     assert_eq!(
-        client.try_trigger_circuit_breaker(&Symbol::new(&env, "SLEEVE"), &Symbol::new(&env, "TEST")),
+        client.try_trigger_circuit_breaker(&Address::generate(&env), &Symbol::new(&env, "SLEEVE"), &Symbol::new(&env, "TEST")),
         Err(Ok(soroban_sdk::Error::from_contract_error(
             OracleError::NotInitialized as u32
         )))
@@ -440,7 +440,7 @@ fn test_uninitialized_and_authorization_checks() {
 
     // Trigger circuit breaker on non-existent sleeve fails
     assert_eq!(
-        client.try_trigger_circuit_breaker(&Symbol::new(&env, "NON_EXISTENT"), &Symbol::new(&env, "TEST")),
+        client.try_trigger_circuit_breaker(&admin, &Symbol::new(&env, "NON_EXISTENT"), &Symbol::new(&env, "TEST")),
         Err(Ok(soroban_sdk::Error::from_contract_error(
             OracleError::SleeveNotFound as u32
         )))
@@ -639,3 +639,4 @@ fn test_property_collateral_nav_le_deposit_nav() {
     let d = client.get_deposit_nav(&sleeve).unwrap();
     assert!(c.price <= d.price);
 }
+

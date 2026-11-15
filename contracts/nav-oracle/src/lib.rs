@@ -97,6 +97,7 @@ pub enum DataKey {
     AssetSleeve(Address),
     AllAssets,
     LastPrice(Address),
+    PauseAuthority,
 }
 
 pub trait NavOracleTrait {
@@ -146,8 +147,15 @@ pub trait NavOracleTrait {
 
     /// Circuit breaker status and management
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool;
-    fn trigger_circuit_breaker(env: Env, sleeve_id: Symbol, reason: Symbol);
+    /// Manually pause a sleeve. `caller` must sign and be the pause
+    /// authority or the admin (audit O1). Fast, single-key by design.
+    fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol);
+    /// Resume a sleeve. Admin (multisig) only.
     fn clear_circuit_breaker(env: Env, sleeve_id: Symbol);
+    /// Rotate the pause authority. Admin only.
+    fn set_pause_authority(env: Env, new_authority: Address);
+    /// Current pause authority (defaults to the admin).
+    fn get_pause_authority(env: Env) -> Address;
 
     /// Admin query
     fn get_admin(env: Env) -> Address;
@@ -289,6 +297,7 @@ impl NavOracleTrait for NavOracle {
             panic_with_error!(&env, OracleError::AlreadyInitialized);
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::PauseAuthority, &admin);
         env.storage().instance().set(&DataKey::BaseAsset, &base_asset);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
         env.storage().instance().set(&DataKey::Resolution, &resolution);
@@ -692,9 +701,21 @@ impl NavOracleTrait for NavOracle {
         }
     }
 
-    fn trigger_circuit_breaker(env: Env, sleeve_id: Symbol, reason: Symbol) {
-        if !env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, OracleError::NotInitialized);
+    fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol) {
+        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(a) => a,
+            None => panic_with_error!(&env, OracleError::NotInitialized),
+        };
+        // Audit O1: only the pause authority or the admin may pause, and they
+        // must actually sign. Previously anyone could pause any sleeve.
+        caller.require_auth();
+        let pause_authority: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseAuthority)
+            .unwrap_or(admin.clone());
+        if caller != pause_authority && caller != admin {
+            panic_with_error!(&env, OracleError::Unauthorized);
         }
 
         let has_sources = env.storage().instance().has(&DataKey::SleeveSources(sleeve_id.clone()));
@@ -814,6 +835,37 @@ impl NavOracleTrait for NavOracle {
                 timestamp: now,
             },
         );
+    }
+
+    fn set_pause_authority(env: Env, new_authority: Address) {
+        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(a) => a,
+            None => panic_with_error!(&env, OracleError::NotInitialized),
+        };
+        admin.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PauseAuthority)
+            .unwrap_or(admin);
+        env.storage()
+            .instance()
+            .set(&DataKey::PauseAuthority, &new_authority);
+        env.events().publish(
+            (Symbol::new(&env, "PAUSE_AUTHORITY_SET"), old),
+            new_authority,
+        );
+    }
+
+    fn get_pause_authority(env: Env) -> Address {
+        let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
+            Some(a) => a,
+            None => panic_with_error!(&env, OracleError::NotInitialized),
+        };
+        env.storage()
+            .instance()
+            .get(&DataKey::PauseAuthority)
+            .unwrap_or(admin)
     }
 
     fn get_admin(env: Env) -> Address {
