@@ -5,7 +5,7 @@ extern crate std;
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
-    Address, Env, Symbol, TryFromVal,
+    vec, Address, Env, IntoVal, Symbol, TryFromVal,
 };
 
 /// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
@@ -1226,5 +1226,205 @@ mod o6 {
         let hijack = create_source(&env, "X_A", &y, "CASH", 1_080_000, 200_000, 1000);
         assert_eq!(client.try_register_source(&hijack).map(|_| ()), err(OracleError::AssetSleeveMismatch));
         assert_eq!(client.get_source(&Symbol::new(&env, "X_A")).unwrap().asset, x);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Audit W5 (2026-11-15): SEP-40 conformance and frictionless Blend v2
+// integration. `sep40` below is a verbatim copy of the interface in
+// script3/sep-40-oracle v1.4.0 (sep-40/src/lib.rs) - the crate Blend v2's
+// pool compiles against - so these calls decode exactly as Blend's do.
+// -------------------------------------------------------------------------
+mod sep40 {
+    use soroban_sdk::{contractclient, contracttype, Address, Env, Symbol, Vec};
+
+    /// Price data for an asset at a specific timestamp
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct PriceData {
+        pub price: i128,
+        pub timestamp: u64,
+    }
+
+    /// Asset type
+    #[contracttype]
+    #[derive(Clone, Debug, PartialEq)]
+    pub enum Asset {
+        Stellar(Address),
+        Other(Symbol),
+    }
+
+    /// Oracle feed interface description
+    #[contractclient(name = "PriceFeedClient")]
+    #[allow(dead_code)]
+    pub trait PriceFeedTrait {
+        fn base(env: Env) -> Asset;
+        fn assets(env: Env) -> Vec<Asset>;
+        fn decimals(env: Env) -> u32;
+        fn resolution(env: Env) -> u32;
+        fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData>;
+        fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>>;
+        fn lastprice(env: Env, asset: Asset) -> Option<PriceData>;
+    }
+}
+
+/// Mirrors blend-contracts-v2 `pool/src/pool/pool.rs` (`main`, read
+/// 15 Nov 2026): `load_price` and `load_price_decimals`.
+mod blend_style {
+    use super::sep40::{Asset, PriceFeedClient};
+    use soroban_sdk::{contract, contracterror, contractimpl, panic_with_error, Address, Env};
+
+    #[contracterror]
+    #[derive(Copy, Clone, Debug, Eq, PartialEq)]
+    #[repr(u32)]
+    pub enum PoolError {
+        InvalidPrice = 1210,
+    }
+
+    #[contract]
+    pub struct BlendStylePool;
+
+    #[contractimpl]
+    impl BlendStylePool {
+        pub fn load_price(e: Env, oracle: Address, asset: Address) -> i128 {
+            let oracle_client = PriceFeedClient::new(&e, &oracle);
+            let oracle_asset = Asset::Stellar(asset);
+            let price_data = oracle_client.lastprice(&oracle_asset).unwrap();
+            if price_data.timestamp + 24 * 60 * 60 < e.ledger().timestamp() || price_data.price <= 0 {
+                panic_with_error!(&e, PoolError::InvalidPrice);
+            }
+            price_data.price
+        }
+
+        pub fn load_price_decimals(e: Env, oracle: Address) -> u32 {
+            PriceFeedClient::new(&e, &oracle).decimals()
+        }
+    }
+}
+
+mod w5 {
+    use super::sep40::{Asset, PriceData, PriceFeedClient};
+    use super::*;
+
+    const RES: u64 = 300; // resolution configured by setup_oracle
+
+    /// BENJI with two deep feeds ($1.00 and $1.01) in its own sleeve, at t = 1000.
+    fn feed(env: &Env) -> (Address, PriceFeedClient<'_>, Address, Address) {
+        let (client, _admin, base) = setup_oracle(env);
+        env.ledger().set_timestamp(1000);
+        client.configure_sleeve(&Symbol::new(env, "USD_GOV_FUNDS"), &300, &2);
+        let benji = Address::generate(env);
+        client.register_source(&create_source(env, "BENJI_NAV", &benji, "USD_GOV_FUNDS", 1_000_000, 200_000, 1000));
+        client.register_source(&create_source(env, "REFLECTOR_BENJI", &benji, "USD_GOV_FUNDS", 1_010_000, 200_000, 1000));
+        let id = client.address.clone();
+        (id.clone(), PriceFeedClient::new(env, &id), benji, base)
+    }
+
+    fn blend(env: &Env) -> blend_style::BlendStylePoolClient<'_> {
+        let id = env.register(blend_style::BlendStylePool, ());
+        blend_style::BlendStylePoolClient::new(env, &id)
+    }
+
+    #[test]
+    fn metadata_matches_sep40() {
+        let env = Env::default();
+        let (_id, feed_client, benji, base) = feed(&env);
+        assert_eq!(feed_client.base(), Asset::Stellar(base));
+        assert_eq!(feed_client.assets(), vec![&env, Asset::Stellar(benji)]);
+        assert_eq!(feed_client.decimals(), 7);
+        assert_eq!(feed_client.resolution(), 300);
+    }
+
+    #[test]
+    fn price_data_has_exactly_the_sep40_fields() {
+        // Older SDKs decode contracttype structs strictly: an extra field
+        // (e.g. a `source`) would break deployed consumers.
+        let env = Env::default();
+        let (id, _f, benji, _base) = feed(&env);
+        let raw: soroban_sdk::Val = env.invoke_contract(&id, &Symbol::new(&env, "lastprice"), vec![&env, Asset::Stellar(benji).into_val(&env)]);
+        let map = soroban_sdk::Map::<Symbol, soroban_sdk::Val>::try_from_val(&env, &raw).unwrap();
+        assert_eq!(map.keys(), vec![&env, Symbol::new(&env, "price"), Symbol::new(&env, "timestamp")]);
+    }
+
+    #[test]
+    fn a_blend_v2_pool_reads_the_conservative_price_and_decimals() {
+        let env = Env::default();
+        let (id, feed_client, benji, base) = feed(&env);
+        let pool = blend(&env);
+        assert_eq!(pool.load_price(&id, &benji), 1_000_000, "collateral = minimum of valid sources (Rule 3)");
+        assert_eq!(pool.load_price_decimals(&id), 7);
+        // lastprice timestamp: oldest data used, on the resolution grid.
+        assert_eq!(feed_client.lastprice(&Asset::Stellar(benji)).unwrap(), PriceData { price: 1_000_000, timestamp: 900 });
+        // The base asset is exactly 1.0.
+        assert_eq!(pool.load_price(&id, &base), 10_000_000);
+    }
+
+    #[test]
+    fn a_blend_v2_pool_halts_when_our_rules_say_there_is_no_valid_price() {
+        let env = Env::default();
+        let (id, feed_client, benji, _base) = feed(&env);
+        let pool = blend(&env);
+        // Stale by our 4h source limit, yet younger than Blend's own 24h window:
+        // returning the old price would let Blend lend against it for 20 more hours.
+        env.ledger().set_timestamp(1000 + 14_401);
+        assert_eq!(feed_client.lastprice(&Asset::Stellar(benji.clone())), None);
+        assert!(pool.try_load_price(&id, &benji).is_err(), "Blend must halt, not use a stale price");
+
+        // Paused sleeve (deviation) also yields no price.
+        env.ledger().set_timestamp(2000);
+        let oracle = NavOracleClient::new(&env, &id);
+        oracle.update_price(&Symbol::new(&env, "BENJI_NAV"), &1_000_000, &200_000, &2000);
+        oracle.update_price(&Symbol::new(&env, "REFLECTOR_BENJI"), &1_200_000, &200_000, &2000);
+        assert!(oracle.is_sleeve_paused(&Symbol::new(&env, "USD_GOV_FUNDS")));
+        assert_eq!(feed_client.lastprice(&Asset::Stellar(benji.clone())), None);
+        assert!(pool.try_load_price(&id, &benji).is_err());
+    }
+
+    #[test]
+    fn unknown_assets_return_none() {
+        let env = Env::default();
+        let (_id, feed_client, _benji, _base) = feed(&env);
+        assert_eq!(feed_client.lastprice(&Asset::Stellar(Address::generate(&env))), None);
+        assert_eq!(feed_client.lastprice(&Asset::Other(Symbol::new(&env, "USD"))), None);
+        assert_eq!(feed_client.prices(&Asset::Other(Symbol::new(&env, "USD")), &1), None);
+        assert_eq!(feed_client.price(&Asset::Other(Symbol::new(&env, "USD")), &900), None);
+    }
+
+    #[test]
+    fn history_is_on_the_resolution_grid_newest_first() {
+        let env = Env::default();
+        let (id, feed_client, benji, _base) = feed(&env); // snapshot @ bucket 900 (price 1.00)
+        let oracle = NavOracleClient::new(&env, &id);
+        let a = Asset::Stellar(benji.clone());
+        for (t, p) in [(1300u64, 1_002_000i128), (1700, 1_004_000), (1750, 1_005_000)] {
+            env.ledger().set_timestamp(t);
+            oracle.update_price(&Symbol::new(&env, "BENJI_NAV"), &p, &200_000, &t);
+            oracle.update_price(&Symbol::new(&env, "REFLECTOR_BENJI"), &(p + 5_000), &200_000, &t);
+        }
+        // Buckets: 900 -> 1.000, 1200 -> 1.002, 1500 -> 1.005 (1700 and 1750 share a bucket; latest wins).
+        let h = feed_client.prices(&a, &10).unwrap();
+        assert_eq!(h, vec![&env,
+            PriceData { price: 1_005_000, timestamp: 1500 },
+            PriceData { price: 1_002_000, timestamp: 1200 },
+            PriceData { price: 1_000_000, timestamp: 900 }]);
+        assert_eq!(feed_client.prices(&a, &2).unwrap().len(), 2);
+        assert_eq!(feed_client.prices(&a, &0), None);
+        assert_eq!(feed_client.prices(&a, &21), None, "Reflector-compatible cap of 20 records");
+        // Unaligned timestamps floor to their bucket; gaps and the future are None.
+        assert_eq!(feed_client.price(&a, &1299).unwrap(), PriceData { price: 1_002_000, timestamp: 1200 });
+        assert_eq!(feed_client.price(&a, &(RES * 2)), None);
+        assert_eq!(feed_client.price(&a, &99_999), None);
+    }
+
+    #[test]
+    fn no_history_is_recorded_while_the_asset_has_no_valid_price() {
+        let env = Env::default();
+        let (id, feed_client, benji, _base) = feed(&env);
+        let oracle = NavOracleClient::new(&env, &id);
+        env.ledger().set_timestamp(2000);
+        oracle.update_price(&Symbol::new(&env, "REFLECTOR_BENJI"), &1_300_000, &200_000, &2000); // deviation -> paused
+        let h = feed_client.prices(&Asset::Stellar(benji), &20).unwrap();
+        assert_eq!(h.len(), 1, "the deviating write must not be recorded as a price");
+        assert_eq!(h.get(0).unwrap().timestamp, 900);
     }
 }
