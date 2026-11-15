@@ -724,3 +724,19 @@ fn p4_amendment_does_not_take_effect_before_the_notice_period() {
     assert_eq!(s.policy.get_policy_hash(&s.vault_id), amended);
     assert_eq!(s.policy.get_policy_config(&s.vault_id).unwrap().min_liquidity_sleeve_bps, 0);
 }
+
+// ---------------------------------------------------------------------------
+// W3 (caps) — the vault accepted unlimited deposits. AGENT-RULES Rule 6: all
+// new contracts start with TVL caps and per-user caps; ROADMAP 3.2: $1M TVL cap.
+// ---------------------------------------------------------------------------
+#[test]
+fn w3_deposits_are_capped() {
+    let s = deploy_stack();
+    let whale = Address::generate(&s.env);
+    let huge = 10_000_000 * ONE; // $10M
+    s.usdc_admin.mint(&whale, &huge);
+
+    assert!(s.vault.max_deposit(&whale) < i128::MAX, "max_deposit must report a finite cap");
+    assert!(s.vault.try_deposit(&huge, &whale).is_err(), "a $10M deposit must exceed the caps");
+    assert_eq!(s.usdc.balance(&whale), huge, "rejected deposit moves no funds");
+}
