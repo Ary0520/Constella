@@ -26,8 +26,13 @@ docker run --rm \
   -e CARGO_TARGET_DIR=/work/contracts/target \
   -v constella-cargo-registry:/usr/local/cargo/registry \
   constella-stellar-build:30.0.1 \
-  stellar contract build
+  stellar contract build --locked
 ```
+
+`--locked` fails the build if `contracts/Cargo.lock` would change, so every
+release WASM is built from exactly the committed, reviewed dependency set. To
+upgrade a dependency, change `Cargo.toml`, regenerate the lock, run the full
+test suite, and commit both files together.
 
 Artifacts: `contracts/target/wasm32v1-none/release/constella_*.wasm`.
 
