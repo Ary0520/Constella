@@ -157,6 +157,12 @@ pub trait NavOracleTrait {
 
     /// Inspect sleeve config
     fn get_sleeve_config(env: Env, sleeve_id: Symbol) -> Option<SleeveOracleConfig>;
+
+    /// Inspect all source IDs for a sleeve
+    fn get_sleeve_sources(env: Env, sleeve_id: Symbol) -> Vec<Symbol>;
+
+    /// Inspect all sources across all registered assets
+    fn get_sources(env: Env) -> Vec<OracleSource>;
 }
 
 fn sort_sources_by_price(mut sources: Vec<OracleSource>) -> Vec<OracleSource> {
@@ -823,6 +829,44 @@ impl NavOracleTrait for NavOracle {
 
     fn get_sleeve_config(env: Env, sleeve_id: Symbol) -> Option<SleeveOracleConfig> {
         env.storage().instance().get(&DataKey::SleeveConfig(sleeve_id))
+    }
+
+    fn get_sleeve_sources(env: Env, sleeve_id: Symbol) -> Vec<Symbol> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SleeveSources(sleeve_id))
+            .unwrap_or_else(|| Vec::new(&env))
+    }
+
+    fn get_sources(env: Env) -> Vec<OracleSource> {
+        let mut sources: Vec<OracleSource> = Vec::new(&env);
+        let assets = Self::assets(env.clone());
+        for asset in assets.iter() {
+            let asset_sources: Vec<Symbol> = env
+                .storage()
+                .instance()
+                .get(&DataKey::AssetSources(asset))
+                .unwrap_or_else(|| Vec::new(&env));
+            for src_id in asset_sources.iter() {
+                if let Some(src) = env
+                    .storage()
+                    .instance()
+                    .get::<_, OracleSource>(&DataKey::Source(src_id))
+                {
+                    let mut exists = false;
+                    for s in sources.iter() {
+                        if s.source_id == src.source_id {
+                            exists = true;
+                            break;
+                        }
+                    }
+                    if !exists {
+                        sources.push_back(src);
+                    }
+                }
+            }
+        }
+        sources
     }
 }
 
