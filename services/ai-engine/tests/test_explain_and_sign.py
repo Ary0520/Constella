@@ -3,6 +3,7 @@ TDD Test Suite for Slice 3: Thesis Engine Explain & Sign (Steps 5 & 6)
 Written FIRST before implementation code is created.
 """
 
+from tests.fixtures import fixture_registry
 import pytest
 import json
 import hashlib
@@ -49,7 +50,7 @@ def test_t14_asset_rationales_and_diff():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -78,7 +79,7 @@ def test_t15_concentration_warning_trigger():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -186,7 +187,7 @@ def test_t17_policy_hash_bytes_and_hex():
 
     thesis = "Park runway."
     policy = parse_thesis(thesis, jurisdiction="non-US", investor_class="retail")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -225,7 +226,7 @@ def test_t18_full_pipeline_end_to_end():
     assert policy.currency_exposure["USD"] == 0.80
 
     # 2. Retrieve
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     assert len(candidates) >= 3
 
@@ -272,7 +273,7 @@ def test_t19_ambiguity_clarifications_and_unsupported_assets():
 
     thesis = "Allocate 50% to TSLA stock, 30% to BTC, and 20% to safe dollar T-bills."
     policy = parse_thesis(thesis, jurisdiction="non-US", investor_class="retail")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 

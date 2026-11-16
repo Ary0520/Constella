@@ -3,6 +3,7 @@ TDD Test Suite for Slice 2: Thesis Engine Optimise & Simulate (Steps 3 & 4)
 Written FIRST before implementation code is created.
 """
 
+from tests.fixtures import fixture_registry
 import pytest
 import pandas as pd
 import numpy as np
@@ -41,7 +42,7 @@ def test_t05_hrp_and_constrained_weights_sum_and_caps():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     result = optimize_portfolio(policy, candidates)
@@ -76,7 +77,7 @@ def test_t06_currency_matching_constraint():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     result = optimize_portfolio(policy, candidates)
@@ -105,7 +106,7 @@ def test_t07_redemption_ladder_breakdown():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -135,7 +136,7 @@ def test_t08_stress_simulations_depeg_and_freeze():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -162,7 +163,7 @@ def test_t09_mandatory_legal_disclaimer():
 
     thesis = "Park runway."
     policy = parse_thesis(thesis, jurisdiction="non-US", investor_class="retail")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -183,7 +184,7 @@ def test_t10_hrp_with_historical_returns_dataframe():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     np.random.seed(42)
@@ -218,7 +219,7 @@ def test_t11_simulation_with_custom_historical_nav():
 
     thesis = "Park runway."
     policy = parse_thesis(thesis, jurisdiction="non-US", investor_class="retail")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -259,7 +260,7 @@ def test_t13_exit_hours_derivation():
     # Runway thesis: assets are tier 0 (cash) and tier 1 (T-bills) -> 24 hours
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
     sim_report = simulate_portfolio(opt_result.weights, candidates, policy)

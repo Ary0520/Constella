@@ -83,21 +83,22 @@ class AssetCandidate(BaseModel):
     currency: str
     liquidity_tier: int = 1  # 0: instant, 1: 24h, 2: 1 week
     permissionless: bool = False
-    requires_professional: bool = False
-    requires_institutional: bool = False
     blocked_jurisdictions: List[str] = Field(default_factory=list)
+    # Audit A3: issuer rules and status as recorded ON CHAIN (registry).
+    eligible_jurisdictions: List[str] = Field(default_factory=list)  # empty = all
+    issuer_investor_classes: List[str] = Field(default_factory=list)  # empty = all
+    is_active: bool = True
     contract_address: str = ""
+    # Audit A3: no invented yields. 0.0 means "unknown" until a live yield
+    # source exists (e.g. Blend b_rate); fixtures label their values.
     current_yield_pct: float = 0.0
     tags: List[str] = Field(default_factory=list)
     description: str = ""
 
     @property
     def investor_classes_required(self) -> List[str]:
-        if self.requires_institutional:
-            return ["institutional"]
-        if self.requires_professional:
-            return ["professional", "institutional"]
-        return ["retail", "professional", "institutional"]
+        """The issuer's class requirement (on-chain); empty = all classes."""
+        return list(self.issuer_investor_classes)
 
 
 class OptimizationResult(BaseModel):
