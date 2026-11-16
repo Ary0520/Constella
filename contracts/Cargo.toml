@@ -11,6 +11,7 @@ members = [
     "fee-sponsor",
     "webauthn-verifier",
     "threshold-policy",
+    "testkit",
 ]
 
 [workspace.package]

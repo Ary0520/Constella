@@ -1,0 +1,16 @@
+[package]
+name = "constella-testkit"
+description = "Dev-only test fixtures (never deployed): the real Blend v2 environment from verified mainnet WASMs."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+# rlib only: `stellar contract build` builds cdylib crates, so this crate can
+# never end up in a release WASM.
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
