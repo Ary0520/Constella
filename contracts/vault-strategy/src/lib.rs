@@ -261,6 +261,13 @@ pub enum VaultError {
     SlippageExceeded = 25,
     /// The pending router change's 48h delay has not elapsed / none pending.
     RouterNotReady = 26,
+    /// After the trades, the vault's actual holdings (measured balances at
+    /// per-asset median prices) breach the signed policy's bands, caps or
+    /// liquidity floor (audit W1b). The whole rebalance reverts.
+    AllocationOutOfPolicy = 27,
+    /// A sleeve's target weight differs from the signed policy's target, or
+    /// the policy does not declare the sleeve at all (audit W1b).
+    SleeveTargetMismatch = 28,
 }
 
 /// Timelock between proposing and executing a WASM upgrade (CONTRACTS-SPEC:
@@ -515,6 +522,8 @@ pub struct PolicySleeveTargetRef {
 pub trait PolicyInterface {
     fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfigRef>;
     fn validate_rebalance(env: Env, vault: Address, proposal: RebalanceProposal) -> ValidationResult;
+    fn validate_holdings(env: Env, vault: Address, holdings: Vec<(Symbol, i128)>) -> ValidationResult;
+    fn get_sleeve_targets(env: Env, vault: Address) -> Vec<PolicySleeveTargetRef>;
     fn register_policy(
         env: Env,
         vault: Address,
@@ -702,6 +711,34 @@ fn sleeve_value(
     }
     let value = held.checked_mul(pd.price).ok_or(VaultError::MathOverflow)? / scale;
     Ok((value, pd.timestamp))
+}
+
+/// Audit W1b: value every sleeve as actually held (measured balance, capped
+/// by the booked balance, at its asset's median price; cash at face value)
+/// under its registry asset ID, and require the signed policy to accept the
+/// result. A missing price stops with `OracleUnavailable` (Rule 5); a policy
+/// rejection stops with `AllocationOutOfPolicy`. Panics revert the trades.
+fn check_actual_allocation(env: &Env, config: &VaultConfig, sleeves: &Vec<SleeveState>) {
+    let oracle = NavOracleClient::new(env, &config.oracle_contract);
+    let registry = AssetRegistryClient::new(env, &config.registry_contract);
+    let scale = share_scale(env);
+    let mut holdings: Vec<(Symbol, i128)> = Vec::new(env);
+    for sleeve in sleeves.iter() {
+        let id = match registry.get_asset_by_address(&sleeve.contract_address) {
+            Some(e) if e.is_active => e.asset_id,
+            _ => panic_with_error!(env, VaultError::AssetNotRegistered),
+        };
+        let value = match sleeve_value(env, &oracle, &sleeve, NavKind::Deposit, scale) {
+            Ok((v, _)) => v,
+            Err(e) => panic_with_error!(env, e),
+        };
+        holdings.push_back((id, value));
+    }
+    let verdict = PolicyClient::new(env, &config.policy_contract)
+        .validate_holdings(&env.current_contract_address(), &holdings);
+    if !verdict.is_valid {
+        panic_with_error!(env, VaultError::AllocationOutOfPolicy);
+    }
 }
 
 /// Total value of all sleeves and the latest oracle timestamp involved.
@@ -1762,9 +1799,19 @@ impl StrategyVault {
     /// balance the vault has already recorded for that asset (0 for a new
     /// sleeve); any other value is rejected with `BalanceNotSettable`. A sleeve
     /// whose asset the vault still holds (recorded or real) cannot be removed.
+    ///
+    /// Audit W1b: once a policy is bound, the signed policy is the source of
+    /// truth for targets - every sleeve must be declared there with exactly
+    /// the signed target weight (`SleeveTargetMismatch` otherwise).
     pub fn set_sleeves(env: Env, sleeves: Vec<SleeveState>) {
         let config = get_config(&env);
         config.admin.require_auth();
+        let policy = PolicyClient::new(&env, &config.policy_contract);
+        let signed = if policy.get_policy_config(&env.current_contract_address()).is_some() {
+            Some(policy.get_sleeve_targets(&env.current_contract_address()))
+        } else {
+            None
+        };
 
         let existing: Vec<SleeveState> = env
             .storage()
@@ -1796,6 +1843,16 @@ impl StrategyVault {
             let (label, _) = registry_label(&env, &registry, &s.contract_address);
             if s.asset_id != label {
                 panic_with_error!(&env, VaultError::InvalidSleeveConfig);
+            }
+            if let Some(targets) = &signed {
+                let id = match registry.get_asset_by_address(&s.contract_address) {
+                    Some(e) => e.asset_id,
+                    None => panic_with_error!(&env, VaultError::AssetNotRegistered),
+                };
+                match targets.iter().find(|t| t.asset_id == id) {
+                    Some(t) if t.target_weight_bps == s.target_weight_bps => {}
+                    _ => panic_with_error!(&env, VaultError::SleeveTargetMismatch),
+                }
             }
 
             let mut recorded = 0i128;
@@ -1986,8 +2043,9 @@ impl StrategyVault {
     /// Execute a rebalance proposal (audit W1). The keeper submits; the signed
     /// policy must validate the proposal; every swap is measured on the
     /// vault's own balances and must deliver at least `min_amount_out`;
-    /// sleeve holdings are booked from those measured deltas only.
-    /// Post-trade band verification on actual holdings follows in W1b.
+    /// sleeve holdings are booked from those measured deltas only. Finally
+    /// (audit W1b) the vault's ACTUAL holdings - not the claimed
+    /// `weights_after` - must satisfy the signed bands, caps and floor.
     pub fn rebalance(env: Env, proposal: RebalanceProposal) {
         let keeper: Address = env.storage().instance().get(&DataKey::Keeper)
             .unwrap_or_else(|| panic_with_error!(&env, VaultError::Unauthorized));
@@ -2036,6 +2094,7 @@ impl StrategyVault {
             sleeves.set(i_out, s_out);
             RebalanceStep { proposer: keeper.clone(), asset_in: op.asset_in.clone(), asset_out: op.asset_out.clone(), spent, received }.publish(&env);
         }
+        check_actual_allocation(&env, &config, &sleeves);
         env.storage().instance().set(&DataKey::Sleeves, &sleeves);
         RebalanceComplete { proposer: keeper, steps: proposal.operations.len() }.publish(&env);
     }

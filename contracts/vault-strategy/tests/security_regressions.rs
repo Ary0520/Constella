@@ -1365,11 +1365,13 @@ mod w1 {
         pub(super) eurc_admin: token::StellarAssetClient<'static>,
         pub(super) router: soroswap_router::Client<'static>,
         pub(super) keeper: Address,
+        pub(super) depositor: Address,
         pub(super) now: u64,
     }
 
     /// Full stack + EURC sleeve + a real Soroswap USDC/EURC pool at 1.08 with
-    /// 1.08M / 1M liquidity, the router configured through the 48h delay,
+    /// 10.8M / 10M liquidity (deep enough that a 5_000 USDC trade stays inside
+    /// the signed 0.5 % value slippage: 0.3 % fee + ~0.05 % impact), the router configured through the 48h delay,
     /// oracle feeds refreshed, a keeper, and 10_000 USDC deposited.
     pub(super) fn setup() -> R {
         setup_with(|s| usdc_eurc_policy(s))
@@ -1397,9 +1399,9 @@ mod w1 {
         let router = soroswap_router::Client::new(env, &env.register(soroswap_router::WASM, ()));
         router.initialize(&factory.address);
         let lp = Address::generate(env);
-        s.usdc_admin.mint(&lp, &(1_080_000 * ONE));
-        eurc_admin.mint(&lp, &(1_000_000 * ONE));
-        router.add_liquidity(&s.usdc_addr, &eurc, &(1_080_000 * ONE), &(1_000_000 * ONE), &0, &0, &lp, &(T0 + 10_000));
+        s.usdc_admin.mint(&lp, &(10_800_000 * ONE));
+        eurc_admin.mint(&lp, &(10_000_000 * ONE));
+        router.add_liquidity(&s.usdc_addr, &eurc, &(10_800_000 * ONE), &(10_000_000 * ONE), &0, &0, &lp, &(T0 + 10_000));
 
         // Router through the 48h delay (a router can move vault funds).
         s.vault.propose_router(&VaultRoute::Soroswap, &router.address);
@@ -1415,7 +1417,7 @@ mod w1 {
         let alice = Address::generate(env);
         s.usdc_admin.mint(&alice, &(10_000 * ONE));
         s.vault.deposit(&(10_000 * ONE), &alice, &alice, &alice);
-        let r = R { s, eurc, eurc_admin, router, keeper, now };
+        let r = R { s, eurc, eurc_admin, router, keeper, depositor: alice, now };
         let _ = &r.eurc_admin;
         r
     }
@@ -1560,6 +1562,7 @@ mod w1b {
 
     const ALLOCATION_OUT_OF_POLICY: u32 = 27;
     const ORACLE_UNAVAILABLE: u32 = 10;
+    const SLEEVE_TARGET_MISMATCH: u32 = 28;
 
     fn claim(r: &R, usdc_bps: u32, eurc_bps: u32, amount_in: i128) -> constella_vault_strategy::RebalanceProposal {
         let env = &r.s.env;
@@ -1622,6 +1625,174 @@ mod w1b {
         as_keeper(&r, &ok);
         r.s.vault.rebalance(&ok);
         assert_eq!(holdings(&r).0, 7_000 * ONE);
+    }
+
+    const LIQUIDITY_FLOOR_BREACHED: u32 = 9;
+    const EXCEEDS_REDEMPTION_CAPACITY: u32 = 8;
+
+    /// Spec formula (CONTRACTS-SPEC redemption capacity): cash that can leave
+    /// while cash / total stays >= floor.
+    fn instant(cash: i128, total: i128, floor_bps: i128) -> i128 {
+        (cash * 10_000 - total * floor_bps) / (10_000 - floor_bps)
+    }
+
+    /// Formerly src/test.rs `test_t46_liquidity_sleeve_floor_protection`
+    /// (ignored since audit V2 because its holdings were fabricated). Now the
+    /// 20 / 80 basket is bought through real Soroswap and every expected value
+    /// is derived from the measured balances and oracle prices.
+    #[test]
+    fn the_liquidity_floor_limits_instant_redemptions_on_real_holdings() {
+        let r = setup_with(|s| usdc_eurc_policy_with(s, (1000, 3000), (7000, 9000), "eur_sovereign", 1000));
+        let p = claim(&r, 2000, 8000, 8_000 * ONE);
+        as_keeper(&r, &p);
+        r.s.env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        let (cash, eurc) = holdings(&r);
+        assert_eq!(cash, 2_000 * ONE);
+        let eurc_value = eurc * 108 / 100;
+        let total = cash + eurc_value;
+        assert_eq!(r.s.vault.total_assets(), total);
+        let cap = r.s.vault.get_redemption_capacity();
+        assert_eq!(cap.instant, instant(cash, total, 1000));
+        assert_eq!(cap.in_24h, eurc_value, "EURC is a tier-0 sleeve");
+        assert!(cap.instant > 1_000 * ONE && cap.instant < cash);
+
+        r.s.env.mock_all_auths();
+        let holder = holder(&r);
+        // Inside instant capacity: paid.
+        r.s.vault.withdraw(&(500 * ONE), &holder, &holder, &holder);
+        let cash = cash - 500 * ONE;
+        let total = total - 500 * ONE;
+        let room = r.s.vault.get_redemption_capacity().instant;
+        assert_eq!(room, instant(cash, total, 1000));
+        // Beyond the floor but within cash: LiquidityFloorBreached.
+        assert_eq!(
+            r.s.vault.try_withdraw(&(room + ONE), &holder, &holder, &holder).unwrap_err().unwrap(),
+            contract_error(LIQUIDITY_FLOOR_BREACHED)
+        );
+        // Beyond the cash itself: ExceedsRedemptionCapacity.
+        assert_eq!(
+            r.s.vault.try_withdraw(&(cash + 1), &holder, &holder, &holder).unwrap_err().unwrap(),
+            contract_error(EXCEEDS_REDEMPTION_CAPACITY)
+        );
+        // The EURC feeds are visible through the registry lookup.
+        assert!(r.s.vault.get_oracle_status().iter().any(|o| o.source_id == Symbol::new(&r.s.env, "EURC_A")));
+    }
+
+    /// Formerly `test_exact_liquidity_floor_boundary`: withdrawing exactly the
+    /// instant capacity lands cash on the floor (to the stroop), after which
+    /// capacity is 0 and even one more stroop is refused.
+    #[test]
+    fn redeeming_exactly_to_the_floor_leaves_zero_capacity() {
+        let r = setup_with(|s| usdc_eurc_policy_with(s, (500, 1500), (8500, 9500), "eur_sovereign", 1000));
+        let p = claim(&r, 1000, 9000, 9_000 * ONE);
+        as_keeper(&r, &p);
+        r.s.env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        r.s.env.mock_all_auths();
+        let holder = holder(&r);
+        let room = r.s.vault.get_redemption_capacity().instant;
+        assert!(room > 0, "a little over 10 % cash after swap fees");
+        assert_eq!(r.s.vault.max_withdraw(&holder), room);
+        r.s.vault.withdraw(&room, &holder, &holder, &holder);
+
+        let (cash, eurc) = holdings(&r);
+        let total = cash + eurc * 108 / 100;
+        assert!(cash * 10_000 >= total * 1000, "never below the floor");
+        assert!(cash * 10_000 - total * 1000 < 9000, "on the floor to the stroop");
+        assert_eq!(r.s.vault.get_redemption_capacity().instant, 0);
+        assert_eq!(r.s.vault.max_withdraw(&holder), 0);
+        assert_eq!(r.s.vault.max_redeem(&holder), 0);
+        let floor = contract_error(LIQUIDITY_FLOOR_BREACHED);
+        assert_eq!(r.s.vault.try_withdraw(&1, &holder, &holder, &holder).unwrap_err().unwrap(), floor);
+        assert_eq!(r.s.vault.try_redeem(&ONE, &holder, &holder, &holder).unwrap_err().unwrap(), floor);
+    }
+
+    /// Formerly `test_dual_nav_asymmetric_max_redeem` (its 50 % feed spread is
+    /// impossible since O5 caps the breaker at 5 %). After a real purchase the
+    /// two EURC feeds diverge within the 2 % breaker: redemptions are priced at
+    /// the conservative (minimum) NAV, so max_redeem never pays out more cash
+    /// than the vault has - at the median NAV the same shares would.
+    #[test]
+    fn redemptions_use_the_conservative_nav_after_a_real_purchase() {
+        let r = setup_with(|s| usdc_eurc_policy_with(s, (0, 10_000), (0, 10_000), "eur_sovereign", 0));
+        let p = claim(&r, 5000, 5000, 5_000 * ONE);
+        as_keeper(&r, &p);
+        r.s.env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        r.s.env.mock_all_auths();
+        // One EURC feeder now reports 1.065 (1.4 % below the other).
+        r.s.oracle.update_price(&Symbol::new(&r.s.env, "EURC_B"), &(ONE * 1065 / 1000), &200_000, &r.now);
+        let low = r.s.oracle.collateral_price(&r.eurc).unwrap().price;
+        let med = r.s.oracle.asset_price(&r.eurc).unwrap().price;
+        assert_eq!(low, ONE * 1065 / 1000);
+        assert!(med > low);
+
+        let (cash, eurc) = holdings(&r);
+        assert_eq!(cash, 5_000 * ONE);
+        let supply = r.s.vault.total_supply();
+        let cons = (cash + eurc * low / ONE) * ONE / supply;
+        let dep = (cash + eurc * med / ONE) * ONE / supply;
+        assert_eq!(r.s.vault.get_nav_conservative().unwrap().price, cons);
+        assert_eq!(r.s.vault.get_nav_deposit().unwrap().price, dep);
+
+        let holder = holder(&r);
+        assert_eq!(r.s.vault.get_redemption_capacity().instant, cash, "0 % floor: all cash");
+        let max_red = r.s.vault.max_redeem(&holder);
+        assert_eq!(max_red, cash * ONE / cons);
+        assert!(max_red * dep / ONE > cash, "at the median NAV these shares would overdraw the cash");
+        let out = r.s.vault.redeem(&max_red, &holder, &holder, &holder);
+        assert!(out <= cash && out >= cash - 1, "paid at the conservative NAV: {out}");
+    }
+
+    /// Once a policy is bound, the vault's sleeve targets come from it: the
+    /// admin can neither re-weight a sleeve nor add one the policy does not
+    /// declare.
+    #[test]
+    fn sleeve_targets_must_match_the_signed_policy() {
+        let r = setup();
+        let env = &r.s.env;
+        r.s.env.mock_all_auths();
+        let current = r.s.vault.get_sleeves();
+        // Re-weighting to 60 / 40 contradicts the signed 50 / 50.
+        let mut reweighted = current.clone();
+        let mut a = reweighted.get(0).unwrap();
+        a.target_weight_bps = 6000;
+        reweighted.set(0, a);
+        let mut b = reweighted.get(1).unwrap();
+        b.target_weight_bps = 4000;
+        reweighted.set(1, b);
+        assert_eq!(r.s.vault.try_set_sleeves(&reweighted).unwrap_err().unwrap(), contract_error(SLEEVE_TARGET_MISMATCH));
+        // A registered asset the policy does not declare cannot become a sleeve.
+        let other = r.s.env.register_stellar_asset_contract_v2(Address::generate(env)).address();
+        AssetRegistryClient::new(env, &r.s.registry_id).add_asset(&AssetEntry {
+            contract_address: other.clone(),
+            asset_id: Symbol::new(env, "OTHER"),
+            issuer: Symbol::new(env, "SOMEONE"),
+            sleeve_type: RegSleeve::Cash,
+            liquidity_tier: 0,
+            permissionless: true,
+            oracle_sources: Vec::from_array(env, [Symbol::new(env, "OTHER_A"), Symbol::new(env, "OTHER_B")]),
+            eligible_jurisdictions: Vec::new(env),
+            blocked_jurisdictions: Vec::new(env),
+            investor_classes_required: Vec::new(env),
+            is_active: true,
+            added_at: T0,
+        });
+        let mut extra = current.clone();
+        extra.push_back(SleeveState { asset_id: String::from_str(env, "OTHER"), contract_address: other, target_weight_bps: 0,
+            band_bps: 0, current_balance: 0, sleeve_type: SleeveType::EurSovereign, liquidity_tier: 0 });
+        assert_eq!(r.s.vault.try_set_sleeves(&extra).unwrap_err().unwrap(), contract_error(SLEEVE_TARGET_MISMATCH));
+        // The layout that matches the signed targets is accepted.
+        r.s.vault.set_sleeves(&current);
+        assert_eq!(r.s.vault.get_sleeves(), current);
+    }
+
+    /// The setup's only depositor (holds every share).
+    fn holder(r: &R) -> Address {
+        let h = r.depositor.clone();
+        assert_eq!(r.s.vault.balance(&h), r.s.vault.total_supply());
+        h
     }
 
     /// Audit V4 regression on a REAL acquisition: once a sleeve holds EURC
