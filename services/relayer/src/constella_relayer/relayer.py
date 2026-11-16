@@ -1,7 +1,11 @@
 """Constella sponsor relayer (audit F1): pays the network fee for a user's
 Soroban call, within on-chain quotas.
 
-Flow for `submit(func, auth)` (one at a time per relayer account, under a lock):
+Decision D-I: a POOL of relayer accounts (all in the fee-sponsor's relayer
+set). Each account processes one request at a time under its own lock, so
+throughput grows with the pool while every guarantee below holds per account.
+
+Flow for `submit(func, auth)` on a free pool account:
   1. `gateway.validate` - pure request checks (see gateway.py).
   2. The target must be whitelisted on the fee-sponsor contract (on-chain
      source of truth, not local config alone).
@@ -33,6 +37,7 @@ from .gateway import MAX_FUNC_XDR_BYTES, Rejected, _decode, validate
 
 @dataclass(frozen=True)
 class Submitted:
+    relayer: str
     hash: str
     user: str
     contract: str
@@ -47,7 +52,7 @@ class Relayer:
         self,
         server: SorobanServer,
         network_passphrase: str,
-        keypair: Keypair,
+        keypairs: list[Keypair],
         sponsor_contract: str,
         allowed: dict[str, frozenset[str]],
         max_fee_stroops: int,
@@ -56,32 +61,48 @@ class Relayer:
     ):
         if max_fee_stroops <= inclusion_fee:
             raise ValueError("max_fee_stroops must exceed the inclusion fee")
+        if not keypairs or len({k.public_key for k in keypairs}) != len(keypairs):
+            raise ValueError("need one or more distinct relayer keypairs")
         self.server = server
         self.passphrase = network_passphrase
-        self.keypair = keypair
+        self.keypairs = list(keypairs)
         self.sponsor = sponsor_contract
         self.allowed = allowed
         self.max_fee = max_fee_stroops
         self.inclusion_fee = inclusion_fee
         self.timeout = timeout_seconds
-        self.relayer_addresses = frozenset({keypair.public_key})
-        self._lock = threading.Lock()
+        self.relayer_addresses = frozenset(k.public_key for k in keypairs)
+        self._locks = [threading.Lock() for _ in keypairs]
+        self._next = 0
+        self._pick = threading.Lock()
 
     # ---------------------------------------------------------------- helpers
-    def _builder(self, sequence: int) -> TransactionBuilder:
-        return TransactionBuilder(Account(self.keypair.public_key, sequence), self.passphrase,
+    def _builder(self, source: str, sequence: int) -> TransactionBuilder:
+        return TransactionBuilder(Account(source, sequence), self.passphrase,
                                   base_fee=self.inclusion_fee).set_timeout(self.timeout)
 
+    def _acquire(self) -> int:
+        """A free pool account (its lock held), else wait on the next in turn."""
+        for i, lock in enumerate(self._locks):
+            if lock.acquire(blocking=False):
+                return i
+        with self._pick:
+            i = self._next
+            self._next = (self._next + 1) % len(self._locks)
+        self._locks[i].acquire()
+        return i
+
     def _view(self, fn: str, args: list[xdr.SCVal]):
-        seq = self.server.load_account(self.keypair.public_key).sequence
-        tx = self._builder(seq).append_invoke_contract_function_op(self.sponsor, fn, args).build()
+        source = self.keypairs[0].public_key
+        seq = self.server.load_account(source).sequence
+        tx = self._builder(source, seq).append_invoke_contract_function_op(self.sponsor, fn, args).build()
         sim = self.server.simulate_transaction(tx)
         if sim.error:
             raise Rejected("SPONSOR_UNAVAILABLE", f"{fn}: {sim.error}")
         return scval.to_native(xdr.SCVal.from_xdr(sim.results[0].xdr))
 
-    def _send(self, tx) -> tuple[str, int]:
-        tx.sign(self.keypair)
+    def _send(self, tx, kp: Keypair) -> tuple[str, int]:
+        tx.sign(kp)
         sent = self.server.send_transaction(tx)
         if sent.status not in (SendTransactionStatus.PENDING, SendTransactionStatus.DUPLICATE):
             raise Rejected("SEND_FAILED", f"{sent.status} {sent.error_result_xdr}")
@@ -108,8 +129,9 @@ class Relayer:
         function = host_fn.invoke_contract.function_name.sc_symbol.decode()
         if function not in self.allowed.get(contract, frozenset()):
             raise Rejected("FUNCTION_NOT_ALLOWED", f"{contract}.{function}")
-        seq = self.server.load_account(self.keypair.public_key).sequence
-        tx = self._builder(seq).append_operation(InvokeHostFunction(host_function=host_fn, auth=[])).build()
+        source = self.keypairs[0].public_key
+        seq = self.server.load_account(source).sequence
+        tx = self._builder(source, seq).append_operation(InvokeHostFunction(host_function=host_fn, auth=[])).build()
         sim = self.server.simulate_transaction(tx, auth_mode=AuthMode.RECORD)
         if sim.error:
             raise Rejected("SIMULATION_FAILED", sim.error)
@@ -117,11 +139,14 @@ class Relayer:
 
     def submit(self, func_b64: str, auth_b64: list[str]) -> Submitted:
         v = validate(func_b64, auth_b64, self.allowed, self.relayer_addresses)
-        with self._lock:
-            if self._view("is_whitelisted", [scval.to_address(v.contract)]) is not True:
-                raise Rejected("TARGET_NOT_WHITELISTED", v.contract)
-            seq = self.server.load_account(self.keypair.public_key).sequence
-            user_tx = self._builder(seq + 1).append_operation(
+        if self._view("is_whitelisted", [scval.to_address(v.contract)]) is not True:
+            raise Rejected("TARGET_NOT_WHITELISTED", v.contract)
+        i = self._acquire()
+        try:
+            kp = self.keypairs[i]
+            me = kp.public_key
+            seq = self.server.load_account(me).sequence
+            user_tx = self._builder(me, seq + 1).append_operation(
                 InvokeHostFunction(host_function=v.host_function, auth=v.auth)).build()
             try:
                 # Auth entries are present, so the simulation ENFORCES them:
@@ -132,18 +157,19 @@ class Relayer:
             fee = prepared.transaction.fee
             if fee > self.max_fee:
                 raise Rejected("FEE_TOO_HIGH", f"{fee} > {self.max_fee}")
-            record = self._builder(seq).append_invoke_contract_function_op(
+            record = self._builder(me, seq).append_invoke_contract_function_op(
                 self.sponsor, "record_sponsored_op",
-                [scval.to_address(v.user), scval.to_address(v.contract), scval.to_uint64(fee)]).build()
+                [scval.to_address(me), scval.to_address(v.user), scval.to_address(v.contract), scval.to_uint64(fee)]).build()
             try:
                 record = self.server.prepare_transaction(record)
             except PrepareTransactionException as e:
                 raise Rejected("SPONSOR_REFUSED", str(e.simulate_transaction_response.error)) from None
-            record_hash, record_fee = self._send(record)
-            tx_hash, fee_charged = self._send(prepared)
-            return Submitted(hash=tx_hash, user=v.user, contract=v.contract, function=v.function,
+            record_hash, record_fee = self._send(record, kp)
+            tx_hash, fee_charged = self._send(prepared, kp)
+            return Submitted(relayer=me, hash=tx_hash, user=v.user, contract=v.contract, function=v.function,
                              fee_charged=fee_charged, record_hash=record_hash, record_fee_charged=record_fee)
-
+        finally:
+            self._locks[i].release()
 
 def func_b64(contract: str, function: str, args: list[xdr.SCVal]) -> str:
     """Encode an InvokeContract host function (what a client sends)."""

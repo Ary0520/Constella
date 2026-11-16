@@ -54,9 +54,10 @@ deploy() { local name=$1; shift; local id
   [[ $id == C* ]] || fail "$name deploy: $(tail -3 "$WORK/err")"; echo "$id"; }
 invoke() { cli contract invoke --source "$@" >/dev/null 2>"$WORK/err" || fail "invoke $*: $(tail -3 "$WORK/err")"; }
 
-for k in admin issuer relayer viewer; do keys generate $k >/dev/null 2>&1; fund "$(keys address $k)"; done
-ADMIN=$(keys address admin); ISSUER=$(keys address issuer); RELAYER=$(keys address relayer); VIEWER=$(keys address viewer)
-RELAYER_SECRET=$(keys show relayer)
+for k in admin issuer relayer1 relayer2 viewer; do keys generate $k >/dev/null 2>&1; fund "$(keys address $k)"; done
+ADMIN=$(keys address admin); ISSUER=$(keys address issuer); VIEWER=$(keys address viewer)
+R1=$(keys address relayer1); R2=$(keys address relayer2)
+RELAYER_SECRETS="$(keys show relayer1),$(keys show relayer2)"
 
 USDC=$(cli contract asset deploy --asset USDC:$ISSUER --source admin 2>"$WORK/err" | tail -1); [[ $USDC == C* ]] || fail "USDC: $(tail -3 "$WORK/err")"
 cli contract asset deploy --asset native --source admin >/dev/null 2>&1 || true
@@ -70,17 +71,22 @@ VAULT=$(deploy vault_strategy -- --config "{\"admin\":\"$ADMIN\",\"pause_authori
 VERIFIER=$(deploy webauthn_verifier)
 SPONSOR=$(deploy fee_sponsor -- --admin $ADMIN --max_ops_per_hour 10 --max_ops_per_day 50 --daily_budget_stroops 100000000)
 invoke admin --id $SPONSOR -- whitelist_contract --target $VAULT
-invoke admin --id $SPONSOR -- set_relayer --relayer $RELAYER
+invoke admin --id $SPONSOR -- add_relayer --relayer $R1
+invoke admin --id $SPONSOR -- add_relayer --relayer $R2
 
 py() { docker run --rm --network $NET -v "$ROOT/services/relayer:/svc" -v "$WORK:/work" -w /svc "$@"; }
 PUBKEY=$(py $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e ".[dev]" >/dev/null 2>&1; python tests/localnet_driver.py keygen /work/passkey.pem')
 [ ${#PUBKEY} = 130 ] || fail "passkey keygen: $PUBKEY"
 ACCOUNT=$(deploy smart_account -- --verifier $VERIFIER --owner_key $PUBKEY --name owner)
 invoke issuer --id $USDC -- mint --to $ACCOUNT --amount 10000000000
-echo "registry $REGISTRY  vault $VAULT  sponsor $SPONSOR  account $ACCOUNT  relayer $RELAYER"
+PUBKEY2=$(py $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e ".[dev]" >/dev/null 2>&1; python tests/localnet_driver.py keygen /work/passkey2.pem')
+[ ${#PUBKEY2} = 130 ] || fail "passkey2 keygen: $PUBKEY2"
+ACCOUNT2=$(deploy smart_account -- --verifier $VERIFIER --owner_key $PUBKEY2 --name owner)
+invoke issuer --id $USDC -- mint --to $ACCOUNT2 --amount 10000000000
+echo "registry $REGISTRY  vault $VAULT  sponsor $SPONSOR  accounts $ACCOUNT $ACCOUNT2  relayer pool $R1 $R2"
 
 docker run -d --rm --name $RELAY --network $NET -v "$ROOT/services/relayer:/svc" -w /svc \
-  -e CONSTELLA_RPC_URL=$RPC -e "CONSTELLA_NETWORK_PASSPHRASE=$PASS" -e RELAYER_SECRET="$RELAYER_SECRET" \
+  -e CONSTELLA_RPC_URL=$RPC -e "CONSTELLA_NETWORK_PASSPHRASE=$PASS" -e RELAYER_SECRETS="$RELAYER_SECRETS" \
   -e SPONSOR_CONTRACT_ID=$SPONSOR -e "SPONSOR_ALLOWED=$VAULT:deposit,redeem,withdraw,redeem_frozen" \
   -e RELAYER_HOST=0.0.0.0 -e RELAYER_PORT=8787 $PY_IMAGE \
   sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; constella-relayer' >/dev/null
@@ -91,9 +97,10 @@ for i in $(seq 1 60); do
 done
 
 drive() { py -e RPC=$RPC -e "PASS=$PASS" -e VIEWER=$VIEWER -e RELAYER_URL=http://$RELAY:8787 -e ACCOUNT=$ACCOUNT \
-  -e VAULT=$VAULT -e USDC=$USDC -e NATIVE=$NATIVE -e RELAYER=$RELAYER -e SPONSOR=$SPONSOR -e VERIFIER=$VERIFIER \
-  -e PASSKEY_PEM=/work/passkey.pem $PY_IMAGE sh -c "pip install -q --no-cache-dir --root-user-action=ignore -e '.[dev]' >/dev/null 2>&1; python tests/localnet_driver.py $1"; }
+  -e VAULT=$VAULT -e USDC=$USDC -e NATIVE=$NATIVE -e RELAYERS=$R1,$R2 -e SPONSOR=$SPONSOR -e VERIFIER=$VERIFIER \
+  -e ACCOUNT2=$ACCOUNT2 -e PASSKEY_PEM=/work/passkey.pem -e PASSKEY2_PEM=/work/passkey2.pem $PY_IMAGE sh -c "pip install -q --no-cache-dir --root-user-action=ignore -e '.[dev]' >/dev/null 2>&1; python tests/localnet_driver.py $1"; }
 drive run || fail "zero-gas run"
+drive parallel || fail "parallel run"
 invoke admin --id $SPONSOR -- pause
 drive paused || fail "paused run"
 echo "E2E PASS"

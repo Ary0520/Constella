@@ -9,7 +9,9 @@ Binds to 127.0.0.1 by default: put it behind your API gateway / rate limiter,
 never expose it directly (same advice as the OpenZeppelin Relayer docs).
 
 Configuration (environment only - the secret is never logged):
-  CONSTELLA_RPC_URL, CONSTELLA_NETWORK_PASSPHRASE, RELAYER_SECRET,
+  CONSTELLA_RPC_URL, CONSTELLA_NETWORK_PASSPHRASE,
+  RELAYER_SECRETS (comma-separated pool, D-I; each must be in the fee-sponsor's
+  relayer set) or RELAYER_SECRET (pool of one),
   SPONSOR_CONTRACT_ID, SPONSOR_ALLOWED ("C...:deposit,redeem;C...:fn"),
   RELAYER_MAX_FEE_STROOPS (default 1_000_000), RELAYER_HOST, RELAYER_PORT.
 """
@@ -59,7 +61,7 @@ def make_handler(relayer: Relayer):
 
         def do_GET(self):
             if self.path == "/health":
-                self._reply(200, {"ok": True, "relayer": relayer.keypair.public_key})
+                self._reply(200, {"ok": True, "relayers": [k.public_key for k in relayer.keypairs]})
             else:
                 self._reply(404, {"error": "NOT_FOUND"})
 
@@ -96,13 +98,13 @@ def cli() -> None:
     relayer = Relayer(
         server=SorobanServer(env["CONSTELLA_RPC_URL"]),
         network_passphrase=env["CONSTELLA_NETWORK_PASSPHRASE"],
-        keypair=Keypair.from_secret(env["RELAYER_SECRET"]),
+        keypairs=[Keypair.from_secret(x.strip()) for x in env.get("RELAYER_SECRETS", env.get("RELAYER_SECRET", "")).split(",") if x.strip()],
         sponsor_contract=env["SPONSOR_CONTRACT_ID"],
         allowed=parse_allowed(env["SPONSOR_ALLOWED"]),
         max_fee_stroops=int(env.get("RELAYER_MAX_FEE_STROOPS", "1000000")),
     )
     host, port = env.get("RELAYER_HOST", "127.0.0.1"), int(env.get("RELAYER_PORT", "8787"))
-    sys.stderr.write(f"constella-relayer {relayer.keypair.public_key} on {host}:{port}\n")
+    sys.stderr.write(f"constella-relayer pool of {len(relayer.keypairs)} on {host}:{port}\n")
     ThreadingHTTPServer((host, port), make_handler(relayer)).serve_forever()
 
 

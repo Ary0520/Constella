@@ -57,8 +57,8 @@ class Chain:
         return int(self.view(token, "balance", [scval.to_address(who)]))
 
 
-def signed_request(chain: Chain, passkey: SoftwarePasskey, amount: int) -> dict:
-    acct = E["ACCOUNT"]
+def signed_request(chain: Chain, passkey: SoftwarePasskey, amount: int, acct: str | None = None) -> dict:
+    acct = acct or E["ACCOUNT"]
     a = scval.to_address(acct)
     func = func_b64(E["VAULT"], "deposit", [scval.to_int128(amount), a, a, a])
     code, prep = post("/prepare", {"func": func})
@@ -77,14 +77,15 @@ def signed_request(chain: Chain, passkey: SoftwarePasskey, amount: int) -> dict:
 def run() -> None:
     chain = Chain()
     owner = SoftwarePasskey.from_pem(open(E["PASSKEY_PEM"], "rb").read())
-    acct, vault, usdc, native, relayer = E["ACCOUNT"], E["VAULT"], E["USDC"], E["NATIVE"], E["RELAYER"]
+    acct, vault, usdc, native = E["ACCOUNT"], E["VAULT"], E["USDC"], E["NATIVE"]
+    relayers = E["RELAYERS"].split(",")
     sponsor = E["SPONSOR"]
     one = 10_000_000
 
     usdc_before = chain.balance(usdc, acct)
     xlm_user_before = chain.balance(native, acct)
-    xlm_relayer_before = chain.balance(native, relayer)
-    print(f"user {acct}: {usdc_before / one} USDC, {xlm_user_before} stroops XLM; relayer {xlm_relayer_before} stroops")
+    xlm_relayers_before = {r: chain.balance(native, r) for r in relayers}
+    print(f"user {acct}: {usdc_before / one} USDC, {xlm_user_before} stroops XLM; relayer pool {xlm_relayers_before}")
     if xlm_user_before != 0:
         fail("the user must start with zero XLM")
 
@@ -111,8 +112,8 @@ def run() -> None:
     stats = chain.view(sponsor, "get_user_stats", [scval.to_address(acct)])
     if stats["daily_ops"] != 0:
         fail(f"refused requests consumed quota: {stats}")
-    if chain.balance(native, relayer) != xlm_relayer_before:
-        fail("refused requests cost the relayer XLM")
+    if {r: chain.balance(native, r) for r in relayers} != xlm_relayers_before:
+        fail("refused requests cost the relayers XLM")
 
     # --- the sponsored deposit ---------------------------------------------
     req = signed_request(chain, owner, 500 * one)
@@ -124,7 +125,11 @@ def run() -> None:
     shares = chain.balance(vault, acct)
     usdc_after = chain.balance(usdc, acct)
     xlm_user_after = chain.balance(native, acct)
-    xlm_relayer_after = chain.balance(native, relayer)
+    payer = res["relayer"]
+    if payer not in relayers:
+        fail(f"paid by an account outside the pool: {payer}")
+    xlm_relayer_before = xlm_relayers_before[payer]
+    xlm_relayer_after = chain.balance(native, payer)
     paid = res["fee_charged"] + res["record_fee_charged"]
     print(f"shares {shares / one}, USDC {usdc_after / one}, user XLM {xlm_user_after}, "
           f"relayer paid {xlm_relayer_before - xlm_relayer_after} stroops (deposit {res['fee_charged']} + record {res['record_fee_charged']})")
@@ -145,17 +150,54 @@ def run() -> None:
     print("ZERO-GAS DEPOSIT PASS")
 
 
+def parallel() -> None:
+    """Decision D-I: two users submit at the same time; the pool serves them
+    on two different relayer accounts, each paying its own fees."""
+    import threading
+
+    chain = Chain()
+    users = [(E["ACCOUNT"], SoftwarePasskey.from_pem(open(E["PASSKEY_PEM"], "rb").read())),
+             (E["ACCOUNT2"], SoftwarePasskey.from_pem(open(E["PASSKEY2_PEM"], "rb").read()))]
+    one = 10_000_000
+    shares_before = [chain.balance(E["VAULT"], a) for a, _ in users]
+    reqs = [signed_request(chain, pk, 100 * one, acct=a) for a, pk in users]
+    results: list = [None, None]
+
+    def go(i: int) -> None:
+        results[i] = post("/submit", reqs[i])
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    for i, (code, res) in enumerate(results):
+        print(f"parallel user {i + 1} ->", code, res.get("relayer"), res.get("error"))
+        if code != 200:
+            fail(f"parallel submit {i + 1} failed: {code} {res}")
+    payers = {res["relayer"] for _, res in results}
+    if len(payers) != 2:
+        fail(f"the two requests were not served by two pool accounts: {payers}")
+    for i, (a, _) in enumerate(users):
+        if chain.balance(E["VAULT"], a) != shares_before[i] + 100 * one:
+            fail(f"user {i + 1} shares not minted")
+        if chain.balance(E["NATIVE"], a) != 0:
+            fail(f"user {i + 1} paid XLM")
+    print("PARALLEL PASS")
+
+
 def paused() -> None:
     """After the admin paused the sponsor on chain: refused, nothing spent."""
     chain = Chain()
     owner = SoftwarePasskey.from_pem(open(E["PASSKEY_PEM"], "rb").read())
-    before = chain.balance(E["NATIVE"], E["RELAYER"])
+    relayers = E["RELAYERS"].split(",")
+    before = {r: chain.balance(E["NATIVE"], r) for r in relayers}
     code, res = post("/submit", signed_request(chain, owner, 10 * 10_000_000))
     print("paused sponsor ->", code, res.get("error"))
     if res.get("error") != "SPONSOR_REFUSED":
         fail(f"a paused sponsor must refuse: {code} {res}")
-    if chain.balance(E["NATIVE"], E["RELAYER"]) != before:
-        fail("a refused request cost the relayer XLM")
+    if {r: chain.balance(E["NATIVE"], r) for r in relayers} != before:
+        fail("a refused request cost the relayers XLM")
     print("PAUSED PASS")
 
 
@@ -166,6 +208,8 @@ if __name__ == "__main__":
         print(pk.public_key.hex())
     elif sys.argv[1] == "run":
         run()
+    elif sys.argv[1] == "parallel":
+        parallel()
     elif sys.argv[1] == "paused":
         paused()
     else:
