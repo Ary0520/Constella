@@ -17,6 +17,38 @@ UNREGISTERED_SYMBOLS = {
 }
 
 
+# REGISTRY.md "Issuer Concentration Policy": defaults, user-configurable.
+DEFAULT_MAX_ISSUER = 0.30
+DEFAULT_MAX_SINGLE_ASSET = 0.25
+
+# Clauses: split on , ; " and " " but " and on a period that ends a sentence
+# (not the one inside "22.5%").
+_CLAUSE_SPLIT = re.compile(r"[;,]|\.(?=\s|$)|\band\b|\bbut\b", re.IGNORECASE)
+_PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_MAX_WORDS = re.compile(r"no more than|not more than|at most|\bmax(?:imum)?\b|\bup to\b|\bcap(?:ped)?\b|\blimit(?:ed)?\b|\babove\b|\bover\b|\bceiling\b|<=|≤")
+_MIN_WORDS = re.compile(r"at least|\bminimum\b|\bmin\b|no less than|not less than")
+_ISSUER = re.compile(r"\bissuers?\b")
+_ASSET = re.compile(r"\b(?:single|any|each|one|per)\s+(?:single\s+)?(?:assets?|tokens?|holdings?|positions?)\b")
+
+
+def _fmt(v: float) -> str:
+    return f"{v * 100:g}%"
+
+
+def _resolve_cap(caps: List[float], default: float, kind: str, ambiguities: List[str], confidence: Dict[str, float], key: str) -> float:
+    """Apply the user's cap: the strictest if several conflict; a cap looser
+    than the documented default is applied but flagged for confirmation."""
+    if not caps:
+        return default
+    cap = min(caps)
+    if len(set(caps)) > 1:
+        ambiguities.append(f"Conflicting {kind} caps ({', '.join(_fmt(c) for c in caps)}); applied the strictest, {_fmt(cap)}.")
+    if cap > default:
+        ambiguities.append(f"Requested {kind} cap {_fmt(cap)} is looser than the {_fmt(default)} default; please confirm on the review screen.")
+    confidence[key] = 0.95
+    return cap
+
+
 def parse_thesis(
     thesis: str,
     jurisdiction: str = "non-US",
@@ -49,33 +81,49 @@ def parse_thesis(
             )
             confidence["unregistered_asset_detected"] = 0.20
 
-    # 2. Extract percentage allocations
-    # Matches patterns like '70% dollar T-bill funds', '20% euro T-bills', '10% instant liquidity'
-    pct_matches = re.findall(
-        r"(\d+(?:\.\d+)?)\s*%\s*(?:in\s+)?([a-zA-Z\$-]+(?:\s+[a-zA-Z-]+)*)",
-        raw_text,
-        re.IGNORECASE
-    )
-
+    # 2. Percentages, read clause by clause (audit A2): each percentage is
+    # interpreted with its own subject (issuer / asset / cash / currency) and
+    # direction ("at most" vs "at least"); the user's caps reach the policy.
     currency_exposure: Dict[str, float] = {}
     min_liquidity_sleeve: float = 0.10
     has_explicit_liquidity = False
+    issuer_caps: List[float] = []
+    asset_caps: List[float] = []
 
-    for pct_str, context in pct_matches:
-        pct = float(pct_str) / 100.0
-        ctx_lower = context.lower()
+    for clause in _CLAUSE_SPLIT.split(raw_text):
+        cl = clause.lower()
+        for m in _PCT.finditer(clause):
+            pct = float(m.group(1)) / 100.0
+            is_max = bool(_MAX_WORDS.search(cl))
+            is_min = bool(_MIN_WORDS.search(cl))
+            if _ISSUER.search(cl) or _ASSET.search(cl):
+                kind = "issuer" if _ISSUER.search(cl) else "single-asset"
+                if is_min and not is_max:
+                    ambiguities.append(f"A minimum per {kind.replace('single-', '')} ({_fmt(pct)}) is not supported; caps are maximums. Kept the default.")
+                elif not (0.0 < pct <= 1.0):
+                    ambiguities.append(f"Ignored impossible {kind} cap {_fmt(pct)}; kept the default.")
+                else:
+                    (issuer_caps if kind == "issuer" else asset_caps).append(pct)
+                continue
+            ctx_lower = cl[m.end():] + " " + cl[: m.start()]
+            # Check for liquidity sleeve
+            if any(term in ctx_lower for term in ["liquidity", "instant liquidity", "cash", "reserve", "buffer"]):
+                if is_max and not is_min:
+                    ambiguities.append(f"A maximum cash share ({_fmt(pct)}) is not supported; the cash sleeve is a minimum (liquidity floor). Kept the default floor.")
+                    continue
+                min_liquidity_sleeve = pct
+                has_explicit_liquidity = True
+                confidence["min_liquidity_sleeve"] = 0.95
+            # Check for USD / dollar exposure
+            elif any(term in ctx_lower for term in ["dollar", "usd", "$", "us t-bill"]):
+                currency_exposure["USD"] = pct
+            # Check for EUR / euro exposure
+            elif any(term in ctx_lower for term in ["euro", "eur", "€"]):
+                currency_exposure["EUR"] = pct
 
-        # Check for liquidity sleeve
-        if any(term in ctx_lower for term in ["liquidity", "instant liquidity", "cash", "reserve", "buffer"]):
-            min_liquidity_sleeve = pct
-            has_explicit_liquidity = True
-            confidence["min_liquidity_sleeve"] = 0.95
-        # Check for USD / dollar exposure
-        elif any(term in ctx_lower for term in ["dollar", "usd", "$", "us t-bill"]):
-            currency_exposure["USD"] = pct
-        # Check for EUR / euro exposure
-        elif any(term in ctx_lower for term in ["euro", "eur", "€"]):
-            currency_exposure["EUR"] = pct
+    max_issuer_weight = _resolve_cap(issuer_caps, DEFAULT_MAX_ISSUER, "issuer", ambiguities, confidence, "max_issuer_weight")
+    max_single_asset_weight = _resolve_cap(asset_caps, DEFAULT_MAX_SINGLE_ASSET, "single-asset", ambiguities, confidence,
+                                           "max_single_asset_weight")
 
     # Fallback for currency exposure if not parsed
     if currency_exposure:
@@ -165,8 +213,8 @@ def parse_thesis(
         objectives=objectives,
         currency_exposure=currency_exposure,
         liquidity_horizon_hours=liquidity_horizon_hours,
-        max_issuer_weight=0.30,
-        max_single_asset_weight=0.25,
+        max_issuer_weight=max_issuer_weight,
+        max_single_asset_weight=max_single_asset_weight,
         risk_tolerance=risk_tolerance,
         exclusions=exclusions,
         min_liquidity_sleeve=min_liquidity_sleeve,
