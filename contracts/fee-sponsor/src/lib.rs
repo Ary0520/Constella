@@ -58,6 +58,14 @@ pub struct SponsorAdminTransferred {
 }
 
 /// Topics: [SPONSOR_PAUSED, admin]. Data: void.
+/// Audit F1b: the relayer (fee-paying service key) was (re)designated.
+#[contractevent(topics = ["RELAYER_SET"], data_format = "single-value")]
+pub struct RelayerSet {
+    #[topic]
+    pub admin: Address,
+    pub relayer: Address,
+}
+
 #[contractevent(topics = ["SPONSOR_PAUSED"], data_format = "single-value")]
 pub struct SponsorPaused {
     #[topic]
@@ -86,6 +94,8 @@ pub enum SponsorError {
     ContractAlreadyWhitelisted = 9,
     ContractNotWhitelisted = 10,
     InvalidConfig = 11,
+    /// No relayer has been designated yet (audit F1b).
+    RelayerNotSet = 12,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,6 +132,8 @@ pub enum DataKey {
     WhitelistList,
     UserStats(Address),
     GlobalStats,
+    /// Audit F1b: the only address allowed to record sponsored operations.
+    Relayer,
 }
 
 /// Audit F1a: TTLs (in ledgers, ~5 s each). Per-user stats live in their own
@@ -303,14 +315,34 @@ impl FeeSponsorContract {
         Ok(())
     }
 
-    /// Record an executed sponsored operation (updates quotas and consumes daily budget)
+    /// Audit F1b: designate the relayer - the service key that pays fees and
+    /// records sponsored operations. Admin only. Least privilege: the relayer
+    /// can only record (within the limits); it cannot change limits, the
+    /// whitelist, the admin, or unpause.
+    pub fn set_relayer(env: Env, relayer: Address) -> Result<(), SponsorError> {
+        let config = Self::require_admin(&env)?;
+        env.storage().instance().set(&DataKey::Relayer, &relayer);
+        extend_instance(&env);
+        RelayerSet { admin: config.admin, relayer }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_relayer(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Relayer)
+    }
+
+    /// Record a sponsored operation BEFORE the relayer submits it: enforces
+    /// the whitelist, pause, per-user quotas and the global daily budget on
+    /// chain, and consumes `fee_spent_stroops` (the relayer's fee cap for the
+    /// operation - an upper bound). Relayer only (audit F1b).
     pub fn record_sponsored_op(
         env: Env,
         user: Address,
         target_contract: Address,
         fee_spent_stroops: u64,
     ) -> Result<(), SponsorError> {
-        let _config = Self::require_admin(&env)?;
+        let relayer: Address = env.storage().instance().get(&DataKey::Relayer).ok_or(SponsorError::RelayerNotSet)?;
+        relayer.require_auth();
 
         // Ensure operation adheres to whitelist, circuit breaker, and budget before recording
         Self::validate_sponsorship(

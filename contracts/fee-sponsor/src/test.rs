@@ -108,6 +108,7 @@ fn test_t53_sponsorship_rate_limits() {
         client.try_validate_sponsorship(&user, &vault_contract, &1000),
         Ok(Ok(()))
     );
+    client.set_relayer(&Address::generate(&env));
     client.record_sponsored_op(&user, &vault_contract, &1000);
 
     // Operation 2 (same hour)
@@ -194,6 +195,7 @@ fn test_t54_sponsorship_daily_budget() {
         client.try_validate_sponsorship(&user_1, &vault_contract, &30_000),
         Ok(Ok(()))
     );
+    client.set_relayer(&Address::generate(&env));
     client.record_sponsored_op(&user_1, &vault_contract, &30_000);
 
     let global_stats = client.get_global_stats();
@@ -346,6 +348,7 @@ fn m2_every_sponsor_event_follows_rule_8() {
     let user = Address::generate(&env);
     let mut n = 0;
     client.whitelist_contract(&vault); n += check(&env);
+    client.set_relayer(&Address::generate(&env));
     client.record_sponsored_op(&user, &vault, &100); n += check(&env);
     client.set_limits(&20, &60, &2_000_000); n += check(&env);
     client.pause(); n += check(&env);
@@ -419,13 +422,14 @@ fn golden_events_fee_sponsor() {
     let vault = Address::generate(&env);
     let user = Address::generate(&env);
     client.whitelist_contract(&vault); g.capture(&env, "whitelist_contract");
+    client.set_relayer(&Address::generate(&env)); g.capture(&env, "set_relayer");
     client.record_sponsored_op(&user, &vault, &100); g.capture(&env, "record_sponsored_op");
     client.set_limits(&20, &60, &2_000_000); g.capture(&env, "set_limits");
     client.pause(); g.capture(&env, "pause");
     client.unpause(); g.capture(&env, "unpause");
     client.remove_contract(&vault); g.capture(&env, "remove_contract");
     client.set_admin(&Address::generate(&env)); g.capture(&env, "set_admin");
-    g.finish(&["SPONSOR_INITIALIZED", "CONTRACT_WHITELISTED", "SPONSORED_OP", "LIMITS_UPDATED",
+    g.finish(&["SPONSOR_INITIALIZED", "CONTRACT_WHITELISTED", "RELAYER_SET", "SPONSORED_OP", "LIMITS_UPDATED",
         "SPONSOR_PAUSED", "SPONSOR_UNPAUSED", "CONTRACT_UNWHITELISTED", "SPONSOR_ADMIN_TRANSFERRED"]);
 }
 
@@ -445,6 +449,7 @@ fn f1a_instance_storage_does_not_grow_with_the_number_of_users() {
     let vault = Address::generate(&env);
     client.whitelist_contract(&vault);
     let first = Address::generate(&env);
+    client.set_relayer(&Address::generate(&env));
     client.record_sponsored_op(&first, &vault, &1_000);
     let instance_len = || env.as_contract(&id, || env.storage().instance().all().len());
     let baseline = instance_len();
@@ -455,4 +460,49 @@ fn f1a_instance_storage_does_not_grow_with_the_number_of_users() {
     assert!(env.as_contract(&id, || env.storage().instance().get_ttl()) > 0);
     let persisted = env.as_contract(&id, || env.storage().persistent().all().len());
     assert!(persisted >= 21, "each user's stats must be their own persistent entry");
+}
+
+/// Audit F1b: only the designated relayer records sponsored operations; the
+/// relayer key cannot reconfigure anything; only the admin designates it.
+#[test]
+fn f1b_only_the_relayer_records_and_it_cannot_reconfigure() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+    let env = Env::default();
+    env.ledger().set_timestamp(1_731_600_000);
+    let admin = Address::generate(&env);
+    let relayer = Address::generate(&env);
+    let id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &id);
+    let vault = Address::generate(&env);
+    let user = Address::generate(&env);
+    let as_ = |who: &Address, f: &'static str, args: soroban_sdk::Vec<soroban_sdk::Val>| {
+        env.mock_auths(&[MockAuth { address: who, invoke: &MockAuthInvoke { contract: &id, fn_name: f, args, sub_invokes: &[] } }]);
+    };
+    as_(&admin, "whitelist_contract", (vault.clone(),).into_val(&env));
+    client.whitelist_contract(&vault);
+    // Nobody can record before a relayer is designated.
+    as_(&admin, "record_sponsored_op", (user.clone(), vault.clone(), 100u64).into_val(&env));
+    assert_eq!(client.try_record_sponsored_op(&user, &vault, &100), Err(Ok(SponsorError::RelayerNotSet)));
+    // A stranger cannot designate one.
+    as_(&relayer, "set_relayer", (relayer.clone(),).into_val(&env));
+    assert!(client.try_set_relayer(&relayer).is_err());
+    as_(&admin, "set_relayer", (relayer.clone(),).into_val(&env));
+    client.set_relayer(&relayer);
+    assert_eq!(client.get_relayer(), Some(relayer.clone()));
+    // The admin can no longer record; the relayer can.
+    as_(&admin, "record_sponsored_op", (user.clone(), vault.clone(), 100u64).into_val(&env));
+    assert!(client.try_record_sponsored_op(&user, &vault, &100).is_err());
+    as_(&relayer, "record_sponsored_op", (user.clone(), vault.clone(), 100u64).into_val(&env));
+    client.record_sponsored_op(&user, &vault, &100);
+    assert_eq!(client.get_user_stats(&user).daily_ops, 1);
+    // The relayer key cannot loosen anything.
+    as_(&relayer, "set_limits", (1_000u32, 5_000u32, 1_000_000_000u64).into_val(&env));
+    assert!(client.try_set_limits(&1_000, &5_000, &1_000_000_000).is_err());
+    as_(&admin, "pause", ().into_val(&env));
+    client.pause();
+    as_(&relayer, "unpause", ().into_val(&env));
+    assert!(client.try_unpause().is_err());
+    as_(&relayer, "whitelist_contract", (user.clone(),).into_val(&env));
+    assert!(client.try_whitelist_contract(&user).is_err());
 }
