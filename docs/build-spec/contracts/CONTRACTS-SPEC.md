@@ -195,6 +195,7 @@ fn max_deposit(env: Env, receiver: Address) -> i128  // real remaining room unde
 fn set_keeper(env: Env, keeper: Address)                        // admin
 fn rebalance(env: Env, proposal: RebalanceProposal)              // keeper; policy-validated; measured swaps;
                                                                  // actual holdings re-checked (AllocationOutOfPolicy)
+// TradeRoute::Blend (D-H): supply underlying -> Blend position, or withdraw; measured deltas.
 // set_sleeves: once a policy is bound, each sleeve must be declared in it with the signed
 // target weight (SleeveTargetMismatch); band enforcement always uses the policy's bands.
 fn propose_router(env: Env, route: TradeRoute, router: Address)  // admin; active after 48h
@@ -311,6 +312,10 @@ fn set_threshold(env, threshold: u32, context_rule: ContextRule, smart_account: 
 // struct PriceData { price: i128, timestamp: u64 }
 fn base(env: Env) -> Asset                                         // numéraire
 fn assets(env: Env) -> Vec<Asset>
+// Decision D-H: Blend v2 supply positions (price per bToken = underlying x live b_rate / 1e12)
+fn set_blend_factory(env: Env, factory: Address)                   // admin; once; official pool factory
+fn register_blend_position(env: Env, pool: Address, underlying: Address) // admin; factory.is_pool; immutable
+fn blend_position(env: Env, pool: Address) -> Option<BlendPosition>
 fn decimals(env: Env) -> u32
 fn resolution(env: Env) -> u32                                     // seconds
 fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData>

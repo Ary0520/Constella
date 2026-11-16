@@ -113,7 +113,7 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 | Yield-bearing dollar (YLDS) | Figure's NAV feed | — | — |
 | USDC | Reflector · RedStone | On-chain (SDEX/Soroswap if deep) | — |
 | EURC | Reflector · RedStone | On-chain (if deep) | — |
-| Lending tokens (Blend) | Blend contract rate | — | — |
+| Lending positions (Blend v2) | **Derived (D-H):** underlying price (its own 2+ sources, or the base) × the pool's live `b_rate` | — (b_rate is Blend's own accounting, not a market price) | None: no price → hard stop |
 | XLM | Reflector · RedStone | CoinGecko (if implemented) | — |
 
 **Sources used:**
@@ -135,6 +135,7 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 ```
 
 - **On-chain providers** (Reflector, RedStone, Blend) are read directly by the oracle contract; no one pushes these prices.
+- **Blend positions (decision D-H, 16 Nov 2026, `ebdeaca` + `1fefc22`):** `register_blend_position(pool, underlying)` (admin; validated against the live pool; immutable; only pools of the official factory set once via `set_blend_factory`). Price per bToken = underlying median (for `asset_price`) or minimum (for `collateral_price` / SEP-40 `lastprice`) × `b_rate` / 1e12, with the underlying's timestamp. Rule 5's "2+ sources" applies to the underlying's market price; `b_rate` is not a market price and has no second source — it rises only by interest accrual and falls only on bad-debt write-off (ORACLE-SOURCES §4). Any pool failure or `b_rate ≤ 0` → `None`. Not yet: SEP-40 `prices()` history for positions (no snapshots are written for them).
 - **Issuer NAVs** originate off-chain and are carried in by a Constella feeder service signing with a dedicated key per source — never the admin key. Where an issuer signs its NAV, the contract verifies that signature.
 - **Current state (15 Nov 2026):** the safety rules are implemented and tested, but every source is written via admin-only `update_price`. Tracked as audit O7.
 
@@ -151,7 +152,7 @@ fn price(asset: Asset, timestamp: u64) -> Option<PriceData>       // history, fl
 fn prices(asset: Asset, records: u32) -> Option<Vec<PriceData>>   // newest first, 1..=20
 ```
 
-**Blend v2** calls only `lastprice(Asset::Stellar(token))` and `decimals()`. It rejects `None`, prices ≤ 0, and prices older than 24 h. Constella returns `None` earlier, as soon as a source passes its own staleness limit, so Blend halts instead of lending against stale data.
+**Blend v2** calls only `lastprice(Asset::Stellar(token))` and `decimals()`. It rejects `None` (by aborting: `unwrap_optimized`), prices ≤ 0, and prices older than 24 h (`InvalidPrice` 1210). Constella returns `None` earlier, as soon as a source passes its own staleness limit, so Blend halts instead of lending against stale data.
 
 **Vault share tokens are not quoted yet** (audit L1); see `SEPS.md`.
 
@@ -208,7 +209,7 @@ Before any NAV oracle code ships to testnet:
 - [ ] Staleness limit configurable per-source (not hardcoded)
 - [ ] Circuit breaker emits on-chain events
 - [ ] Hard stop (< 2 valid sources) tested end-to-end
-- [x] SEP-40 interface implemented and tested (W5; Blend v2 `load_price` mirrored in tests; real Blend WASM on the local network still to do)
+- [x] SEP-40 interface implemented and tested (W5; and against the **real Blend v2 pool WASM** (D-H): Blend lends against Constella's minimum price and refuses once Constella's feed is stale)
 - [ ] Collateral Passport view functions return valid data
 - [ ] Lender listing kit documents our oracle configuration
 - [ ] Independent review of oracle design before mainnet

@@ -114,7 +114,7 @@ pub trait SEP40Oracle {
 }
 ```
 
-> Blend v2 consumes oracles through the `sep-40-oracle` crate and calls only `lastprice(&Asset::Stellar(addr))`, rejecting prices ≤ 0 or older than 24h.
+> Blend v2 consumes oracles through the `sep-40-oracle` crate and calls only `lastprice(&Asset::Stellar(addr))`, rejecting prices ≤ 0 or older than 24h (`InvalidPrice` 1210) and aborting on `None` (`unwrap_optimized`).
 
 ### Implementation in Constella (audit W5, `7ad049c`; verified 15 Nov 2026)
 Checked against the SEP-40 v0.1.0 text, `script3/sep-40-oracle` v1.4.0 (the client Blend v2 compiles against), the Blend v2 pool's `load_price`, and Reflector's contract.
@@ -124,7 +124,7 @@ Checked against the SEP-40 v0.1.0 text, `script3/sep-40-oracle` v1.4.0 (the clie
 - **Return conventions:** timestamps are in seconds; the base asset is `10^decimals`; `Other` and unknown assets return `None`.
 - **Constella extras:** `collateral_price` / `asset_price` / sleeve NAV return `SourcedPrice` (with the source ID). They are not part of SEP-40.
 - **Not yet:** quoting **vault share tokens** (audit **L1**). Today the feed quotes the underlying assets only. For Blend to accept Constella shares as collateral, the feed must also quote each vault's share token at its conservative NAV per share.
-- **Still to verify end to end:** a real Blend pool WASM against our oracle on the local network (tests currently use a line-for-line mirror of Blend's `load_price`).
+- **Verified end to end (16 Nov 2026, D-H):** the real Blend v2 pool WASM (mainnet code) uses Constella's oracle: a borrow against EURC collateral is sized at Constella's **minimum** price (1.07 of 1.07/1.08) and refused once Constella's feeds go stale (`nav-oracle` `blend_position::a_real_blend_pool_lends_only_against_a_valid_constella_price`). Still to do on a real network: the same on the local network / testnet.
 
 ---
 

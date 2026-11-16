@@ -65,7 +65,8 @@ If ANY check fails: **rebalance rejected in its entirety**.
 - **Routers:** set with `propose_router` and active only after **48 h** (`activate_router`), because a router can move vault funds.
 - **Post-trade check (W1b):** the proposal's `weights_after` is only a claim. After the swaps, the vault values every sleeve as **actually held** (measured balance, capped by the booked balance, at its own asset's median price; cash at face value) and the policy's `validate_holdings` must accept the result: every signed band, single-asset cap, issuer caps and the cash liquidity floor, compared exactly. Otherwise the whole rebalance reverts with `AllocationOutOfPolicy`, swaps included. A sleeve without a valid price stops it with `OracleUnavailable`.
 - **Targets (W1b):** once a policy is bound, `set_sleeves` accepts only sleeves declared in it with exactly the signed target weight (`SleeveTargetMismatch`). Targets are read **live** from the policy (`get_sleeves`, empty-vault risk sheet), so an activated amendment applies without re-running `set_sleeves`. If an amendment drops a sleeve the vault still holds, the next rebalance must sell it to zero (the post-trade check rejects undeclared holdings).
-- **Not yet:** Aquarius, SDEX and issuer routes (refused with `RouteUnavailable`); the Blend adapter.
+- **Blend adapter (decision D-H, `000f40a`):** route `Blend`. A `Lending` sleeve whose address the oracle knows as a Blend position (official-factory pools only) is held as **plain-supply bTokens** (never collateral: the vault never borrows, so it cannot be liquidated). Supply authorizes exactly one `transfer(vault → pool, amount_in)`; withdraw converts bTokens to underlying at the live `b_rate`, rounded down so Blend burns ≤ `amount_in`. Spent and received are measured on the vault's token balance and its bToken position; the other leg must be the position's own underlying; Soroswap never routes a Blend position. Liquidity risk is real: Blend refuses a withdraw that would take utilization to 100 % (`InvalidUtilRate` 1207) and the whole rebalance reverts — cash for redemptions must come from the cash sleeve, as the liquidity floor requires.
+- **Not yet:** Aquarius, SDEX and issuer routes (refused with `RouteUnavailable`); DeFindex.
 
 ## Execution Order Within a Rebalance
 
@@ -110,7 +111,7 @@ trait IssuerAdapter {
 
 **Adapters to build (in priority order):**
 1. USDC/EURC (direct — no adapter needed)
-2. Blend supply/withdraw adapter
+2. Blend supply/withdraw adapter ✅ (D-H, `000f40a`)
 3. DeFindex adapter
 4. Spiko (if API available)
 5. Franklin BENJI (if allow-listed)
@@ -209,7 +210,7 @@ Data: {
 - [ ] All 7 policy checks implemented in policy contract
 - [ ] Issuer adapter interface defined
 - [ ] USDC/EURC adapter (trivial — direct)
-- [ ] Blend supply/withdraw adapter
+- [x] Blend supply/withdraw adapter (D-H, `000f40a`)
 - [ ] DeFindex adapter
 - [ ] AMM routing with slippage caps
 - [ ] Route fallback logic (Soroswap → Aquarius → SDEX → abort)
