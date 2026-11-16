@@ -48,11 +48,21 @@ class PolicyDraft(BaseModel):
 
 **User caps (audit A2, implemented):** caps the user states ("no more than 40% per issuer", "no single asset above 15%") are carried into the policy as written; a cap looser than the documented default is applied **and** flagged for confirmation; conflicting caps resolve to the strictest; impossible or "minimum per issuer" caps keep the default and are flagged. The same rules apply to the LLM parser's output (validated after the model).
 
-**LLM instructions:**
-- Use schema-constrained output (function calling mode)
-- Do NOT hallucinate asset names; leave `exclusions` for domain-level exclusions only
-- If the thesis is ambiguous, generate the most conservative reasonable interpretation AND flag ambiguities for user confirmation
-- Output confidence score for each parsed field
+**LLM-assisted Parse (decision D-J, implemented `8dd73df`, `c9ef464`; `src/thesis_llm.py`, `src/llm.py`):**
+The model helps with language only; it proposes and never decides.
+- OpenRouter chat/completions, `response_format` json_schema `strict`, `provider: {require_parameters: true, data_collection: "deny", zdr: true}`; pinned models `anthropic/claude-haiku-5.5` → `openai/gpt-5-mini` → `google/gemini-2.5-flash`. No `temperature` (current models reject it, and with `require_parameters` it excludes every endpoint).
+- Schema has **no nullable unions** (some providers' strict mode refuses them): `numbers: [{field, pct, quote}]`, enums with `"unstated"`.
+- **Jurisdiction and investor class come from onboarding only** — never from the text or the model.
+- **Grounding:** each number needs a quote found verbatim in the thesis that contains it; otherwise dropped and flagged.
+- **Merge with the rule-based parser toward the safer value:** lower cap, higher cash floor, more conservative risk / yield orientation, union of exclusions; duplicate readings → lowest cap / highest floor; conflicting currency readings ignored; every disagreement is flagged for the review screen.
+- Thesis sent delimited as untrusted data; > 4000 characters or any error / budget refusal → rule-based parser (flagged).
+- **SpendGuard:** before sending, the worst case (prompt + `max_tokens` at the dearest pinned model, live prices from `/models`) must fit the run budget and leave the account above a floor; the actual `usage.cost` is booked after (worst case if absent); truncated output is an error.
+
+---
+
+**LLM-assisted Explain (D-J):** the model writes a ≤ 120-word summary and 2-4 risks from a structured facts object only (allocation, vault currency, profile, floor, cap, warnings, items needing confirmation). It is discarded if it contains any number not in the facts or any promise ("guaranteed", "risk-free", "insured", ...). The deterministic `ExplanationReport` remains the authoritative explanation.
+
+**Tests:** offline `tests/test_thesis_llm.py` (82 total in the suite; guard mutation 21/21); live `tests/test_llm_live.py`, opt-in (`CONSTELLA_LIVE_LLM=1`, key in env, shared $0.03 guard) — 3/3 on Claude Haiku 5.5, $0.00088 per run (17 Nov 2026).
 
 ---
 
@@ -232,8 +242,8 @@ Each asset in the registry has a text document for semantic search:
 
 | Component | Technology |
 |---|---|
-| LLM | GPT-4o or Claude via API (schema-constrained function calling) |
-| Orchestration | LangChain |
+| LLM | OpenRouter (D-J): Claude Haiku 5.5 with gpt-5-mini / gemini-2.5-flash fallbacks, json_schema strict, ZDR + no data collection |
+| Orchestration | Direct HTTP (stdlib), no LangChain — two calls do not need a framework |
 | Vector search | pgvector (PostgreSQL extension) or Chroma |
 | Portfolio optimisation | PyPortfolioOpt (HRP) |
 | Policy schema | Pydantic (Python) |
