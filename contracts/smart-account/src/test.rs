@@ -924,3 +924,23 @@ mod s4 {
         assert_eq!(a.client.try_propose_recovery(&current).err().unwrap().unwrap(), contract_err(AccError::AlreadyOwner as u32));
     }
 }
+
+/// Audit F1: cross-implementation vectors. The relayer's Python client
+/// (`services/relayer/.../passkey.py::auth_digest`) must encode OpenZeppelin's
+/// `AuthDigestPreimage` byte-for-byte; the same constants are asserted in
+/// `services/relayer/tests/test_passkey.py`.
+#[test]
+fn f1_auth_digest_vectors_match_the_python_client() {
+    let env = Env::default();
+    let account = Address::from_str(&env, "CAIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRCEIRDB3V");
+    let mut p = [0u8; 32];
+    for (i, b) in p.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    let payload = BytesN::from_array(&env, &p);
+    let hex = |d: BytesN<32>| d.to_array().iter().map(|b| std::format!("{b:02x}")).collect::<std::string::String>();
+    let d1 = AuthDigestPreimage { account: account.clone(), signature_payload: payload.clone(), context_rule_ids: vec![&env, 0u32, 0u32] }.digest(&env);
+    assert_eq!(hex(d1), "9b19bf4175973da39fd001b8251d481ef104e9672369c0ee611e68450611210a");
+    let d2 = AuthDigestPreimage { account, signature_payload: payload, context_rule_ids: vec![&env, 3u32] }.digest(&env);
+    assert_eq!(hex(d2), "d506511b29a2196dba8d9145cfa66841c45e54ba8a9298e5683a608cb008859b");
+}
