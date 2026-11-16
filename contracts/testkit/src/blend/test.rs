@@ -20,6 +20,8 @@ fn setup() -> (Env, BlendEnv<'static>, StellarAssetClient<'static>) {
 fn the_pool_is_active_and_accepts_supply() {
     let (env, b, usdc_admin) = setup();
     assert!(b.pool.get_config().status <= 1, "active after the backstop deposit");
+    assert!(b.factory.is_pool(&b.pool.address), "deployed by the official factory code");
+    assert!(!b.factory.is_pool(&b.usdc));
     let user = Address::generate(&env);
     usdc_admin.mint(&user, &(1_000 * SCALAR_7));
     let req = soroban_sdk::vec![&env, pool::Request { request_type: SUPPLY, address: b.usdc.clone(), amount: 1_000 * SCALAR_7 }];

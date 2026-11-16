@@ -46,6 +46,8 @@ pub const RATE_SCALE: i128 = 1_000_000_000_000;
 
 pub struct BlendEnv<'a> {
     pub pool: pool::Client<'a>,
+    /// The factory that deployed `pool` (`is_pool(pool) == true`).
+    pub factory: pool_factory::Client<'a>,
     pub backstop: backstop::Client<'a>,
     pub admin: Address,
     pub blnd: Address,
@@ -154,7 +156,15 @@ pub fn deploy<'a>(env: &Env, usdc_admin: &StellarAssetClient<'a>, oracle: &Addre
     pool.set_status(&3);
     pool.update_status();
 
-    BlendEnv { pool, backstop, admin, blnd, usdc, usdc_index }
+    BlendEnv { pool, factory, backstop, admin, blnd, usdc, usdc_index }
+}
+
+/// Add a reserve for `asset` (7 decimals) to a pool still in setup status
+/// (no timelock applies before activation). Returns the reserve index.
+pub fn add_setup_reserve(env: &Env, pool_id: &Address, asset: &Address) -> u32 {
+    let pool = pool::Client::new(env, pool_id);
+    pool.queue_set_reserve(asset, &default_reserve(7));
+    pool.set_reserve(asset)
 }
 
 /// Add a reserve for `asset` to a live pool. Blend requires a one-week
