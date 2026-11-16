@@ -269,6 +269,11 @@ pub enum VaultError {
     /// A sleeve's target weight differs from the signed policy's target, or
     /// the policy does not declare the sleeve at all (audit W1b).
     SleeveTargetMismatch = 28,
+    /// `redeem_frozen` is only for a vault with a funded sleeve that has no
+    /// valid price; otherwise use `redeem` (audit V6).
+    NoFrozenSleeve = 29,
+    /// No outstanding claim for this holder and asset (audit V6).
+    NoClaim = 30,
 }
 
 /// Timelock between proposing and executing a WASM upgrade (CONTRACTS-SPEC:
@@ -392,6 +397,10 @@ pub enum DataKey {
     PendingUpgrade,
     /// Address allowed to submit rebalance proposals (audit W1).
     Keeper,
+    /// Audit V6: units of a frozen sleeve's asset owed to a holder.
+    Claim(Address, Address),
+    /// Audit V6: total units of an asset reserved for claims.
+    ClaimTotal(Address),
     /// Executor contract per trade route (u32 = TradeRoute discriminant).
     Router(u32),
     PendingRouter(u32),
@@ -761,6 +770,72 @@ const REGISTRY_SLEEVE_CASH: u32 = 0;
 fn share_scale(env: &Env) -> i128 {
     let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
     10i128.pow(decimals)
+}
+
+/// Audit V6: result of a redemption while a funded sleeve has no valid price.
+/// `cash` is paid now; `claims` are (asset, units) owed in kind and settled
+/// in cash at the conservative price once the asset is priced again.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenRedemption {
+    pub cash: i128,
+    pub claims: Vec<(Address, i128)>,
+}
+
+#[contractevent(topics = ["FROZEN_REDEMPTION"], data_format = "vec")]
+pub struct FrozenRedemptionExecuted {
+    #[topic]
+    pub owner: Address,
+    pub receiver: Address,
+    pub shares: i128,
+    pub cash: i128,
+}
+
+#[contractevent(topics = ["CLAIM_RECORDED"], data_format = "vec")]
+pub struct ClaimRecorded {
+    #[topic]
+    pub holder: Address,
+    #[topic]
+    pub asset: Address,
+    pub units: i128,
+}
+
+#[contractevent(topics = ["CLAIM_SETTLED"], data_format = "vec")]
+pub struct ClaimSettled {
+    #[topic]
+    pub holder: Address,
+    #[topic]
+    pub asset: Address,
+    pub units: i128,
+    pub paid: i128,
+}
+
+/// Audit V6: split `shares` of `supply` into the pro-rata value of every
+/// PRICED sleeve (conservative prices, cash at face) and pro-rata units of
+/// every funded sleeve without a valid price. Rounds down (vault's favour).
+/// Returns (cash, claims, priced_total).
+fn frozen_split(env: &Env, config: &VaultConfig, shares: i128, supply: i128) -> (i128, Vec<(Address, i128)>, i128) {
+    if supply <= 0 {
+        panic_with_error!(env, VaultError::ZeroAmount);
+    }
+    let sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(env));
+    let oracle = NavOracleClient::new(env, &config.oracle_contract);
+    let scale = share_scale(env);
+    let mut priced = 0i128;
+    let mut claims: Vec<(Address, i128)> = Vec::new(env);
+    for sleeve in sleeves.iter() {
+        match sleeve_value(env, &oracle, &sleeve, NavKind::Collateral, scale) {
+            Ok((v, _)) => priced = priced.checked_add(v).unwrap_or_else(|| panic_with_error!(env, VaultError::MathOverflow)),
+            Err(VaultError::OracleUnavailable) => {
+                let held = sleeve_holdings(env, &sleeve);
+                let units = held.checked_mul(shares).unwrap_or_else(|| panic_with_error!(env, VaultError::MathOverflow)) / supply;
+                claims.push_back((sleeve.contract_address.clone(), units));
+            }
+            Err(e) => panic_with_error!(env, e),
+        }
+    }
+    let cash = priced.checked_mul(shares).unwrap_or_else(|| panic_with_error!(env, VaultError::MathOverflow)) / supply;
+    (cash, claims, priced)
 }
 
 /// Value of one sleeve in numéraire, and the oracle timestamp used.
@@ -1417,6 +1492,140 @@ impl StrategyVault {
         check_redemption_liquidity(&env, &config, assets);
         withdraw_shares(&env, &receiver, &owner, &operator, assets, shares);
         assets
+    }
+
+    /// Audit V6 preview: what `redeem_frozen(shares, ..)` would pay now and
+    /// record as claims (includes pending fee shares, like other previews).
+    pub fn preview_redeem_frozen(env: Env, shares: i128) -> FrozenRedemption {
+        let config = get_config(&env);
+        let supply = supply_with_pending_fees(&env, &config).unwrap_or_else(|| panic_with_error!(&env, VaultError::MathOverflow));
+        let (cash, claims, _) = frozen_split(&env, &config, shares, supply);
+        FrozenRedemption { cash, claims }
+    }
+
+    /// Audit V6 (VAULT-DESIGN: "the sleeve is frozen, not the basket;
+    /// redemptions from the frozen sleeve are queued"). While a funded sleeve
+    /// has no valid price, `redeem` stays halted (no fair share price). This
+    /// explicit opt-in pays `shares / supply` of every PRICED sleeve's value
+    /// in cash now and records `shares / supply` of each frozen sleeve's units
+    /// as a claim for `receiver`, settled by `settle_claim` once that asset is
+    /// priced again. The units leave the sleeve's books, so the remaining
+    /// holders' per-share value is unchanged. Same rules as `redeem`: operator
+    /// auth and allowance, pause, fee accrual, cash and liquidity floor.
+    pub fn redeem_frozen(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> FrozenRedemption {
+        operator.require_auth();
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        if shares <= 0 {
+            panic_with_error!(&env, VaultError::ZeroAmount);
+        }
+        let config = get_config(&env);
+        accrue_fees_internal(&env, &config);
+        let (cash, claims, priced) = frozen_split(&env, &config, shares, share_supply(&env));
+        if claims.is_empty() {
+            panic_with_error!(&env, VaultError::NoFrozenSleeve);
+        }
+        if cash == 0 && claims.iter().all(|(_, u)| u == 0) {
+            panic_with_error!(&env, VaultError::ZeroAmount);
+        }
+        let cash_balance = get_cash_sleeve_balance(&env);
+        if cash > cash_balance {
+            panic_with_error!(&env, VaultError::ExceedsRedemptionCapacity);
+        }
+        // Liquidity floor over the PRICED part (frozen units cannot be valued).
+        let floor_bps = get_policy_floor_bps(&env, &config) as i128;
+        let (rest_cash, rest_priced) = (cash_balance - cash, priced - cash);
+        if floor_bps > 0 && rest_priced > 0 {
+            match (rest_cash.checked_mul(10_000), rest_priced.checked_mul(floor_bps)) {
+                (Some(l), Some(r)) if l >= r => {}
+                (Some(_), Some(_)) => panic_with_error!(&env, VaultError::LiquidityFloorBreached),
+                _ => panic_with_error!(&env, VaultError::MathOverflow),
+            }
+        }
+        // Reserve the claimed units: out of the sleeve's books, into the claim.
+        let mut sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(&env));
+        for (asset, units) in claims.iter() {
+            if units == 0 {
+                continue;
+            }
+            let i = sleeve_index(&sleeves, &asset);
+            let mut sl = sleeves.get_unchecked(i);
+            sl.current_balance -= units;
+            sleeves.set(i, sl);
+            let key = DataKey::Claim(receiver.clone(), asset.clone());
+            let owed: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(owed + units));
+            let total_key = DataKey::ClaimTotal(asset.clone());
+            let total: i128 = env.storage().instance().get(&total_key).unwrap_or(0);
+            env.storage().instance().set(&total_key, &(total + units));
+            ClaimRecorded { holder: receiver.clone(), asset: asset.clone(), units }.publish(&env);
+        }
+        env.storage().instance().set(&DataKey::Sleeves, &sleeves);
+        withdraw_shares(&env, &receiver, &owner, &operator, cash, shares);
+        FrozenRedemptionExecuted { owner, receiver, shares, cash }.publish(&env);
+        FrozenRedemption { cash, claims }
+    }
+
+    /// Audit V6: settle `holder`'s claim on `asset` in cash once the asset has
+    /// a valid conservative price again: units x price, paid to the holder;
+    /// the units return to the sleeve's books. Permissionless (pays only the
+    /// holder). If tokens were clawed back meanwhile, payment is capped pro
+    /// rata to the reserved units actually still held, so remaining holders
+    /// never pay for units that are gone.
+    pub fn settle_claim(env: Env, holder: Address, asset: Address) -> i128 {
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        let key = DataKey::Claim(holder.clone(), asset.clone());
+        let units: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if units <= 0 {
+            panic_with_error!(&env, VaultError::NoClaim);
+        }
+        let config = get_config(&env);
+        let price = match NavOracleClient::new(&env, &config.oracle_contract).collateral_price(&asset) {
+            Some(pd) if pd.price > 0 => pd.price,
+            _ => panic_with_error!(&env, VaultError::OracleUnavailable),
+        };
+        let mut sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(&env));
+        let i = sleeve_index(&sleeves, &asset);
+        let mut sl = sleeves.get_unchecked(i);
+        let total_key = DataKey::ClaimTotal(asset.clone());
+        let total: i128 = env.storage().instance().get(&total_key).unwrap_or(0);
+        let present = real_holding(&env, &sl) - sl.current_balance;
+        let paid_units = if present >= total {
+            units
+        } else if present <= 0 {
+            0
+        } else {
+            units.checked_mul(present).unwrap_or_else(|| panic_with_error!(&env, VaultError::MathOverflow)) / total
+        };
+        let paid = paid_units.checked_mul(price).unwrap_or_else(|| panic_with_error!(&env, VaultError::MathOverflow))
+            / share_scale(&env);
+        if paid > get_cash_sleeve_balance(&env) {
+            panic_with_error!(&env, VaultError::ExceedsRedemptionCapacity);
+        }
+        sl.current_balance += paid_units;
+        sleeves.set(i, sl);
+        env.storage().instance().set(&DataKey::Sleeves, &sleeves);
+        env.storage().persistent().remove(&key);
+        env.storage().instance().set(&total_key, &(total - units));
+        if paid > 0 {
+            update_cash_sleeve_balance(&env, paid, false);
+            token::Client::new(&env, &config.numeraire).transfer(&env.current_contract_address(), &holder, &paid);
+        }
+        ClaimSettled { holder, asset, units: paid_units, paid }.publish(&env);
+        paid
+    }
+
+    /// Audit V6: units of `asset` owed to `holder`.
+    pub fn get_claim(env: Env, holder: Address, asset: Address) -> i128 {
+        env.storage().persistent().get(&DataKey::Claim(holder, asset)).unwrap_or(0)
+    }
+
+    /// Audit V6: total units of `asset` reserved for claims.
+    pub fn get_claim_total(env: Env, asset: Address) -> i128 {
+        env.storage().instance().get(&DataKey::ClaimTotal(asset)).unwrap_or(0)
     }
 
     /// SEP-56 withdraw: pays exactly `assets`; returns the shares burned.

@@ -2220,6 +2220,44 @@ mod blend_sleeve {
         router
     }
 
+    /// Audit V6 with three sleeves (USDC cash, Blend position, EURC): when EURC
+    /// is frozen, the Blend position is still priced, so a frozen redemption
+    /// pays its share of cash + Blend in cash - limited by the cash actually
+    /// held and by the liquidity floor over the priced part.
+    #[test]
+    fn v6_cash_and_floor_limits_apply_to_the_priced_part() {
+        let x = setup_with(true);
+        let env = &x.s.env;
+        env.mock_all_auths();
+        let router = real_soroswap(&x, Some(&x.eurc));
+        for id in ["EURC_A", "EURC_B"] {
+            x.s.oracle.update_price(&Symbol::new(env, id), &(ONE * 108 / 100), &200_000, &env.ledger().timestamp());
+        }
+        let w = |u: u32, b: u32, e: u32| Vec::from_array(env, [(Symbol::new(env, "USDC"), u), (Symbol::new(env, "BLEND_USDC_SUPPLY"), b),
+            (Symbol::new(env, "EURC"), e)]);
+        let mut fund = leg(&x, &x.s.usdc_addr, &x.pool, 3_000 * ONE, 2_997 * ONE, VR::Blend);
+        fund.weights_after = w(5000, 3000, 2000);
+        run(&x, &fund).unwrap();
+        let path = Vec::from_array(env, [x.s.usdc_addr.clone(), x.eurc.clone()]);
+        let out = router.router_get_amounts_out(&(2_000 * ONE), &path).get(1).unwrap();
+        let mut buy = leg(&x, &x.s.usdc_addr, &x.eurc, 2_000 * ONE, out, VR::Soroswap);
+        buy.weights_after = w(5000, 3000, 2000);
+        run(&x, &buy).unwrap();
+        // EURC feeds go stale; the Blend position (USDC underlying) stays priced.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 3_601);
+        env.mock_all_auths();
+        let alice = x.alice.clone();
+        // 90 %: 0.9 x (5,000 cash + 3,000 Blend) = 7,200 > 5,000 cash held.
+        assert_eq!(x.s.vault.try_redeem_frozen(&(9_000 * ONE), &alice, &alice, &alice).unwrap_err().unwrap(), contract_error(8));
+        // 60 %: 4,800 cash leaves 200 cash of 3,200 priced = 6.25 % < 10 % floor.
+        assert_eq!(x.s.vault.try_redeem_frozen(&(6_000 * ONE), &alice, &alice, &alice).unwrap_err().unwrap(), contract_error(9));
+        // 20 %: 1,600 cash; Blend units are NOT claimed (still priced), EURC is.
+        let got = x.s.vault.redeem_frozen(&(2_000 * ONE), &alice, &alice, &alice);
+        assert_eq!(got.cash, 1_600 * ONE);
+        assert_eq!(got.claims, Vec::from_array(env, [(x.eurc.clone(), out * 2_000 / 10_000)]));
+        assert_eq!(b_tokens(&x), 3_000 * ONE, "Blend position untouched");
+    }
+
     /// A funded Blend sleeve cannot be dropped from the layout, even after the
     /// policy stops declaring it: its bTokens are read from the pool itself.
     #[test]
@@ -2241,5 +2279,172 @@ mod blend_sleeve {
         cash_only.push_back(usdc);
         assert_eq!(x.s.vault.try_set_sleeves(&cash_only).unwrap_err().unwrap(), contract_error(SLEEVE_HAS_HOLDINGS));
         let _ = &x.alice;
+    }
+}
+
+/// Audit V6: a funded sleeve without a valid price no longer traps every
+/// holder. `redeem` stays halted (no fair share price); `redeem_frozen` pays
+/// the priced part now and records the frozen units as a claim, settled in
+/// cash at the conservative price once the asset is priced again. Real
+/// holdings throughout (EURC bought through real Soroswap).
+mod v6 {
+    use super::w1::*;
+    use super::*;
+
+    const ORACLE_UNAVAILABLE: u32 = 10;
+    const NO_FROZEN_SLEEVE: u32 = 29;
+    const NO_CLAIM: u32 = 30;
+    const EXCEEDS_REDEMPTION_CAPACITY: u32 = 8;
+
+    /// W1 setup, buy `usdc_in` of EURC through real Soroswap, then let both
+    /// EURC feeds go stale (limit 1 h). Returns (r, EURC held).
+    fn frozen(usdc_in: i128) -> (R, i128) {
+        let r = setup();
+        let mut p = proposal(&r, usdc_in, quote(&r, usdc_in));
+        let env = &r.s.env;
+        let cash_bps = ((10_000 * ONE - usdc_in) * 10_000 / (10_000 * ONE)) as u32;
+        p.weights_after = Vec::from_array(env, [(Symbol::new(env, "USDC"), cash_bps), (Symbol::new(env, "EURC"), 10_000 - cash_bps)]);
+        as_keeper(&r, &p);
+        env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        let held = holdings(&r).1;
+        env.ledger().set_timestamp(r.now + 3_601);
+        env.mock_all_auths();
+        (r, held)
+    }
+
+    fn resume(r: &R, a: i128, b: i128) {
+        let env = &r.s.env;
+        let t = env.ledger().timestamp();
+        r.s.oracle.update_price(&Symbol::new(env, "EURC_A"), &a, &200_000, &t);
+        r.s.oracle.update_price(&Symbol::new(env, "EURC_B"), &b, &200_000, &t);
+    }
+
+    #[test]
+    fn redeem_stays_halted_but_redeem_frozen_pays_the_priced_part_and_records_a_claim() {
+        let (r, held) = frozen(3_000 * ONE);
+        let alice = r.depositor.clone();
+        assert_eq!(r.s.vault.try_redeem(&(1_000 * ONE), &alice, &alice, &alice).unwrap_err().unwrap(), contract_error(ORACLE_UNAVAILABLE));
+        assert!(r.s.vault.try_deposit(&ONE, &alice, &alice, &alice).is_err(), "deposits stay halted: no fair price");
+
+        let units = held * 1_000 / 10_000;
+        let preview = r.s.vault.preview_redeem_frozen(&(1_000 * ONE));
+        assert_eq!(preview.cash, 700 * ONE, "10 % of the priced part: 7,000 USDC");
+        assert_eq!(preview.claims, Vec::from_array(&r.s.env, [(r.eurc.clone(), units)]));
+        let got = r.s.vault.redeem_frozen(&(1_000 * ONE), &alice, &alice, &alice);
+        assert_eq!(got, preview);
+
+        assert_eq!(r.s.usdc.balance(&alice), 700 * ONE);
+        assert_eq!(r.s.vault.balance(&alice), 9_000 * ONE);
+        assert_eq!(r.s.vault.get_claim(&alice, &r.eurc), units);
+        assert_eq!(r.s.vault.get_claim_total(&r.eurc), units);
+        assert_eq!(holdings(&r), (6_300 * ONE, held - units), "claimed units left the sleeve's books");
+        assert_eq!(token::Client::new(&r.s.env, &r.eurc).balance(&r.s.vault_id), held, "but are still held for the claim");
+    }
+
+    #[test]
+    fn remaining_holders_keep_their_per_share_value() {
+        let (r, held) = frozen(3_000 * ONE);
+        let per_share = |cash: i128, eurc: i128, supply: i128| (cash + eurc * 108 / 100) * ONE / supply;
+        let before = per_share(7_000 * ONE, held, 10_000 * ONE);
+        let alice = r.depositor.clone();
+        r.s.vault.redeem_frozen(&(2_500 * ONE), &alice, &alice, &alice);
+        resume(&r, ONE * 108 / 100, ONE * 108 / 100);
+        let after = r.s.vault.total_assets() * ONE / r.s.vault.total_supply();
+        assert_eq!(after, per_share(holdings(&r).0, holdings(&r).1, r.s.vault.total_supply()));
+        assert!(after >= before && after - before <= 1, "before {before}, after {after}");
+    }
+
+    #[test]
+    fn a_claim_settles_in_cash_at_the_conservative_price_once_priced_again() {
+        let (r, held) = frozen(3_000 * ONE);
+        let alice = r.depositor.clone();
+        r.s.vault.redeem_frozen(&(1_000 * ONE), &alice, &alice, &alice);
+        let units = held * 1_000 / 10_000;
+        assert_eq!(r.s.vault.try_settle_claim(&alice, &r.eurc).unwrap_err().unwrap(), contract_error(ORACLE_UNAVAILABLE));
+        let bob = Address::generate(&r.s.env);
+        assert_eq!(r.s.vault.try_settle_claim(&bob, &r.eurc).unwrap_err().unwrap(), contract_error(NO_CLAIM));
+
+        resume(&r, ONE * 108 / 100, ONE * 107 / 100);
+        // Permissionless: nobody signs; the vault pays only the holder.
+        r.s.env.set_auths(&[]);
+        let paid = r.s.vault.settle_claim(&alice, &r.eurc);
+        assert_eq!(paid, units * (ONE * 107 / 100) / ONE, "conservative (minimum) price");
+        assert_eq!(r.s.usdc.balance(&alice), 700 * ONE + paid);
+        assert_eq!(r.s.vault.get_claim(&alice, &r.eurc), 0);
+        assert_eq!(r.s.vault.get_claim_total(&r.eurc), 0);
+        assert_eq!(holdings(&r), (6_300 * ONE - paid, held), "units back on the books, cash out");
+        assert_eq!(r.s.vault.try_settle_claim(&alice, &r.eurc).unwrap_err().unwrap(), contract_error(NO_CLAIM), "once");
+    }
+
+    #[test]
+    fn a_paused_vault_neither_redeems_frozen_nor_settles() {
+        let (r, _) = frozen(3_000 * ONE);
+        let alice = r.depositor.clone();
+        r.s.vault.redeem_frozen(&(1_000 * ONE), &alice, &alice, &alice);
+        resume(&r, ONE * 108 / 100, ONE * 108 / 100);
+        r.s.vault.pause();
+        assert_eq!(r.s.vault.try_redeem_frozen(&ONE, &alice, &alice, &alice).unwrap_err().unwrap(), contract_error(4));
+        assert_eq!(r.s.vault.try_settle_claim(&alice, &r.eurc).unwrap_err().unwrap(), contract_error(4));
+    }
+
+    #[test]
+    fn redeem_frozen_is_only_for_a_vault_with_a_frozen_sleeve() {
+        let r = setup();
+        r.s.env.mock_all_auths();
+        let alice = r.depositor.clone();
+        assert_eq!(r.s.vault.try_redeem_frozen(&ONE, &alice, &alice, &alice).unwrap_err().unwrap(), contract_error(NO_FROZEN_SLEEVE));
+    }
+
+    #[test]
+    fn only_the_owner_or_an_approved_operator_can_redeem_frozen() {
+        let (r, _) = frozen(3_000 * ONE);
+        let alice = r.depositor.clone();
+        let mallory = Address::generate(&r.s.env);
+        // Mallory signs for herself, but has no allowance on Alice's shares.
+        authorize(&r.s, &mallory, "redeem_frozen", (ONE, mallory.clone(), alice.clone(), mallory.clone()).into_val(&r.s.env));
+        assert_eq!(r.s.vault.try_redeem_frozen(&ONE, &mallory, &alice, &mallory).unwrap_err().unwrap(), contract_error(7),
+            "InsufficientAllowance");
+        // Nor can she act as Alice without Alice's signature.
+        authorize(&r.s, &mallory, "redeem_frozen", (ONE, mallory.clone(), alice.clone(), alice.clone()).into_val(&r.s.env));
+        assert!(r.s.vault.try_redeem_frozen(&ONE, &mallory, &alice, &alice).is_err());
+        assert_eq!(r.s.vault.balance(&alice), 10_000 * ONE);
+        assert_eq!(r.s.vault.get_claim(&mallory, &r.eurc), 0);
+    }
+
+    #[test]
+    fn a_settlement_the_cash_cannot_cover_waits_with_the_claim_intact() {
+        let (r, held) = frozen(9_000 * ONE);
+        let alice = r.depositor.clone();
+        let got = r.s.vault.redeem_frozen(&(9_000 * ONE), &alice, &alice, &alice);
+        assert_eq!(got.cash, 900 * ONE);
+        resume(&r, ONE * 108 / 100, ONE * 107 / 100);
+        let units = held * 9_000 / 10_000;
+        assert_eq!(r.s.vault.try_settle_claim(&alice, &r.eurc).unwrap_err().unwrap(), contract_error(EXCEEDS_REDEMPTION_CAPACITY));
+        assert_eq!(r.s.vault.get_claim(&alice, &r.eurc), units);
+        assert_eq!(holdings(&r), (100 * ONE, held - units));
+    }
+
+    /// If the issuer claws tokens back while claims are outstanding, the
+    /// settlement is capped pro rata to the reserved units still held - the
+    /// remaining holders never pay cash for units that are gone.
+    #[test]
+    fn a_clawback_meanwhile_caps_the_settlement_pro_rata() {
+        let (r, held) = frozen(3_000 * ONE);
+        let alice = r.depositor.clone();
+        r.s.vault.redeem_frozen(&(5_000 * ONE), &alice, &alice, &alice);
+        let units = held * 5_000 / 10_000;
+        let booked = holdings(&r).1;
+        r.eurc_admin.clawback(&r.s.vault_id, &(units / 2));
+        resume(&r, ONE * 108 / 100, ONE * 107 / 100);
+        assert_eq!(holdings(&r).1, booked, "the remaining holders' units are untouched");
+        let present = held - units / 2 - booked;
+        let paid_units = units * present / units;
+        let paid = r.s.vault.settle_claim(&alice, &r.eurc);
+        assert_eq!(paid, paid_units * (ONE * 107 / 100) / ONE);
+        assert!(paid_units < units);
+        let real = token::Client::new(&r.s.env, &r.eurc).balance(&r.s.vault_id);
+        assert_eq!(holdings(&r).1, real, "books equal the real balance after settlement");
+        assert_eq!(r.s.vault.get_claim_total(&r.eurc), 0);
     }
 }
