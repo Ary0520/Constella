@@ -520,8 +520,8 @@ fn test_t55_sponsored_passkey_vault_deposit() {
 
     // C) The designated relayer (audit F1b) records the sponsored transaction
     let relayer = Address::generate(&env);
-    sponsor_client.set_relayer(&relayer);
-    sponsor_client.record_sponsored_op(&user_account_id, &vault_id, &fee_bid_stroops);
+    sponsor_client.add_relayer(&relayer);
+    sponsor_client.record_sponsored_op(&relayer, &user_account_id, &vault_id, &fee_bid_stroops);
 
     // D) Verification of balances & zero-gas sponsorship accounting
     // Smart account holds 500 vault shares
