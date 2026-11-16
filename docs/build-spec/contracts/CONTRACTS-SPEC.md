@@ -89,6 +89,10 @@ fn update_policy(env: Env, vault: Address, new_hash: BytesN<32>, min_liquidity_s
                  max_single_asset_bps: u32, max_issuer_bps: u32, max_slippage_bps: u32,
                  rebalance_band_bps: u32, new_sleeves: Vec<SleeveTarget>)
 fn validate_rebalance(env: Env, vault: Address, proposal: RebalanceProposal) -> ValidationResult
+// Audit W1b: checks ACTUAL holdings, (registry asset_id, value in numéraire) per sleeve, against
+// every band, the single-asset and issuer caps and the cash floor. Exact (no rounding), read-only.
+fn validate_holdings(env: Env, vault: Address, holdings: Vec<(Symbol, i128)>) -> ValidationResult
+fn get_sleeve_targets(env: Env, vault: Address) -> Vec<SleeveTarget>
 fn get_policy_hash(env: Env, vault: Address) -> BytesN<32>
 fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfig> // includes owner + terms_hash
 ```
@@ -187,9 +191,12 @@ fn cancel_upgrade(env: Env)                          // admin
 fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade>
 fn lower_caps(env: Env, tvl_cap: i128, per_user_cap: i128)  // admin; decrease only
 fn max_deposit(env: Env, receiver: Address) -> i128  // real remaining room under both caps
-// Rebalancing (audit W1a)
+// Rebalancing (audit W1a, W1b)
 fn set_keeper(env: Env, keeper: Address)                        // admin
-fn rebalance(env: Env, proposal: RebalanceProposal)              // keeper; policy-validated; measured swaps
+fn rebalance(env: Env, proposal: RebalanceProposal)              // keeper; policy-validated; measured swaps;
+                                                                 // actual holdings re-checked (AllocationOutOfPolicy)
+// set_sleeves: once a policy is bound, each sleeve must be declared in it with the signed
+// target weight (SleeveTargetMismatch); band enforcement always uses the policy's bands.
 fn propose_router(env: Env, route: TradeRoute, router: Address)  // admin; active after 48h
 fn activate_router(env: Env, route: TradeRoute)                  // anyone, after the delay
 fn get_router(env: Env, route: TradeRoute) -> Option<Address>
