@@ -515,7 +515,12 @@ fn usdc_eurc_policy(s: &Stack) -> Address {
 /// sleeve type and the liquidity floor (bps).
 fn usdc_eurc_policy_with(s: &Stack, usdc_band: (u32, u32), eurc_band: (u32, u32), eurc_type: &str, floor_bps: u32) -> Address {
     let registry = AssetRegistryClient::new(&s.env, &s.registry_id);
-    let eurc = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+    // Like Circle's real EURC issuer: revocable + clawback enabled, so balances
+    // created afterwards (the vault's) can be clawed back (audit V6 test).
+    let sac = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env));
+    sac.issuer().set_flag(soroban_sdk::testutils::IssuerFlags::RevocableFlag);
+    sac.issuer().set_flag(soroban_sdk::testutils::IssuerFlags::ClawbackEnabledFlag);
+    let eurc = sac.address();
     registry.add_asset(&AssetEntry {
         contract_address: eurc.clone(),
         asset_id: Symbol::new(&s.env, "EURC"),
