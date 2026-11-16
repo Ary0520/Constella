@@ -171,7 +171,7 @@ Can liquidity sleeve cover it?
 
 | Fee | Method | On-chain? |
 |---|---|---|
-| Management fee | Share dilution inside vault | YES — visible on-chain |
+| Performance fee (D-D) | 10% of profit above the per-share high-water mark (conservative NAV), max 0.20%/yr of assets, at most daily; share dilution | YES — enforced and visible on-chain |
 | Subscription fee | Off-chain billing | No |
 | Issuer expense ratios | Pass-through; no Constella markup | Shown in UI before deposit |
 

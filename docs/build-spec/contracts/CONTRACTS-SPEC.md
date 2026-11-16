@@ -221,7 +221,7 @@ pub struct VaultState {
     pause_authority: Address,
     is_paused: bool,
     last_fee_accrual: u64,
-    management_fee_bps: u32,
+    performance_fee_bps: u32, // D-D: <= 1000 (10% of profit); cap 0.20%/yr of assets; daily crystallization
     tvl_cap: i128,        // required, > 0; total vault value cap (Rule 6; $1M in beta)
     per_user_cap: i128,   // required, > 0, <= tvl_cap; per-receiver cap on deposit/mint
 }
@@ -477,7 +477,7 @@ Data: { relevant fields, timestamp }
 | `REBALANCE_COMPLETE` | Full rebalance completed |
 | `NAV_PAUSE` | Circuit breaker triggered |
 | `NAV_RESUME` | Circuit breaker cleared |
-| `FEE_ACCRUAL` | Management fee accrued |
+| `FEE_ACCRUAL` | Performance fee crystallized (shares minted to the treasury; only on profit above the high-water mark) |
 | `POLICY_REGISTERED` | New policy hash stored |
 | `POLICY_UPDATED` | Policy hash updated |
 | `VAULT_PAUSED` | Vault paused |

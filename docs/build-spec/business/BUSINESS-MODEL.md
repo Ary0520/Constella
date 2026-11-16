@@ -9,7 +9,7 @@
 1. **Zero User Gas:** Transaction fees and trustline reserves are sponsored by Constella.
 2. **Zero In/Out Friction:** No deposit fees, no redemption fees, no protocol-level bid/ask spread.
 3. **Issuer Cost Pass-Through:** Underlying asset management fees (e.g. Franklin Templeton's or Ondo's expense ratios) are passed through at net cost with 100% transparency.
-4. **Thin Wrapper Pricing:** Constella charges a low, predictable management fee (0.05%–0.25%/year) accrued via on-chain share dilution.
+4. **Thin Wrapper Pricing (decision D-D, 16 Nov 2026):** Constella charges a **performance fee of 10 % of the profit** a vault earns above its high-water mark — nothing on principal, nothing when the vault earns nothing — with an **all-in ceiling of 0.20 % / year** of assets, enforced in the vault contract. Accrued via on-chain share dilution, at most once per day.
 5. **Free Thesis Discovery:** Unlimited AI thesis generations and simulation scenarios are always free.
 
 ---
@@ -30,17 +30,18 @@
 ```
 
 ### Stream Details
-1. **Management Fee on AUM (Core):**
-   - Accrues continuously on-chain via fractional share dilution.
-   - Requires zero invoicing; non-custodial and programmatic.
+1. **Performance Fee (Core, D-D):**
+   - 10 % of profit above the per-share high-water mark (conservative NAV); capped at 0.20 % of assets per year all-in; crystallizes at most daily via share dilution.
+   - Why: Phase-1 yields are low (Blend V2 average supply APY ≈ 2.4 %, DefiLlama Nov 2026); a 0.20 % AUM fee would take most of a cash-heavy holder's yield. Competitors charge on yield (Morpho curators 0–20 % of interest; many vaults 0 % management fee).
+   - Requires zero invoicing; non-custodial and programmatic. Revenue in Phase 1 is correspondingly small; it grows with yield-bearing sleeves (T-bills in Phase 3).
 2. **Treasury SaaS Subscriptions (High Margin):**
    - Monthly retainer for institutional features: private vault factory deployment, multi-entity accounting, automated tax-lot harvesting, SOC2-compliant audit logs, and dedicated keeper gas pools.
 3. **Partner Platform Fees & Revenue Share (Scale Distribution):**
-   - Wallets and fintechs embedding the Constella SDK pay a platform fee or share 30% of basket AUM fees.
+   - Wallets and fintechs embedding the Constella SDK pay a platform fee or share 30% of the vault performance fee.
    - Unlocked at massive scale via Bell's CAP-84 W-address omnibus accounts.
 4. **Curator Marketplace (Ecosystem Growth):**
    - Community analysts and asset managers publish verified theses.
-   - Curators can attach up to 0.30% add-on fee; Constella retains a 30% protocol cut.
+   - A curator's share comes **out of** the same 10 % performance fee (never on top); the 0.20 %/yr all-in ceiling always holds.
 
 ---
 
@@ -48,13 +49,13 @@
 
 | Plan | Target Customer | Features Included | Fee Structure |
 |---|---|---|---|
-| **Explorer** | Individuals & retail testers | Unlimited drafts & simulations, 1 active basket up to $25k | 0.20% / yr on AUM (No SaaS fee) |
-| **Pro** | Power users & angels | Unlimited baskets, custom rebalance bands, CSV exports | 0.15% / yr + $19 / month |
-| **Treasury** | Startups, DAOs, VC Funds, Foundations | Private vaults, multisig & ML-DSA, tax-lot accounting, API access | $199–$499 / mo + 0.10% / yr (falls to 0.05% for AUM > $5M) |
-| **Partner** | Wallets, Anchors, Fintechs | White-label UI, SDK access, W-address omnibus, priority routing | 0.10% / yr + 30% rev-share to partner (or flat enterprise licence) |
-| **Curator** | Strategy publishers | Public thesis publishing, distribution channel | Curator sets up to 0.30%; Constella takes 30% |
+| **Explorer** | Individuals & retail testers | Unlimited drafts & simulations, 1 active basket up to $25k | 10% of profit, max 0.20% / yr (No SaaS fee) |
+| **Pro** | Power users & angels | Unlimited baskets, custom rebalance bands, CSV exports | 10% of profit, max 0.20% / yr + $19 / month |
+| **Treasury** | Startups, DAOs, VC Funds, Foundations | Private vaults, multisig & ML-DSA, tax-lot accounting, API access | $199–$499 / mo + performance fee set per vault (≤ 10% of profit; e.g. 5% above $5M AUM) |
+| **Partner** | Wallets, Anchors, Fintechs | White-label UI, SDK access, W-address omnibus, priority routing | 30% of the performance fee shared with the partner (or flat enterprise licence) |
+| **Curator** | Strategy publishers | Public thesis publishing, distribution channel | Curator's share comes out of the 10% performance fee |
 
-**Hard Ceiling:** All-in Constella protocol fees never exceed **0.35% / year**.
+**Hard Ceiling (D-D, enforced on chain):** fees never exceed **10% of profit** and never **0.20% of assets per year**, all-in. Issuer fund fees are passed through at cost and shown separately.
 
 ---
 
