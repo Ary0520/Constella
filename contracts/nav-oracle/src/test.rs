@@ -2116,3 +2116,193 @@ mod o5 {
         assert_eq!(cfg(&client, &sleeve), (200, 3));
     }
 }
+
+// ---------------------------------------------------------------------------
+// Decision D-H: Blend v2 supply positions, priced from the REAL pool's live
+// b_rate (mainnet WASMs via constella-testkit). The pool's oracle is this
+// NAV oracle, so Blend's own borrow path reads Constella's SEP-40 feed.
+// ---------------------------------------------------------------------------
+mod blend_position {
+    use super::*;
+    use constella_testkit::blend::{self, pool::Request, BORROW, RATE_SCALE, SCALAR_7, SUPPLY, SUPPLY_COLLATERAL};
+    use soroban_sdk::token::StellarAssetClient;
+
+    struct S<'a> {
+        env: Env,
+        oracle: NavOracleClient<'a>,
+        usdc: Address,
+        usdc_admin: StellarAssetClient<'a>,
+        b: blend::BlendEnv<'a>,
+    }
+
+    fn setup() -> S<'static> {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.cost_estimate().budget().reset_unlimited();
+        env.ledger().set_timestamp(1_731_600_000);
+        let usdc = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+        let usdc_admin = StellarAssetClient::new(&env, &usdc);
+        let oracle_id = env.register(NavOracle, (Address::generate(&env), usdc.clone(), 7u32, 300u32));
+        let oracle = NavOracleClient::new(&env, &oracle_id);
+        let b = blend::deploy(&env, &usdc_admin, &oracle_id);
+        S { env, oracle, usdc, usdc_admin, b }
+    }
+
+    fn req(env: &Env, kind: u32, asset: &Address, amount: i128) -> Vec<Request> {
+        soroban_sdk::vec![env, Request { request_type: kind, address: asset.clone(), amount }]
+    }
+
+    /// EURC reserve + two EURC feeds (1.08 / 1.07) under their own sleeve.
+    fn add_eurc(s: &S) -> Address {
+        let eurc = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+        blend::add_reserve(&s.env, &s.b, &eurc, 7);
+        let sleeve = Symbol::new(&s.env, "EURC");
+        s.oracle.configure_sleeve(&sleeve, &200, &2);
+        for (id, px) in [("EURC_A", 10_800_000i128), ("EURC_B", 10_700_000i128)] {
+            s.oracle.register_source(&OracleSource {
+                source_id: Symbol::new(&s.env, id),
+                asset: eurc.clone(),
+                sleeve: sleeve.clone(),
+                price: px,
+                timestamp: s.env.ledger().timestamp(),
+                staleness_limit_seconds: 3600,
+                min_liquidity_depth_usd: 100_000,
+                current_liquidity_depth_usd: 200_000,
+                is_active: true,
+                feeder: Address::generate(&s.env),
+            });
+        }
+        eurc
+    }
+
+    #[test]
+    fn a_usdc_supply_position_is_priced_by_the_live_b_rate() {
+        let s = setup();
+        let pool = s.b.pool.address.clone();
+        s.oracle.register_blend_position(&pool, &s.usdc);
+        assert_eq!(s.oracle.asset_price(&pool).unwrap().price, SCALAR_7, "fresh reserve: 1 bToken = 1 USDC");
+        assert_eq!(s.oracle.collateral_price(&pool).unwrap().price, SCALAR_7);
+        assert_eq!(s.oracle.lastprice(&Asset::Stellar(pool.clone())).unwrap().price, SCALAR_7);
+
+        // Real utilization: a lender supplies, a borrower posts USDC collateral
+        // and borrows. Blend prices that collateral and debt through THIS
+        // oracle (lastprice(Asset::Stellar(USDC)) + decimals()). Health:
+        // 50k x c_factor 0.75 = 37.5k >= 20k / l_factor 0.75 = 26.7k.
+        let lender = Address::generate(&s.env);
+        s.usdc_admin.mint(&lender, &(100_000 * SCALAR_7));
+        s.b.pool.submit(&lender, &lender, &lender, &req(&s.env, SUPPLY, &s.usdc, 100_000 * SCALAR_7));
+        let borrower = Address::generate(&s.env);
+        s.usdc_admin.mint(&borrower, &(50_000 * SCALAR_7));
+        s.b.pool.submit(&borrower, &borrower, &borrower, &req(&s.env, SUPPLY_COLLATERAL, &s.usdc, 50_000 * SCALAR_7));
+        s.b.pool.submit(&borrower, &borrower, &borrower, &req(&s.env, BORROW, &s.usdc, 20_000 * SCALAR_7));
+        assert_eq!(s.b.pool.get_positions(&borrower).liabilities.len(), 1, "the borrow went through our feed");
+
+        // Interest accrues over 30 days; the position's price follows b_rate.
+        s.env.ledger().set_timestamp(s.env.ledger().timestamp() + 30 * 24 * 3600);
+        let b_rate = s.b.pool.get_reserve(&s.usdc).data.b_rate;
+        assert!(b_rate > RATE_SCALE, "suppliers earned interest");
+        let expected = SCALAR_7 * b_rate / RATE_SCALE;
+        assert!(expected > SCALAR_7);
+        assert_eq!(s.oracle.asset_price(&pool).unwrap().price, expected);
+        assert_eq!(s.oracle.collateral_price(&pool).unwrap().price, expected, "USDC is the base: median = minimum");
+        assert_eq!(s.oracle.lastprice(&Asset::Stellar(pool.clone())).unwrap().price, expected);
+    }
+
+    #[test]
+    fn a_non_base_underlying_uses_its_median_and_its_minimum() {
+        let s = setup();
+        let eurc = add_eurc(&s);
+        let pool = s.b.pool.address.clone();
+        s.oracle.register_blend_position(&pool, &eurc);
+        // Fresh EURC reserve (b_rate 1.0): median 1.075, minimum 1.07.
+        assert_eq!(s.oracle.asset_price(&pool).unwrap().price, 10_750_000);
+        assert_eq!(s.oracle.collateral_price(&pool).unwrap().price, 10_700_000);
+        assert_eq!(s.oracle.lastprice(&Asset::Stellar(pool.clone())).unwrap().price, 10_700_000);
+        assert_eq!(s.oracle.blend_position(&pool), Some(BlendPosition { pool: pool.clone(), underlying: eurc.clone() }));
+        assert!(s.oracle.assets().contains(&Asset::Stellar(pool.clone())));
+        // The underlying's staleness carries through: no price, no position price.
+        s.env.ledger().set_timestamp(s.env.ledger().timestamp() + 3_601);
+        assert!(s.oracle.asset_price(&pool).is_none());
+        assert!(s.oracle.collateral_price(&pool).is_none());
+        assert!(s.oracle.lastprice(&Asset::Stellar(pool)).is_none());
+    }
+
+    #[test]
+    fn registration_is_validated_against_the_live_pool() {
+        let s = setup();
+        let pool = s.b.pool.address.clone();
+        let invalid = Err(Ok(OracleError::InvalidBlendPosition.into()));
+        // Not a reserve of this pool.
+        let stranger = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+        assert_eq!(s.oracle.try_register_blend_position(&pool, &stranger), invalid);
+        // A reserve whose asset has no price.
+        let unpriced = s.env.register_stellar_asset_contract_v2(Address::generate(&s.env)).address();
+        blend::add_reserve(&s.env, &s.b, &unpriced, 7);
+        assert_eq!(s.oracle.try_register_blend_position(&pool, &unpriced), invalid);
+        // Not a Blend pool at all (a token contract).
+        assert_eq!(s.oracle.try_register_blend_position(&stranger, &s.usdc), invalid);
+        assert_eq!(s.oracle.try_register_blend_position(&pool, &pool), invalid);
+        // Valid once; then immutable, and never mixed with pushed / pulled sources.
+        s.oracle.register_blend_position(&pool, &s.usdc);
+        let taken = Err(Ok(OracleError::AssetAlreadyConfigured.into()));
+        assert_eq!(s.oracle.try_register_blend_position(&pool, &s.usdc), taken);
+        let src = OracleSource {
+            source_id: Symbol::new(&s.env, "FAKE"),
+            asset: pool.clone(),
+            sleeve: Symbol::new(&s.env, "EURC"),
+            price: 99 * SCALAR_7,
+            timestamp: s.env.ledger().timestamp(),
+            staleness_limit_seconds: 3600,
+            min_liquidity_depth_usd: 100_000,
+            current_liquidity_depth_usd: 200_000,
+            is_active: true,
+            feeder: Address::generate(&s.env),
+        };
+        s.oracle.configure_sleeve(&Symbol::new(&s.env, "EURC"), &200, &2);
+        assert_eq!(s.oracle.try_register_source(&src), taken);
+        // An asset that already has sources cannot become a position.
+        let eurc = add_eurc(&s);
+        assert_eq!(s.oracle.try_register_blend_position(&eurc, &s.usdc), taken);
+        // The base asset cannot either.
+        assert_eq!(s.oracle.try_register_blend_position(&s.usdc, &eurc), taken);
+    }
+
+    /// SEPS.md follow-up closed: the real Blend v2 pool consumes Constella's
+    /// SEP-40 feed. EURC collateral is valued at Constella's conservative price
+    /// (minimum 1.07); once Constella's EURC feeds go stale, lastprice returns
+    /// None and Blend refuses to lend against it. (Blend's `load_price` does
+    /// `lastprice(..).unwrap_optimized()`: a None aborts the transaction with a
+    /// trap; InvalidPrice 1210 is only for a returned price > 24 h old or <= 0.)
+    #[test]
+    fn a_real_blend_pool_lends_only_against_a_valid_constella_price() {
+        let s = setup();
+        let eurc = add_eurc(&s);
+        let eurc_admin = StellarAssetClient::new(&s.env, &eurc);
+        let lender = Address::generate(&s.env);
+        s.usdc_admin.mint(&lender, &(50_000 * SCALAR_7));
+        s.b.pool.submit(&lender, &lender, &lender, &req(&s.env, SUPPLY, &s.usdc, 50_000 * SCALAR_7));
+        let borrower = Address::generate(&s.env);
+        eurc_admin.mint(&borrower, &(10_000 * SCALAR_7));
+        s.b.pool.submit(&borrower, &borrower, &borrower, &req(&s.env, SUPPLY_COLLATERAL, &eurc, 10_000 * SCALAR_7));
+        // 10k EURC x 1.07 x 0.75 = 8,025 of borrowing power.
+        assert!(s.b.pool.try_submit(&borrower, &borrower, &borrower, &req(&s.env, BORROW, &s.usdc, 6_100 * SCALAR_7)).is_err(),
+            "6,100 / 0.75 = 8,133 > 8,025: Blend used the MINIMUM (1.07), not the median");
+        s.b.pool.submit(&borrower, &borrower, &borrower, &req(&s.env, BORROW, &s.usdc, 1_000 * SCALAR_7));
+
+        s.env.ledger().set_timestamp(s.env.ledger().timestamp() + 3_601);
+        assert!(s.oracle.lastprice(&Asset::Stellar(eurc.clone())).is_none());
+        let debt_before = s.b.pool.get_positions(&borrower).liabilities.get(s.b.usdc_index);
+        let res = s.b.pool.try_submit(&borrower, &borrower, &borrower, &req(&s.env, BORROW, &s.usdc, 1_000 * SCALAR_7));
+        assert!(res.is_err(), "no lending against an invalid Constella price");
+        assert_eq!(s.b.pool.get_positions(&borrower).liabilities.get(s.b.usdc_index), debt_before);
+        assert_eq!(soroban_sdk::token::TokenClient::new(&s.env, &s.usdc).balance(&borrower), 1_000 * SCALAR_7);
+    }
+
+    #[test]
+    fn only_the_admin_registers_a_position() {
+        let s = setup();
+        s.env.set_auths(&[]);
+        assert!(s.oracle.try_register_blend_position(&s.b.pool.address, &s.usdc).is_err());
+        assert!(s.oracle.blend_position(&s.b.pool.address).is_none());
+    }
+}

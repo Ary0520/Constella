@@ -313,6 +313,7 @@ dependencies = [
 name = "constella-nav-oracle"
 version = "0.1.0"
 dependencies = [
+ "constella-testkit",
  "soroban-sdk",
 ]
 

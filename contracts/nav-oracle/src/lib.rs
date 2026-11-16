@@ -38,6 +38,12 @@ pub enum OracleError {
     InvalidPullConfig = 18,
     /// Prices of a pull source are read on-chain; nobody can push them.
     NotAPushSource = 19,
+    /// Blend position rejected by validation against the live pool: the
+    /// underlying is not a reserve of that pool, has no price, or the pool
+    /// is not a Blend pool (audit W1 Blend adapter, decision D-H).
+    InvalidBlendPosition = 20,
+    /// The asset is already priced another way (sources, or a Blend position).
+    AssetAlreadyConfigured = 21,
 }
 
 /// SEP-40 asset identifier (identical to script3/sep-40-oracle and Reflector).
@@ -340,6 +346,77 @@ pub enum DataKey {
     /// Sleeve loosening waiting for its delay (audit O5).
     PendingSleeveConfig(Symbol),
     PauseAuthority,
+    /// Blend v2 supply position priced from the pool's live b_rate (D-H).
+    BlendPosition(Address),
+}
+
+/// A Blend v2 supply position, identified by its pool's address (one priced
+/// reserve per pool). Its price per bToken is the underlying's price x
+/// b_rate / 1e12, b_rate read live from `pool.get_reserve` (decision D-H).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendPosition {
+    pub pool: Address,
+    pub underlying: Address,
+}
+
+/// Blend v2 b_rate scale (12 decimals, `pool/src/storage.rs`).
+pub const BLEND_RATE_SCALE: i128 = 1_000_000_000_000;
+
+/// Mirrors of Blend v2's `ReserveConfig`, `ReserveData`, `Reserve`
+/// (blend-contracts-v2 `pool/src/storage.rs`, `pool/src/pool/reserve.rs`).
+/// Field names and types must match: contract types decode by field name.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserveConfig {
+    pub index: u32,
+    pub decimals: u32,
+    pub c_factor: u32,
+    pub l_factor: u32,
+    pub util: u32,
+    pub max_util: u32,
+    pub r_base: u32,
+    pub r_one: u32,
+    pub r_two: u32,
+    pub r_three: u32,
+    pub reactivity: u32,
+    pub supply_cap: i128,
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserveData {
+    pub d_rate: i128,
+    pub b_rate: i128,
+    pub ir_mod: i128,
+    pub b_supply: i128,
+    pub d_supply: i128,
+    pub backstop_credit: i128,
+    pub last_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserve {
+    pub asset: Address,
+    pub config: BlendReserveConfig,
+    pub data: BlendReserveData,
+    pub scalar: i128,
+}
+
+/// The one Blend v2 pool function the oracle reads. `get_reserve` returns the
+/// reserve accrued to the current ledger.
+#[contractclient(name = "BlendPoolClient")]
+pub trait BlendPoolInterface {
+    fn get_reserve(env: Env, asset: Address) -> BlendReserve;
+}
+
+#[contractevent(topics = ["BLEND_POSITION_REGISTERED"], data_format = "single-value")]
+pub struct BlendPositionRegistered {
+    #[topic]
+    pub pool: Address,
+    pub underlying: Address,
 }
 
 pub trait NavOracleTrait {
@@ -394,6 +471,13 @@ pub trait NavOracleTrait {
     fn decimals(env: Env) -> u32;
     fn resolution(env: Env) -> u32;
     fn assets(env: Env) -> Vec<Asset>;
+
+    /// Price a Blend v2 supply position (decision D-H). Admin only; validated
+    /// against the live pool; immutable once registered.
+    fn register_blend_position(env: Env, pool: Address, underlying: Address);
+
+    /// The registered Blend position for `pool`, if any.
+    fn blend_position(env: Env, pool: Address) -> Option<BlendPosition>;
 
     /// Circuit breaker status and management
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool;
@@ -632,6 +716,54 @@ fn sleeve_config(env: &Env, sleeve_id: &Symbol) -> SleeveOracleConfig {
         })
 }
 
+fn blend_position_of(env: &Env, asset: &Address) -> Option<BlendPosition> {
+    env.storage().instance().get(&DataKey::BlendPosition(asset.clone()))
+}
+
+/// The pool's live b_rate for `underlying` (12 decimals), or None if the call
+/// fails or the rate is not positive (fail closed: a fully written-off
+/// reserve has no usable price).
+fn live_b_rate(env: &Env, pos: &BlendPosition) -> Option<i128> {
+    let reserve = BlendPoolClient::new(env, &pos.pool).try_get_reserve(&pos.underlying).ok()?.ok()?;
+    // Real Blend already fails for a non-reserve; the asset check guards
+    // against a contract that merely claims to be a pool.
+    if reserve.asset != pos.underlying || reserve.data.b_rate <= 0 {
+        return None;
+    }
+    Some(reserve.data.b_rate)
+}
+
+/// Decision D-H: price of one bToken = underlying price x b_rate / 1e12. The
+/// underlying is priced by the normal rules (median for `conservative =
+/// false`, minimum otherwise; the base asset is exactly 1.0) and keeps its
+/// own timestamp; b_rate is Blend's own accounting, read live.
+fn blend_price(env: &Env, pos: &BlendPosition, conservative: bool) -> Option<SourcedPrice> {
+    let (u_price, u_time) = if base_asset(env).as_ref() == Some(&pos.underlying) {
+        (one(env), env.ledger().timestamp())
+    } else {
+        let valid = evaluate_asset(env, &pos.underlying).ok()?;
+        let p = if conservative { min_price(&valid) } else { median_price(valid) };
+        (p.price, p.timestamp)
+    };
+    let b_rate = live_b_rate(env, pos)?;
+    let price = u_price.checked_mul(b_rate)? / BLEND_RATE_SCALE;
+    if price <= 0 {
+        return None;
+    }
+    Some(SourcedPrice { price, timestamp: u_time, source: Symbol::new(env, "BLEND_B_RATE") })
+}
+
+/// Minimum-price source of a validated set.
+fn min_price(valid: &Vec<OracleSource>) -> SourcedPrice {
+    let mut m = valid.get_unchecked(0);
+    for s in valid.iter() {
+        if s.price < m.price {
+            m = s;
+        }
+    }
+    SourcedPrice { price: m.price, timestamp: m.timestamp, source: m.source_id }
+}
+
 /// Audit O6: validate ONE asset's sources under its sleeve's configuration.
 /// Deviation, the minimum-source rule and median/minimum are computed among
 /// the same asset's sources only; a deviation pauses the asset's sleeve
@@ -720,6 +852,10 @@ fn one(env: &Env) -> i128 {
 fn conservative_now(env: &Env, asset: &Address) -> Option<PriceData> {
     if base_asset(env).as_ref() == Some(asset) {
         return Some(PriceData { price: one(env), timestamp: on_grid(env, env.ledger().timestamp()) });
+    }
+    if let Some(pos) = blend_position_of(env, asset) {
+        let p = blend_price(env, &pos, true)?;
+        return Some(PriceData { price: p.price, timestamp: on_grid(env, p.timestamp) });
     }
     let valid = evaluate_asset(env, asset).ok()?;
     let mut price = i128::MAX;
@@ -953,6 +1089,10 @@ fn admin_of(env: &Env) -> Address {
 
 /// Install a source (indexes, deviation latch, history snapshot).
 fn apply_source(env: &Env, source: &OracleSource) {
+    // Every source path (immediate or after the O7a delay) lands here.
+    if blend_position_of(env, &source.asset).is_some() {
+        panic_with_error!(env, OracleError::AssetAlreadyConfigured);
+    }
     env.storage()
         .instance()
         .set(&DataKey::Source(source.source_id.clone()), source);
@@ -1158,6 +1298,9 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn collateral_price(env: Env, asset: Address) -> Option<SourcedPrice> {
+        if let Some(pos) = blend_position_of(&env, &asset) {
+            return blend_price(&env, &pos, true);
+        }
         let valid_sources = evaluate_asset(&env, &asset).ok()?;
         let mut min_source = valid_sources.get(0).unwrap();
         for s in valid_sources.iter() {
@@ -1193,6 +1336,9 @@ impl NavOracleTrait for NavOracle {
                 timestamp: env.ledger().timestamp(),
                 source: Symbol::new(&env, "BASE"),
             });
+        }
+        if let Some(pos) = blend_position_of(&env, &asset) {
+            return blend_price(&env, &pos, false);
         }
         let valid = evaluate_asset(&env, &asset).ok()?;
         Some(median_price(valid))
@@ -1259,6 +1405,31 @@ impl NavOracleTrait for NavOracle {
     fn assets(env: Env) -> Vec<Asset> {
         let all: Vec<Address> = env.storage().instance().get(&DataKey::AllAssets).unwrap_or_else(|| Vec::new(&env));
         Vec::from_iter(&env, all.iter().map(Asset::Stellar))
+    }
+
+    fn register_blend_position(env: Env, pool: Address, underlying: Address) {
+        admin_of(&env).require_auth();
+        let taken = blend_position_of(&env, &pool).is_some()
+            || env.storage().instance().has(&DataKey::AssetSleeve(pool.clone()))
+            || base_asset(&env).as_ref() == Some(&pool);
+        if taken {
+            panic_with_error!(&env, OracleError::AssetAlreadyConfigured);
+        }
+        let pos = BlendPosition { pool: pool.clone(), underlying: underlying.clone() };
+        // The pool must hold a live reserve of exactly this asset, and the
+        // underlying must be priceable right now (base asset or valid sources).
+        if live_b_rate(&env, &pos).is_none() || blend_price(&env, &pos, true).is_none() {
+            panic_with_error!(&env, OracleError::InvalidBlendPosition);
+        }
+        env.storage().instance().set(&DataKey::BlendPosition(pool.clone()), &pos);
+        let mut all: Vec<Address> = env.storage().instance().get(&DataKey::AllAssets).unwrap_or_else(|| Vec::new(&env));
+        all.push_back(pool.clone());
+        env.storage().instance().set(&DataKey::AllAssets, &all);
+        BlendPositionRegistered { pool, underlying }.publish(&env);
+    }
+
+    fn blend_position(env: Env, pool: Address) -> Option<BlendPosition> {
+        blend_position_of(&env, &pool)
     }
 
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool {
