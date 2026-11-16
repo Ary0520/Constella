@@ -189,8 +189,19 @@ def generate_explanation(
 
     # 3. Issuer Concentration Warnings (Threshold >= 25% or 0.249)
     issuer_concentration_warnings: List[str] = []
+    # Decision D-A: the vault currency (numéraire) is exempt from the issuer
+    # cap, so its issuer's exposure is disclosed plainly instead of being
+    # described as "within the cap".
+    numeraire = candidate_map.get(opt_result.numeraire) if opt_result.numeraire else None
     for issuer, weight in sorted(opt_result.issuer_weights.items(), key=lambda x: -x[1]):
-        if weight >= 0.249:
+        if numeraire is not None and issuer == numeraire.issuer and weight >= 0.249:
+            issuer_concentration_warnings.append(
+                f"Vault currency disclosure: {weight * 100:.1f}% of this vault depends on {issuer}, mostly through "
+                f"{numeraire.asset_id} - the currency the vault holds and pays out in. The {policy.max_issuer_weight * 100:.1f}% "
+                f"issuer cap applies to every other asset; settlement cash is exempt by design, so a {numeraire.asset_id} "
+                f"depeg or an issuer freeze would affect this share."
+            )
+        elif weight >= 0.249:
             issuer_concentration_warnings.append(
                 f"Concentration Warning: Issuer '{issuer}' represents {weight * 100:.1f}% of total portfolio allocation (>= 25% threshold). "
                 f"While within the configured cap ({policy.max_issuer_weight * 100:.1f}%), this concentration carries single-entity counterparty risk."

@@ -110,7 +110,11 @@ class OptimizationResult(BaseModel):
     sleeve_weights: Dict[str, float]
     currency_weights: Dict[str, float]
     issuer_weights: Dict[str, float]
-    algorithm_used: str  # "HRP" | "CONSTRAINED_HEURISTIC"
+    algorithm_used: str  # "HRP" | "CONSTRAINED_HEURISTIC" | "LP"
+    # Decision D-A: the profile applied and the vault currency (numéraire),
+    # which is exempt from the issuer and single-asset caps.
+    profile: str = ""
+    numeraire: str = ""
 
 
 class RedemptionLadder(BaseModel):
