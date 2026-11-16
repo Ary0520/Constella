@@ -37,13 +37,16 @@ transaction (S+1) landed first: quotas cannot be skipped even by a bug in step o
 - `auth[0]` must authorize exactly this call; its address is the sponsored user. 1–4 entries; size limits.
 - Errors are stable codes (`SOURCE_ACCOUNT_AUTH_FORBIDDEN`, `SIMULATION_FAILED`, `SPONSOR_REFUSED`, …).
 
-The relayer key is the fee-sponsor's **relayer role** (F1b): it can record sponsored operations and
-nothing else — it cannot change limits, the whitelist, the admin, or unpause.
+Relayer keys form a **pool** (decision D-I): the fee-sponsor holds a bounded relayer set (≤ 16,
+`add_relayer` / `remove_relayer`, admin only). Each pool account works under its own lock, so throughput
+scales with the pool; every per-account guarantee holds. A relayer key can record sponsored operations
+(naming itself, and signing) and nothing else — it cannot change limits, the whitelist, the pool, the
+admin, or unpause. A rotated or compromised key is removed from the set and stops at once.
 
 ## Run
 
 ```
-CONSTELLA_RPC_URL=… CONSTELLA_NETWORK_PASSPHRASE=… RELAYER_SECRET=… \
+CONSTELLA_RPC_URL=… CONSTELLA_NETWORK_PASSPHRASE=… RELAYER_SECRETS=S…,S… \
 SPONSOR_CONTRACT_ID=C… SPONSOR_ALLOWED="C<vault>:deposit,redeem,withdraw,redeem_frozen" \
 RELAYER_MAX_FEE_STROOPS=1000000 constella-relayer        # binds 127.0.0.1:8787
 ```
@@ -55,7 +58,8 @@ environment only and never logged. Production: hosted signer (KMS) is a follow-u
 
 - `pytest` (23 unit tests on real XDR; gateway mutation-tested 9/9; passkey digest vectors cross-checked
   against OpenZeppelin's Rust `AuthDigestPreimage::digest`).
-- `tests/localnet_e2e.sh` — the S2 proof on a real local network (quickstart, protocol 30, release
+- `tests/localnet_e2e.sh` — the S2 proof on a real local network (two pool relayers, two passkey accounts;
+  two simultaneous users are served by two different pool accounts) (quickstart, protocol 30, release
   WASMs). Result on 16 Nov 2026: a passkey account with 0 XLM deposited 500 USDC; 500 shares minted;
   user XLM 0; the relayer paid exactly the fees charged (deposit 328,466 + record 105,483 stroops);
   stranger passkey / source-account drain / non-allow-listed function / paused sponsor all refused
@@ -63,7 +67,8 @@ environment only and never logged. Production: hosted signer (KMS) is a follow-u
 
 ## Not yet
 
-- OpenZeppelin hosted Channels as the submission backend (owner decision pending: external service).
-- Channel accounts for parallel submission (one relayer account, serialized by a lock, today).
+- OpenZeppelin hosted Channels: decided against for the critical path (D-I); optional mainnet-scale
+  backend later (its API key would then be requested).
+- KMS / hosted signer for relayer keys — required before mainnet (D-I).
 - Classic `G…` users signing their own inner transaction (fee-bump / CAP-15 path).
 - Account-management sponsorship (each smart account is its own contract; needs a separate rule).
