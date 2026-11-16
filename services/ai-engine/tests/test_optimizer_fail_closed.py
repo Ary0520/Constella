@@ -123,3 +123,25 @@ def test_the_vault_currency_risk_is_disclosed_not_called_within_the_cap():
     circle = [w for w in warnings if "CIRCLE" in w]
     assert circle and "USDC" in circle[0] and "depeg" in circle[0]
     assert all("within the configured cap" not in w for w in circle)
+
+
+def test_the_signed_policy_declares_the_vault_currency_for_the_chain():
+    # A1b: the policy contract exempts only the sleeve typed "numeraire".
+    from src.signer import assemble_canonical_policy
+    p = retail(currency_exposure={})
+    c = cands(p)
+    r = optimize_portfolio(p, c)
+    signed = assemble_canonical_policy(p, r, c, created_at="2026-11-17T00:00:00Z")
+    kinds = {s.asset_id: s.sleeve_type for s in signed.sleeves}
+    assert kinds["USDC"] == "numeraire"
+    assert all(k != "numeraire" for a, k in kinds.items() if a != "USDC")
+
+
+def test_the_signer_refuses_assets_outside_the_candidates():
+    from src.signer import assemble_canonical_policy
+    p = retail()
+    c = cands(p)
+    r = optimize_portfolio(p, c)
+    r.weights_bps = {**r.weights_bps, "FRANKLIN_BENJI": 1}
+    with pytest.raises(ValueError):
+        assemble_canonical_policy(p, r, c, created_at="2026-11-17T00:00:00Z")

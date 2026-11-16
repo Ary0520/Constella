@@ -45,19 +45,22 @@ def assemble_canonical_policy(
     for asset_id, weight_bps in opt_result.weights_bps.items():
         if weight_bps > 0:
             candidate = candidate_map.get(asset_id)
-            if candidate is not None:
-                contract_address = candidate.contract_address
-                sleeve_type_str = (
-                    candidate.sleeve_type.value
-                    if hasattr(candidate.sleeve_type, "value")
-                    else str(candidate.sleeve_type)
-                )
-            else:
-                contract_address = ""
-                sleeve_type_str = "cash"
+            if candidate is None:
+                # Never sign an asset the user is not eligible for (fail closed).
+                raise ValueError(f"cannot sign {asset_id}: not an eligible candidate")
+            contract_address = candidate.contract_address
+            sleeve_type_str = (
+                candidate.sleeve_type.value
+                if hasattr(candidate.sleeve_type, "value")
+                else str(candidate.sleeve_type)
+            )
+            # Decision D-A / A1b: the vault currency is declared on chain as the
+            # "numeraire" sleeve (exempt from the concentration caps there too).
+            if opt_result.numeraire and asset_id == opt_result.numeraire:
+                sleeve_type_str = "numeraire"
 
             # Cash sleeves use tighter rebalance bands (200 bps); others use default 500 bps
-            band_bps = 200 if sleeve_type_str in ("cash", SleeveType.CASH_STABLE) else 500
+            band_bps = 200 if sleeve_type_str in ("cash", "numeraire", SleeveType.CASH_STABLE) else 500
 
             sleeves.append(
                 CanonicalSleeve(
