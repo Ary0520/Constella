@@ -428,3 +428,31 @@ fn golden_events_fee_sponsor() {
     g.finish(&["SPONSOR_INITIALIZED", "CONTRACT_WHITELISTED", "SPONSORED_OP", "LIMITS_UPDATED",
         "SPONSOR_PAUSED", "SPONSOR_UNPAUSED", "CONTRACT_UNWHITELISTED", "SPONSOR_ADMIN_TRANSFERRED"]);
 }
+
+/// Audit F1a: per-user quota state must not live in instance storage. The
+/// instance entry is loaded by every call and is size-capped, so growing it
+/// per user would eventually brick the sponsor for everyone (same class as
+/// vault audit W2). Each user's stats belong in their own persistent entry.
+#[test]
+fn f1a_instance_storage_does_not_grow_with_the_number_of_users() {
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_731_600_000);
+    let admin = Address::generate(&env);
+    let id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &id);
+    let vault = Address::generate(&env);
+    client.whitelist_contract(&vault);
+    let first = Address::generate(&env);
+    client.record_sponsored_op(&first, &vault, &1_000);
+    let instance_len = || env.as_contract(&id, || env.storage().instance().all().len());
+    let baseline = instance_len();
+    for _ in 0..20 {
+        client.record_sponsored_op(&Address::generate(&env), &vault, &1_000);
+    }
+    assert_eq!(instance_len(), baseline, "per-user stats leaked into instance storage");
+    assert!(env.as_contract(&id, || env.storage().instance().get_ttl()) > 0);
+    let persisted = env.as_contract(&id, || env.storage().persistent().all().len());
+    assert!(persisted >= 21, "each user's stats must be their own persistent entry");
+}
