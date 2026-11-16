@@ -13,7 +13,7 @@ use constella_policy::{
     PolicyContract, PolicyContractClient, RebalanceProposal, SleeveTarget, TradeOperation, TradeRoute,
 };
 use constella_registry::{AssetEntry, AssetRegistry, AssetRegistryClient, SleeveType as RegSleeve};
-use constella_vault_strategy::{SleeveState, SleeveType, StrategyVault, StrategyVaultClient, VaultConfig};
+use constella_vault_strategy::{PolicySleeveTargetRef, SleeveState, SleeveType, StrategyVault, StrategyVaultClient, VaultConfig};
 use soroban_sdk::{
     testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
     token, Address, Env, IntoVal, String, Symbol, TryFromVal, Vec,
@@ -514,6 +514,14 @@ fn usdc_eurc_policy(s: &Stack) -> Address {
 /// USDC + EURC policy with signed bands `(min, max)` per sleeve, EURC's policy
 /// sleeve type and the liquidity floor (bps).
 fn usdc_eurc_policy_with(s: &Stack, usdc_band: (u32, u32), eurc_band: (u32, u32), eurc_type: &str, floor_bps: u32) -> Address {
+    usdc_eurc_policy_cfg(s, usdc_band, eurc_band, "cash", eurc_type, floor_bps, 10_000, 10_000)
+}
+
+/// Full control: USDC's policy sleeve type ("numeraire" = the vault
+/// currency, decision D-A) and the single-asset / issuer caps (bps).
+#[allow(clippy::too_many_arguments)]
+fn usdc_eurc_policy_cfg(s: &Stack, usdc_band: (u32, u32), eurc_band: (u32, u32), usdc_type: &str, eurc_type: &str, floor_bps: u32,
+    single_bps: u32, issuer_bps: u32) -> Address {
     let registry = AssetRegistryClient::new(&s.env, &s.registry_id);
     // Like Circle's real EURC issuer: revocable + clawback enabled, so balances
     // created afterwards (the vault's) can be clawed back (audit V6 test).
@@ -544,7 +552,7 @@ fn usdc_eurc_policy_with(s: &Stack, usdc_band: (u32, u32), eurc_band: (u32, u32)
         s.oracle.register_source(&src);
     }
     let mut targets = Vec::new(&s.env);
-    for (id, (lo, hi), kind) in [("USDC", usdc_band, "cash"), ("EURC", eurc_band, eurc_type)] {
+    for (id, (lo, hi), kind) in [("USDC", usdc_band, usdc_type), ("EURC", eurc_band, eurc_type)] {
         targets.push_back(SleeveTarget {
             asset_id: Symbol::new(&s.env, id),
             target_weight_bps: 5000,
@@ -556,7 +564,7 @@ fn usdc_eurc_policy_with(s: &Stack, usdc_band: (u32, u32), eurc_band: (u32, u32)
     let owner = Address::generate(&s.env);
     s.policy.register_policy(
         &s.vault_id, &owner, &soroban_sdk::BytesN::from_array(&s.env, &[0x77; 32]), &s.registry_id,
-        &floor_bps, &10_000, &10_000, &50, &500, &targets,
+        &floor_bps, &single_bps, &issuer_bps, &50, &500, &targets,
     );
     eurc
 }
@@ -2612,5 +2620,89 @@ mod dd {
         assert!(ok.is_ok());
         let too_high = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deploy_stack_cfg(true, FEE_BPS + 1)));
         assert!(too_high.is_err(), "a fee above 10 % of profit is refused");
+    }
+}
+
+/// Decision D-A / audit A1b: the vault currency, declared in the signed
+/// policy as the "numeraire" sleeve, is exempt from the concentration caps on
+/// chain - so the AI engine's Cash Reserve allocation (>= 85 % USDC) passes
+/// both policy checks, while EURC still counts toward Circle.
+mod a1b {
+    use super::w1::*;
+    use super::*;
+
+    const ALLOCATION_OUT_OF_POLICY: u32 = 27;
+    const REBALANCE_REJECTED: u32 = 23;
+    const INVALID_SLEEVE_CONFIG: u32 = 17;
+
+    /// Real caps: 25 % single asset, 30 % issuer, 10 % floor.
+    fn cash_reserve(usdc_type: &'static str) -> R {
+        setup_with(move |s| usdc_eurc_policy_cfg(s, (0, 10_000), (0, 10_000), usdc_type, "cash", 1000, 2500, 3000))
+    }
+
+    fn buy_eurc(r: &R, usdc_in: i128) -> Result<(), soroban_sdk::Error> {
+        let env = &r.s.env;
+        let mut p = proposal(r, usdc_in, quote(r, usdc_in));
+        let cash = ((10_000 * ONE - usdc_in) * 10_000 / (10_000 * ONE)) as u32;
+        p.weights_after = Vec::from_array(env, [(Symbol::new(env, "USDC"), cash), (Symbol::new(env, "EURC"), 10_000 - cash)]);
+        as_keeper(r, &p);
+        env.cost_estimate().budget().reset_unlimited();
+        match r.s.vault.try_rebalance(&p) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_cash_reserve_rebalance_passes_on_chain_with_the_currency_declared() {
+        let r = cash_reserve("numeraire");
+        buy_eurc(&r, 1_500 * ONE).unwrap(); // 85 % USDC / ~15 % EURC
+        assert_eq!(holdings(&r).0, 8_500 * ONE);
+    }
+
+    #[test]
+    fn without_the_declaration_the_same_allocation_is_refused() {
+        let r = cash_reserve("cash");
+        assert_eq!(buy_eurc(&r, 1_500 * ONE), Err(contract_error(REBALANCE_REJECTED)), "85 % USDC breaches the 25 % cap");
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+    }
+
+    #[test]
+    fn eurc_still_counts_toward_circle_on_chain() {
+        // 35 % EURC (> 30 % Circle cap; the single-asset cap is lifted so the
+        // issuer cap alone decides) - claim says 70/30, actual ~65/35.
+        let r = setup_with(|s| usdc_eurc_policy_cfg(s, (0, 10_000), (0, 10_000), "numeraire", "cash", 1000, 10_000, 3000));
+        let env = &r.s.env;
+        let mut p = proposal(&r, 3_500 * ONE, quote(&r, 3_500 * ONE));
+        p.weights_after = Vec::from_array(env, [(Symbol::new(env, "USDC"), 7000u32), (Symbol::new(env, "EURC"), 3000u32)]);
+        as_keeper(&r, &p);
+        env.cost_estimate().budget().reset_unlimited();
+        assert_eq!(r.s.vault.try_rebalance(&p).unwrap_err().unwrap(), contract_error(ALLOCATION_OUT_OF_POLICY));
+        assert_eq!(holdings(&r), (10_000 * ONE, 0));
+    }
+
+    #[test]
+    fn the_vault_binds_only_its_own_currency_as_the_numeraire() {
+        let s = deploy_stack();
+        let env = &s.env;
+        let eurc = env.register_stellar_asset_contract_v2(Address::generate(env)).address();
+        AssetRegistryClient::new(env, &s.registry_id).add_asset(&AssetEntry {
+            contract_address: eurc, asset_id: Symbol::new(env, "EURC"), issuer: Symbol::new(env, "CIRCLE"),
+            sleeve_type: RegSleeve::Cash, liquidity_tier: 0, permissionless: true,
+            oracle_sources: Vec::from_array(env, [Symbol::new(env, "A"), Symbol::new(env, "B")]),
+            eligible_jurisdictions: Vec::new(env), blocked_jurisdictions: Vec::new(env),
+            investor_classes_required: Vec::new(env), is_active: true, added_at: T0,
+        });
+        let sleeves = |cur: &str, kind: &str| Vec::from_array(env, [
+            PolicySleeveTargetRef { asset_id: Symbol::new(env, cur), target_weight_bps: 10_000, min_band_bps: 0, max_band_bps: 10_000,
+                sleeve_type: Symbol::new(env, kind) }]);
+        env.mock_all_auths_allowing_non_root_auth();
+        let owner = Address::generate(env);
+        let h = soroban_sdk::BytesN::from_array(env, &[0xd1; 32]);
+        // EURC is not this USDC vault's currency.
+        assert_eq!(s.vault.try_bind_policy(&owner, &h, &1000, &2500, &3000, &50, &500, &sleeves("EURC", "numeraire")).unwrap_err().unwrap(),
+            contract_error(INVALID_SLEEVE_CONFIG));
+        s.vault.bind_policy(&owner, &h, &1000, &2500, &3000, &50, &500, &sleeves("USDC", "numeraire"));
+        assert!(s.vault.get_policy_hash().is_some());
     }
 }

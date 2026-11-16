@@ -170,6 +170,9 @@ pub enum PolicyError {
     /// Holdings passed to `validate_holdings` are malformed: a negative or
     /// duplicate entry, a zero total, or a value too large to compare.
     InvalidHoldings = 20,
+    /// Decision D-A: at most one "numeraire" sleeve; it must be an active
+    /// registry CASH asset, and it cannot change through an amendment.
+    NumeraireSleeveInvalid = 21,
 }
 
 /// Protocol minimum notice before a policy amendment takes effect (audit P4,
@@ -373,6 +376,24 @@ fn is_cash_sleeve(env: &Env, st: &Symbol) -> bool {
     bytes.eq_ignore_ascii_case(b"cash")
         || bytes.eq_ignore_ascii_case(b"cash_stable")
         || bytes.eq_ignore_ascii_case(b"cash_sleeve")
+        || is_numeraire_sleeve(env, st)
+}
+
+/// Decision D-A: the vault's own currency is declared in the signed sleeves
+/// with sleeve_type "numeraire". It counts as cash for the liquidity floor
+/// and is EXEMPT from the single-asset and issuer caps (a USDC vault is
+/// inherently USDC-exposed; its cash is governed by the floor instead).
+///
+/// Exact, case-sensitive match on purpose: the vault's binding check
+/// compares the same exact symbol, so no other spelling can carry the
+/// exemption past it.
+fn is_numeraire_sleeve(env: &Env, st: &Symbol) -> bool {
+    *st == Symbol::new(env, "numeraire")
+}
+
+/// The asset_id of the (single) numéraire sleeve, if declared.
+fn numeraire_of(env: &Env, sleeves: &Vec<SleeveTarget>) -> Option<Symbol> {
+    sleeves.iter().find(|t| is_numeraire_sleeve(env, &t.sleeve_type)).map(|t| t.asset_id)
 }
 
 fn verdict(env: &Env, err: Option<(PolicyError, &str)>) -> ValidationResult {
@@ -456,12 +477,20 @@ fn check_holdings(env: &Env, vault: &Address, holdings: &Vec<(Symbol, i128)>) ->
             cash = cash.saturating_add(v);
         }
     }
-    // Single-asset cap and issuer caps (issuer recorded in the registry).
+    // Single-asset cap and issuer caps (issuer recorded in the registry);
+    // the numéraire is exempt from both (D-A) but must still be registered.
     let registry = AssetRegistryClient::new(env, &config.registry_address);
+    let numeraire = numeraire_of(env, &targets);
     let mut issuers: Vec<(Symbol, i128)> = Vec::new(env);
     for (id, value) in holdings.iter() {
         if value == 0 {
             continue;
+        }
+        if numeraire.as_ref() == Some(&id) {
+            match registry.get_asset(&id) {
+                Some(e) if e.is_active => continue,
+                _ => return Some((PolicyError::AssetNotRegistered, "ASSET_NOT_REGISTERED")),
+            }
         }
         match cmp_weight(value, total, config.max_single_asset_bps) {
             Some(Greater) => return Some((PolicyError::SingleAssetCapExceeded, "ACTUAL_SINGLE_ASSET_CAP")),
@@ -502,6 +531,7 @@ fn check_holdings(env: &Env, vault: &Address, holdings: &Vec<(Symbol, i128)>) ->
 
 fn validate_terms(
     env: &Env,
+    registry: &Address,
     min_liquidity_sleeve_bps: u32,
     max_single_asset_bps: u32,
     max_issuer_bps: u32,
@@ -529,6 +559,17 @@ fn validate_terms(
             if sleeve_i.asset_id == sleeves.get(j).unwrap().asset_id {
                 panic_with_error!(env, PolicyError::WeightBandExceeded);
             }
+        }
+    }
+    // D-A: at most one numéraire sleeve, an active registry CASH asset.
+    let declared = sleeves.iter().filter(|t| is_numeraire_sleeve(env, &t.sleeve_type)).count();
+    if declared > 1 {
+        panic_with_error!(env, PolicyError::NumeraireSleeveInvalid);
+    }
+    if let Some(id) = numeraire_of(env, sleeves) {
+        match AssetRegistryClient::new(env, registry).get_asset(&id) {
+            Some(e) if e.is_active && e.sleeve_type == RegistrySleeveType::Cash => {}
+            _ => panic_with_error!(env, PolicyError::NumeraireSleeveInvalid),
         }
     }
 }
@@ -607,6 +648,7 @@ impl PolicyContractTrait for PolicyContract {
 
         validate_terms(
             &env,
+            &registry_address,
             min_liquidity_sleeve_bps,
             max_single_asset_bps,
             max_issuer_bps,
@@ -674,12 +716,20 @@ impl PolicyContractTrait for PolicyContract {
 
         validate_terms(
             &env,
+            &config.registry_address,
             min_liquidity_sleeve_bps,
             max_single_asset_bps,
             max_issuer_bps,
             max_slippage_bps,
             &new_sleeves,
         );
+        // D-A: the numéraire is fixed at binding (checked by the vault, which
+        // is not consulted on amendments), so an amendment cannot add,
+        // remove or change it.
+        let current: Vec<SleeveTarget> = env.storage().instance().get(&DataKey::SleeveTargets(vault.clone())).unwrap_or_else(|| Vec::new(&env));
+        if numeraire_of(&env, &new_sleeves) != numeraire_of(&env, &current) {
+            panic_with_error!(&env, PolicyError::NumeraireSleeveInvalid);
+        }
         let terms_hash = compute_terms_hash(
             &env,
             &config.registry_address,
@@ -997,9 +1047,14 @@ impl PolicyContractTrait for PolicyContract {
             }
         }
 
-        // 4. Verify no single asset weight > max_single_asset_bps
+        // 4. Verify no single asset weight > max_single_asset_bps (the
+        // numéraire is exempt, decision D-A)
+        let numeraire = numeraire_of(&env, &sleeves);
         for j in 0..proposal.weights_after.len() {
-            let (_, weight) = proposal.weights_after.get(j).unwrap();
+            let (asset_id, weight) = proposal.weights_after.get(j).unwrap();
+            if numeraire.as_ref() == Some(&asset_id) {
+                continue;
+            }
             if weight > config.max_single_asset_bps {
                 let res = ValidationResult {
                     is_valid: false,
@@ -1034,6 +1089,9 @@ impl PolicyContractTrait for PolicyContract {
                     return res;
                 }
             };
+            if numeraire.as_ref() == Some(&asset_id) {
+                continue; // registered and active (checked above); exempt from the issuer cap (D-A)
+            }
             let mut found = false;
             for k in 0..issuer_weights.len() {
                 let (issuer, total) = issuer_weights.get(k).unwrap();

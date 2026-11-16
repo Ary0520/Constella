@@ -2569,6 +2569,21 @@ impl StrategyVault {
         let config = get_config(&env);
         config.admin.require_auth();
 
+        // Decision D-A: a "numeraire" sleeve is exempt from the concentration
+        // caps, so it must be THIS vault's settlement currency. The policy
+        // cannot check that itself (it cannot call back into the vault), and
+        // registration only happens here (it requires the vault's own auth).
+        let numeraire_sym = Symbol::new(&env, "numeraire");
+        let registry = AssetRegistryClient::new(&env, &config.registry_contract);
+        for t in sleeves.iter() {
+            if t.sleeve_type == numeraire_sym {
+                match registry.get_asset_by_address(&config.numeraire) {
+                    Some(e) if e.asset_id == t.asset_id => {}
+                    _ => panic_with_error!(&env, VaultError::InvalidSleeveConfig),
+                }
+            }
+        }
+
         PolicyClient::new(&env, &config.policy_contract).register_policy(
             &env.current_contract_address(),
             &owner,

@@ -2435,3 +2435,123 @@ mod blend_route {
         assert_eq!(b.policy.validate_rebalance(&b.ctx.vault, &p).code, PolicyError::AssetNotInPolicy as u32);
     }
 }
+
+// ---------------------------------------------------------------------------
+// Decision D-A / audit A1b: the vault currency, declared as the sleeve with
+// type "numeraire", is exempt from the single-asset and issuer caps (counted
+// as cash for the floor); every other asset - EURC included - still counts.
+// ---------------------------------------------------------------------------
+mod a1b {
+    use super::*;
+
+    fn sleeve(env: &Env, id: &str, kind: &str) -> SleeveTarget {
+        SleeveTarget { asset_id: Symbol::new(env, id), target_weight_bps: 0, min_band_bps: 0, max_band_bps: 10_000,
+            sleeve_type: Symbol::new(env, kind) }
+    }
+
+    /// A fresh vault with USDC typed `usdc_kind`, EURC cash, BENJI gov fund.
+    fn register(ctx: &TestContext, usdc_kind: &str, floor: u32, single: u32, issuer: u32) -> Address {
+        let env = &ctx.env;
+        let vault = Address::generate(env);
+        let sleeves = vec![env, sleeve(env, "CIRCLE_USDC", usdc_kind), sleeve(env, "CIRCLE_EURC", "cash"),
+            sleeve(env, "FRANKLIN_BENJI", "usd_gov_fund")];
+        PolicyContractClient::new(env, &ctx.policy_address).register_policy(&vault, &ctx.owner, &sample_hash(env, 0xa1),
+            &ctx.registry_address, &floor, &single, &issuer, &50, &500, &sleeves);
+        vault
+    }
+
+    fn holdings(env: &Env, usdc: i128, eurc: i128, benji: i128) -> Vec<(Symbol, i128)> {
+        vec![env, (Symbol::new(env, "CIRCLE_USDC"), usdc), (Symbol::new(env, "CIRCLE_EURC"), eurc),
+            (Symbol::new(env, "FRANKLIN_BENJI"), benji)]
+    }
+
+    fn verdict(ctx: &TestContext, vault: &Address, h: &Vec<(Symbol, i128)>) -> (bool, u32) {
+        let r = PolicyContractClient::new(&ctx.env, &ctx.policy_address).validate_holdings(vault, h);
+        (r.is_valid, r.code)
+    }
+
+    #[test]
+    fn a_cash_reserve_vault_passes_only_with_its_currency_declared() {
+        let ctx = setup_test_context();
+        let h = holdings(&ctx.env, 8_500, 1_500, 0);
+        let declared = register(&ctx, "numeraire", 1000, 2500, 3000);
+        assert_eq!(verdict(&ctx, &declared, &h), (true, 0));
+        // Plain "cash" keeps today's stricter rule: 85 % in one asset breaches the caps.
+        let plain = register(&ctx, "cash", 1000, 2500, 3000);
+        assert!(!verdict(&ctx, &plain, &h).0);
+    }
+
+    #[test]
+    fn every_other_asset_still_counts_eurc_included() {
+        let ctx = setup_test_context();
+        let v = register(&ctx, "numeraire", 1000, 10_000, 3000);
+        // EURC alone is 35 % of CIRCLE's non-numéraire share: issuer cap.
+        assert_eq!(verdict(&ctx, &v, &holdings(&ctx.env, 6_500, 3_500, 0)), (false, PolicyError::IssuerCapExceeded as u32));
+        let s = register(&ctx, "numeraire", 1000, 2500, 10_000);
+        assert_eq!(verdict(&ctx, &s, &holdings(&ctx.env, 6_500, 0, 3_500)), (false, PolicyError::SingleAssetCapExceeded as u32));
+    }
+
+    #[test]
+    fn the_claimed_weights_check_applies_the_same_exemption() {
+        let ctx = setup_test_context();
+        let env = &ctx.env;
+        let policy = PolicyContractClient::new(env, &ctx.policy_address);
+        let proposal = |vault: &Address| RebalanceProposal {
+            vault: vault.clone(),
+            policy_hash: current_policy_hash(env, &ctx.policy_address, vault),
+            operations: vec![env],
+            weights_after: vec![env, (Symbol::new(env, "CIRCLE_USDC"), 8500u32), (Symbol::new(env, "CIRCLE_EURC"), 1500u32),
+                (Symbol::new(env, "FRANKLIN_BENJI"), 0u32)],
+            deadline: env.ledger().timestamp() + 3600,
+            proposer: ctx.proposer.clone(),
+        };
+        let declared = register(&ctx, "numeraire", 1000, 2500, 3000);
+        assert!(policy.validate_rebalance(&declared, &proposal(&declared)).is_valid);
+        let plain = register(&ctx, "cash", 1000, 2500, 3000);
+        assert!(!policy.validate_rebalance(&plain, &proposal(&plain)).is_valid);
+    }
+
+    #[test]
+    fn the_currency_counts_as_cash_for_the_liquidity_floor() {
+        let ctx = setup_test_context();
+        let ok = register(&ctx, "numeraire", 8500, 10_000, 10_000);
+        assert_eq!(verdict(&ctx, &ok, &holdings(&ctx.env, 8_500, 0, 1_500)), (true, 0));
+        let high = register(&ctx, "numeraire", 9000, 10_000, 10_000);
+        assert_eq!(verdict(&ctx, &high, &holdings(&ctx.env, 8_500, 0, 1_500)), (false, PolicyError::LiquidityFloorBreached as u32));
+    }
+
+    #[test]
+    fn registration_admits_one_active_cash_currency_spelled_exactly() {
+        let ctx = setup_test_context();
+        let env = &ctx.env;
+        let policy = PolicyContractClient::new(env, &ctx.policy_address);
+        let try_reg = |sleeves: Vec<SleeveTarget>| policy.try_register_policy(&Address::generate(env), &ctx.owner,
+            &sample_hash(env, 0xa2), &ctx.registry_address, &1000, &2500, &3000, &50, &500, &sleeves);
+        let bad = Err(Ok(PolicyError::NumeraireSleeveInvalid.into()));
+        assert_eq!(try_reg(vec![env, sleeve(env, "CIRCLE_USDC", "numeraire"), sleeve(env, "CIRCLE_EURC", "numeraire")]), bad,
+            "only one vault currency");
+        assert_eq!(try_reg(vec![env, sleeve(env, "FRANKLIN_BENJI", "numeraire")]), bad, "must be a registry CASH asset");
+        assert_eq!(try_reg(vec![env, sleeve(env, "RISKY_TOKEN", "numeraire")]), bad, "must be active");
+        // Any other spelling is an ordinary sleeve - no exemption.
+        let v = Address::generate(env);
+        policy.register_policy(&v, &ctx.owner, &sample_hash(env, 0xa3), &ctx.registry_address, &1000, &2500, &3000, &50, &500,
+            &vec![env, sleeve(env, "CIRCLE_USDC", "Numeraire"), sleeve(env, "CIRCLE_EURC", "cash"), sleeve(env, "FRANKLIN_BENJI", "usd_gov_fund")]);
+        assert!(!verdict(&ctx, &v, &holdings(env, 8_500, 1_500, 0)).0);
+    }
+
+    #[test]
+    fn an_amendment_cannot_change_add_or_remove_the_currency() {
+        let ctx = setup_test_context();
+        let env = &ctx.env;
+        let policy = PolicyContractClient::new(env, &ctx.policy_address);
+        let amend = |vault: &Address, sleeves: Vec<SleeveTarget>| policy.try_update_policy(vault, &sample_hash(env, 0xa4),
+            &1000, &2500, &3000, &50, &500, &sleeves);
+        let bad = Err(Ok(PolicyError::NumeraireSleeveInvalid.into()));
+        let v = register(&ctx, "numeraire", 1000, 2500, 3000);
+        assert_eq!(amend(&v, vec![env, sleeve(env, "CIRCLE_USDC", "cash"), sleeve(env, "CIRCLE_EURC", "numeraire")]), bad, "change");
+        assert_eq!(amend(&v, vec![env, sleeve(env, "CIRCLE_USDC", "cash"), sleeve(env, "CIRCLE_EURC", "cash")]), bad, "remove");
+        assert!(amend(&v, vec![env, sleeve(env, "CIRCLE_USDC", "numeraire"), sleeve(env, "CIRCLE_EURC", "cash")]).is_ok(), "keep");
+        let plain = register(&ctx, "cash", 1000, 2500, 3000);
+        assert_eq!(amend(&plain, vec![env, sleeve(env, "CIRCLE_USDC", "numeraire"), sleeve(env, "CIRCLE_EURC", "cash")]), bad, "add");
+    }
+}
