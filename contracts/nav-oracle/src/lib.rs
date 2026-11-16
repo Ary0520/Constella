@@ -44,6 +44,8 @@ pub enum OracleError {
     InvalidBlendPosition = 20,
     /// The asset is already priced another way (sources, or a Blend position).
     AssetAlreadyConfigured = 21,
+    /// The trusted Blend pool factory is set once and never changed.
+    BlendFactoryAlreadySet = 22,
 }
 
 /// SEP-40 asset identifier (identical to script3/sep-40-oracle and Reflector).
@@ -348,6 +350,9 @@ pub enum DataKey {
     PauseAuthority,
     /// Blend v2 supply position priced from the pool's live b_rate (D-H).
     BlendPosition(Address),
+    /// The official Blend pool factory; only pools it deployed (and therefore
+    /// run its fixed, audited pool WASM) can be registered as positions.
+    BlendFactory,
 }
 
 /// A Blend v2 supply position, identified by its pool's address (one priced
@@ -410,6 +415,13 @@ pub struct BlendReserve {
 #[contractclient(name = "BlendPoolClient")]
 pub trait BlendPoolInterface {
     fn get_reserve(env: Env, asset: Address) -> BlendReserve;
+}
+
+/// Blend v2 pool factory: `is_pool` is true only for pools it deployed, all
+/// of which run the pool WASM fixed in its constructor (`PoolInitMeta`).
+#[contractclient(name = "BlendFactoryClient")]
+pub trait BlendFactoryInterface {
+    fn is_pool(env: Env, pool_id: Address) -> bool;
 }
 
 #[contractevent(topics = ["BLEND_POSITION_REGISTERED"], data_format = "single-value")]
@@ -478,6 +490,12 @@ pub trait NavOracleTrait {
 
     /// The registered Blend position for `pool`, if any.
     fn blend_position(env: Env, pool: Address) -> Option<BlendPosition>;
+
+    /// Set the official Blend pool factory (mainnet v2 `CDSYOAVX…`, testnet v2
+    /// `CDV6RX4C…`, see ORACLE-SOURCES.md). Admin only; once, immutable.
+    fn set_blend_factory(env: Env, factory: Address);
+
+    fn get_blend_factory(env: Env) -> Option<Address>;
 
     /// Circuit breaker status and management
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool;
@@ -1415,6 +1433,13 @@ impl NavOracleTrait for NavOracle {
         if taken {
             panic_with_error!(&env, OracleError::AssetAlreadyConfigured);
         }
+        // Only a pool deployed by the official factory - i.e. running Blend's
+        // audited pool code - may receive and value vault funds.
+        let factory: Address = env.storage().instance().get(&DataKey::BlendFactory)
+            .unwrap_or_else(|| panic_with_error!(&env, OracleError::InvalidBlendPosition));
+        if !matches!(BlendFactoryClient::new(&env, &factory).try_is_pool(&pool), Ok(Ok(true))) {
+            panic_with_error!(&env, OracleError::InvalidBlendPosition);
+        }
         let pos = BlendPosition { pool: pool.clone(), underlying: underlying.clone() };
         // The pool must hold a live reserve of exactly this asset, and the
         // underlying must be priceable right now (base asset or valid sources).
@@ -1430,6 +1455,18 @@ impl NavOracleTrait for NavOracle {
 
     fn blend_position(env: Env, pool: Address) -> Option<BlendPosition> {
         blend_position_of(&env, &pool)
+    }
+
+    fn set_blend_factory(env: Env, factory: Address) {
+        admin_of(&env).require_auth();
+        if env.storage().instance().has(&DataKey::BlendFactory) {
+            panic_with_error!(&env, OracleError::BlendFactoryAlreadySet);
+        }
+        env.storage().instance().set(&DataKey::BlendFactory, &factory);
+    }
+
+    fn get_blend_factory(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::BlendFactory)
     }
 
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool {

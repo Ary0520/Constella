@@ -2145,6 +2145,7 @@ mod blend_position {
         let oracle_id = env.register(NavOracle, (Address::generate(&env), usdc.clone(), 7u32, 300u32));
         let oracle = NavOracleClient::new(&env, &oracle_id);
         let b = blend::deploy(&env, &usdc_admin, &oracle_id);
+        oracle.set_blend_factory(&b.factory.address);
         S { env, oracle, usdc, usdc_admin, b }
     }
 
@@ -2298,11 +2299,32 @@ mod blend_position {
         assert_eq!(soroban_sdk::token::TokenClient::new(&s.env, &s.usdc).balance(&borrower), 1_000 * SCALAR_7);
     }
 
+    /// A genuine Blend v2 pool from ANOTHER factory (here: a second, fully
+    /// real Blend deployment) is refused: only the configured official
+    /// factory's pools qualify. The factory is set once.
+    #[test]
+    fn only_pools_of_the_official_factory_qualify() {
+        let s = setup();
+        let rogue = blend::deploy(&s.env, &s.usdc_admin, &s.oracle.address);
+        assert!(rogue.factory.is_pool(&rogue.pool.address));
+        assert_eq!(s.oracle.try_register_blend_position(&rogue.pool.address, &s.usdc),
+            Err(Ok(OracleError::InvalidBlendPosition.into())));
+        assert_eq!(s.oracle.try_set_blend_factory(&rogue.factory.address),
+            Err(Ok(OracleError::BlendFactoryAlreadySet.into())));
+        assert_eq!(s.oracle.get_blend_factory(), Some(s.b.factory.address.clone()));
+        // Without a configured factory nothing qualifies.
+        let fresh = NavOracleClient::new(&s.env, &s.env.register(NavOracle, (Address::generate(&s.env), s.usdc.clone(), 7u32, 300u32)));
+        assert_eq!(fresh.try_register_blend_position(&s.b.pool.address, &s.usdc),
+            Err(Ok(OracleError::InvalidBlendPosition.into())));
+    }
+
     #[test]
     fn only_the_admin_registers_a_position() {
         let s = setup();
         s.env.set_auths(&[]);
         assert!(s.oracle.try_register_blend_position(&s.b.pool.address, &s.usdc).is_err());
+        let fresh = NavOracleClient::new(&s.env, &s.env.register(NavOracle, (Address::generate(&s.env), s.usdc.clone(), 7u32, 300u32)));
+        assert!(fresh.try_set_blend_factory(&s.b.factory.address).is_err(), "admin only");
         assert!(s.oracle.blend_position(&s.b.pool.address).is_none());
     }
 }

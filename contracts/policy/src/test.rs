@@ -2335,6 +2335,7 @@ mod blend_route {
     struct B {
         ctx: TestContext,
         pool: Address,
+        factory: blend::pool_factory::Client<'static>,
         policy: PolicyContractClient<'static>,
     }
 
@@ -2346,7 +2347,9 @@ mod blend_route {
         let pool = b.pool.address.clone();
         let registry = AssetRegistryClient::new(&ctx.env, &ctx.registry_address);
         register_registry_asset(&ctx.env, &registry, &pool, "BLEND_USDC_SUPPLY", "BLEND", SleeveType::Lending);
-        NavOracleClient::new(&ctx.env, &ctx.oracle_address).register_blend_position(&pool, &ctx.usdc_addr);
+        let oracle = NavOracleClient::new(&ctx.env, &ctx.oracle_address);
+        oracle.set_blend_factory(&b.factory.address);
+        oracle.register_blend_position(&pool, &ctx.usdc_addr);
         let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
         let sleeves = vec![
             &ctx.env,
@@ -2371,7 +2374,7 @@ mod blend_route {
         // 4 years separate b_rate valuation clearly from the 0.5 % slippage cap.
         ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + 4 * 365 * 24 * 3600);
         assert!(b.pool.get_reserve(&ctx.usdc_addr).data.b_rate > RATE_SCALE * 101 / 100, "over 1 % earned");
-        B { ctx, pool, policy }
+        B { ctx, pool, factory: b.factory, policy }
     }
 
     fn leg(b: &B, asset_in: &Address, asset_out: &Address, amount_in: i128, min_out: i128) -> RebalanceProposal {
@@ -2420,9 +2423,11 @@ mod blend_route {
     fn a_blend_position_the_policy_does_not_declare_cannot_be_bought() {
         let b = setup();
         let env = &b.ctx.env;
-        // A second real pool, registered and priced, but not in the signed policy.
-        let usdc_admin = StellarAssetClient::new(env, &b.ctx.usdc_addr);
-        let other = blend::deploy(env, &usdc_admin, &b.ctx.oracle_address).pool.address.clone();
+        // A second real pool of the official factory, registered and priced,
+        // but not in the signed policy.
+        let other = b.factory.deploy(&Address::generate(env), &soroban_sdk::String::from_str(env, "other"),
+            &BytesN::from_array(env, &[9u8; 32]), &b.ctx.oracle_address, &1_000_000, &6, &SCALAR_7);
+        blend::add_setup_reserve(env, &other, &b.ctx.usdc_addr);
         let registry = AssetRegistryClient::new(env, &b.ctx.registry_address);
         register_registry_asset(env, &registry, &other, "BLEND_OTHER", "BLEND", SleeveType::Lending);
         NavOracleClient::new(env, &b.ctx.oracle_address).register_blend_position(&other, &b.ctx.usdc_addr);
