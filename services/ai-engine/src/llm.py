@@ -14,7 +14,10 @@ Safety and cost rules, enforced here:
     max_tokens, at the live model prices) must fit the run budget, and the
     account balance must stay above a floor; after a call, the ACTUAL cost
     from `usage.cost` is booked. Over budget -> BudgetExceeded, nothing sent.
-  * Pinned models with fallbacks, temperature 0.
+  * Pinned models with fallbacks. No `temperature`: the current models
+    (Claude Haiku 5.5, gpt-5-mini) do not accept it, and with
+    require_parameters it would exclude every endpoint (404, found on the
+    first live call). Determinism is not relied on: every output is checked.
 """
 from __future__ import annotations
 
@@ -87,7 +90,7 @@ class SpendGuard:
 
 class OpenRouterClient:
     def __init__(self, guard: SpendGuard, models: Optional[List[str]] = None, key: Optional[str] = None,
-                 max_tokens: int = 800, timeout: float = 60.0):
+                 max_tokens: int = 1200, timeout: float = 60.0):
         self.key = key if key is not None else os.environ.get("OPENROUTER_API_KEY", "")
         if not self.key:
             raise LLMError("OPENROUTER_API_KEY is not set")
@@ -122,7 +125,6 @@ class OpenRouterClient:
             "model": self.models[0],
             "models": self.models,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "temperature": 0,
             "max_tokens": self.max_tokens,
             "response_format": {"type": "json_schema", "json_schema": {"name": schema_name, "strict": True, "schema": schema}},
             "provider": {"require_parameters": True, "data_collection": "deny", "zdr": True},

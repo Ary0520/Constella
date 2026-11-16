@@ -14,10 +14,13 @@ from src.thesis_llm import (check_summary, explain_facts, explain_llm, grounded,
 
 
 def blank(**kw):
-    d = {k: None for k in ["usd_pct", "usd_quote", "eur_pct", "eur_quote", "min_cash_pct", "min_cash_quote",
-                           "max_issuer_pct", "max_issuer_quote", "max_single_asset_pct", "max_single_asset_quote",
-                           "risk_tolerance", "yield_orientation"]}
-    d.update(exclusions=[], unsupported_assets=[], objectives=[])
+    """Model answer in the schema's shape; *_pct / *_quote kwargs become
+    `numbers` findings (readable tests)."""
+    d = {"numbers": [], "risk_tolerance": "unstated", "yield_orientation": "unstated",
+         "exclusions": [], "unsupported_assets": [], "objectives": []}
+    for f in ["usd", "eur", "min_cash", "max_issuer", "max_single_asset"]:
+        if f"{f}_pct" in kw:
+            d["numbers"].append({"field": f, "pct": kw.pop(f"{f}_pct"), "quote": kw.pop(f"{f}_quote", "")})
     d.update(kw)
     return d
 
@@ -192,7 +195,8 @@ def test_every_call_carries_privacy_routing_and_strict_schema(monkeypatch):
     assert c.chat_json("s", "u", "n", {"type": "object"}) == {"a": 1}
     body = api.calls[-1][2]
     assert body["provider"] == {"require_parameters": True, "data_collection": "deny", "zdr": True}
-    assert body["response_format"]["json_schema"]["strict"] is True and body["temperature"] == 0
+    assert body["response_format"]["json_schema"]["strict"] is True
+    assert "temperature" not in body  # would exclude every current endpoint under require_parameters
     assert body["models"] == llm.DEFAULT_MODELS
     assert c.guard.spent_usd == pytest.approx(0.0003)
 
@@ -233,3 +237,31 @@ def test_the_key_never_appears_in_errors(monkeypatch):
     monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
     with pytest.raises(LLMError, match="not set"):
         OpenRouterClient(SpendGuard(1.0))
+
+
+def test_several_readings_of_one_field_resolve_safely():
+    t = "Max 25% per issuer, and honestly 15% per issuer is better. Keep 10% cash or even 20% cash."
+    base = parse_thesis(t)
+    ans = blank()
+    ans["numbers"] = [{"field": "max_issuer", "pct": 25, "quote": "Max 25% per issuer"},
+                      {"field": "max_issuer", "pct": 15, "quote": "15% per issuer"},
+                      {"field": "min_cash", "pct": 10, "quote": "Keep 10% cash"},
+                      {"field": "min_cash", "pct": 20, "quote": "20% cash"},
+                      {"field": "usd", "pct": 25, "quote": "Max 25%"}, {"field": "usd", "pct": 15, "quote": "15% per"}]
+    d = merge_parse(t, base, ans)
+    assert d.max_issuer_weight == 0.15 and d.min_liquidity_sleeve == 0.20
+    assert any("Conflicting AI readings of USD share" in a for a in d.ambiguities)
+
+
+def test_duplicate_model_readings_alone_resolve_to_the_safer_value():
+    # Worded so the rule-based parser misses both: only the model's readings decide.
+    t = "No company above 25%, ideally under 15% each. Keep 10% on hand, or even 20% on hand."
+    base = parse_thesis(t)
+    assert base.max_issuer_weight == 0.30 and base.min_liquidity_sleeve == 0.10
+    ans = blank()
+    ans["numbers"] = [{"field": "max_issuer", "pct": 25, "quote": "No company above 25%"},
+                      {"field": "max_issuer", "pct": 15, "quote": "under 15% each"},
+                      {"field": "min_cash", "pct": 10, "quote": "Keep 10% on hand"},
+                      {"field": "min_cash", "pct": 20, "quote": "20% on hand"}]
+    d = merge_parse(t, base, ans)
+    assert d.max_issuer_weight == 0.15 and d.min_liquidity_sleeve == 0.20
