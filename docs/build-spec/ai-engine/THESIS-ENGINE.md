@@ -46,6 +46,8 @@ class PolicyDraft(BaseModel):
     ambiguities: List[str]          # fields with low confidence, flagged for user
 ```
 
+**User caps (audit A2, implemented):** caps the user states ("no more than 40% per issuer", "no single asset above 15%") are carried into the policy as written; a cap looser than the documented default is applied **and** flagged for confirmation; conflicting caps resolve to the strictest; impossible or "minimum per issuer" caps keep the default and are flagged. The same rules apply to the LLM parser's output (validated after the model).
+
 **LLM instructions:**
 - Use schema-constrained output (function calling mode)
 - Do NOT hallucinate asset names; leave `exclusions` for domain-level exclusions only
