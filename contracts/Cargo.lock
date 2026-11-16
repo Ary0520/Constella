@@ -367,6 +367,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "constella-vault-factory"
+version = "0.1.0"
+dependencies = [
+ "constella-nav-oracle",
+ "constella-policy",
+ "constella-registry",
+ "constella-vault-strategy",
+ "soroban-sdk",
+]
+
+[[package]]
 name = "constella-vault-strategy"
 version = "0.1.0"
 dependencies = [

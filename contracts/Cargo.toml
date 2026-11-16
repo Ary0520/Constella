@@ -12,6 +12,7 @@ members = [
     "webauthn-verifier",
     "threshold-policy",
     "testkit",
+    "vault-factory",
 ]
 
 [workspace.package]
