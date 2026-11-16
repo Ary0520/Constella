@@ -124,6 +124,17 @@ pub enum DataKey {
     GlobalStats,
 }
 
+/// Audit F1a: TTLs (in ledgers, ~5 s each). Per-user stats live in their own
+/// persistent entries; the instance (config, global stats, whitelist - all
+/// bounded) is extended on use so the sponsor never archives while in use.
+const DAY_LEDGERS: u32 = 17_280;
+const TTL_THRESHOLD: u32 = 29 * DAY_LEDGERS;
+const TTL_EXTEND_TO: u32 = 30 * DAY_LEDGERS;
+
+fn extend_instance(env: &Env) {
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+}
+
 #[contract]
 pub struct FeeSponsorContract;
 
@@ -333,9 +344,10 @@ impl FeeSponsorContract {
             last_op_timestamp: now,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::UserStats(user.clone()), &updated_user_stats);
+        let key = DataKey::UserStats(user.clone());
+        env.storage().persistent().set(&key, &updated_user_stats);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        extend_instance(&env);
 
         SponsoredOp { user, target_contract, fee_spent_stroops }.publish(&env);
 
@@ -415,7 +427,7 @@ impl FeeSponsorContract {
     pub fn get_user_stats(env: Env, user: Address) -> UserSponsorStats {
         let now = env.ledger().timestamp();
         let stored: Option<UserSponsorStats> =
-            env.storage().instance().get(&DataKey::UserStats(user));
+            env.storage().persistent().get(&DataKey::UserStats(user));
         match stored {
             Some(stats) => {
                 let hourly = if stats.last_op_timestamp == 0
