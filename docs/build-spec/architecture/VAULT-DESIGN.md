@@ -26,14 +26,14 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 - One WASM deployed; multiple vault instances share the code
 - Upgraded atomically via CAP-85 (Adapter, Protocol 28)
 
-### Private Vault (Q1 2027)
+### Private Vault (built 17 Nov 2026, decision D-C)
 - Deployed **per institution** via a factory contract
 - Own policy, own admin accounts, own share class
 - Required for: treasuries needing custom policy limits, multisig control, audit exports
 - Supports ML-DSA admin keys after Bell (Protocol 30)
 - More expensive (own state, own rent)
 
-**v1 delivers Strategy Vault only.** Private Vault Factory is Q1 2027.
+**Private Vault Factory (D-C, `ac597cd`):** `contracts/vault-factory` deploys the same audited vault WASM for a treasury. The factory fixes the shared registry / oracle / policy and the fee treasury; the creator chooses admin, pause authority, numéraire, performance fee (≤ 10 % of profit) and caps (≤ the factory's beta TVL cap). Addresses are bound to the creator (no squatting); `is_vault` attests origin; code for future vaults changes only after 48 h. Gated (SEP-57) private vaults still wait for an issuer allow-listing partner.
 
 ---
 

@@ -13,8 +13,8 @@ constella-contracts/
 ├── registry/           # Asset registry — the closed universe
 ├── policy/             # Policy storage and validation
 ├── vault-strategy/     # Shared strategy vault (SEP-56)
-├── vault-factory/      # Deploys private vault instances [Q1 2027]
-├── vault-private/      # Per-institution vault (same WASM as strategy) [Q1 2027]
+├── vault-factory/      # Deploys private vault instances ✅ built (D-C, `ac597cd`)
+├── vault-private/      # Per-institution vault = vault-strategy WASM deployed by the factory (no separate crate)
 ├── nav-oracle/         # NAV computation and circuit breakers
 ├── keeper/             # Rebalance proposer and TTL extender
 ├── smart-account/      # Passkey smart account (OZ context rules)
