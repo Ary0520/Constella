@@ -1563,6 +1563,7 @@ mod w1b {
     const ALLOCATION_OUT_OF_POLICY: u32 = 27;
     const ORACLE_UNAVAILABLE: u32 = 10;
     const SLEEVE_TARGET_MISMATCH: u32 = 28;
+    const DELAY_48H: u64 = 48 * 3600;
 
     fn claim(r: &R, usdc_bps: u32, eurc_bps: u32, amount_in: i128) -> constella_vault_strategy::RebalanceProposal {
         let env = &r.s.env;
@@ -1786,6 +1787,60 @@ mod w1b {
         // The layout that matches the signed targets is accepted.
         r.s.vault.set_sleeves(&current);
         assert_eq!(r.s.vault.get_sleeves(), current);
+    }
+
+    /// A policy amendment (owner-signed, after the 48 h notice) changes the
+    /// targets the vault uses at once - nobody has to re-run set_sleeves.
+    /// The empty-vault risk sheet is target-weighted, so it must follow the
+    /// signed targets, and get_sleeves must report them.
+    #[test]
+    fn an_amended_policy_drives_the_vault_targets_without_set_sleeves() {
+        let r = setup();
+        let env = &r.s.env;
+        r.s.env.mock_all_auths();
+        // Empty the vault so the risk sheet weights by targets.
+        let holder = holder(&r);
+        r.s.vault.redeem(&r.s.vault.balance(&holder), &holder, &holder, &holder);
+        assert_eq!(r.s.vault.total_assets(), 0);
+        // Signed 50/50: USDC cash haircut 10 %, EURC (EurSovereign) 15 %.
+        assert_eq!(r.s.vault.get_risk_sheet().recommended_haircut_bps, 1250);
+
+        // The owner amends to 20/80; it takes effect after the notice period.
+        let mut targets = Vec::new(env);
+        for (id, w) in [("USDC", 2000u32), ("EURC", 8000u32)] {
+            targets.push_back(SleeveTarget { asset_id: Symbol::new(env, id), target_weight_bps: w, min_band_bps: 0,
+                max_band_bps: 10_000, sleeve_type: Symbol::new(env, "cash") });
+        }
+        r.s.policy.update_policy(&r.s.vault_id, &soroban_sdk::BytesN::from_array(env, &[0x78; 32]),
+            &1000, &10_000, &10_000, &50, &500, &targets);
+        env.ledger().set_timestamp(r.now + DELAY_48H + 1);
+        r.s.policy.activate_policy_update(&r.s.vault_id);
+
+        // 0.2 * 10 % + 0.8 * 15 % = 14 %.
+        assert_eq!(r.s.vault.get_risk_sheet().recommended_haircut_bps, 1400);
+        let shown = r.s.vault.get_sleeves();
+        assert_eq!((shown.get(0).unwrap().target_weight_bps, shown.get(1).unwrap().target_weight_bps), (2000, 8000));
+        // What get_sleeves shows is a layout set_sleeves accepts.
+        r.s.vault.set_sleeves(&shown);
+    }
+
+    /// A sleeve the amended policy no longer declares has a target of 0.
+    #[test]
+    fn a_sleeve_dropped_by_an_amendment_has_a_zero_target() {
+        let r = setup();
+        let env = &r.s.env;
+        r.s.env.mock_all_auths();
+        let holder = holder(&r);
+        r.s.vault.redeem(&r.s.vault.balance(&holder), &holder, &holder, &holder);
+        let targets = Vec::from_array(env, [SleeveTarget { asset_id: Symbol::new(env, "USDC"), target_weight_bps: 10_000,
+            min_band_bps: 0, max_band_bps: 10_000, sleeve_type: Symbol::new(env, "cash") }]);
+        r.s.policy.update_policy(&r.s.vault_id, &soroban_sdk::BytesN::from_array(env, &[0x79; 32]),
+            &1000, &10_000, &10_000, &50, &500, &targets);
+        env.ledger().set_timestamp(r.now + DELAY_48H + 1);
+        r.s.policy.activate_policy_update(&r.s.vault_id);
+        let shown = r.s.vault.get_sleeves();
+        assert_eq!((shown.get(0).unwrap().target_weight_bps, shown.get(1).unwrap().target_weight_bps), (10_000, 0));
+        assert_eq!(r.s.vault.get_risk_sheet().recommended_haircut_bps, 1000, "all cash");
     }
 
     /// The setup's only depositor (holds every share).
