@@ -2219,7 +2219,7 @@ mod blend_position {
         assert_eq!(s.oracle.collateral_price(&pool).unwrap().price, 10_700_000);
         assert_eq!(s.oracle.lastprice(&Asset::Stellar(pool.clone())).unwrap().price, 10_700_000);
         assert_eq!(s.oracle.blend_position(&pool), Some(BlendPosition { pool: pool.clone(), underlying: eurc.clone() }));
-        assert!(s.oracle.assets().contains(&Asset::Stellar(pool.clone())));
+        assert!(s.oracle.assets().contains(Asset::Stellar(pool.clone())));
         // The underlying's staleness carries through: no price, no position price.
         s.env.ledger().set_timestamp(s.env.ledger().timestamp() + 3_601);
         assert!(s.oracle.asset_price(&pool).is_none());
