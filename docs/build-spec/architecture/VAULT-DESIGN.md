@@ -53,7 +53,11 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 - If an issuer freezes an asset: the **sleeve** is frozen, not the entire basket
   - Remaining sleeves continue to operate
   - Redemptions from frozen sleeve are queued
-  - **Implementation status (15 Nov 2026):** a frozen or unpriced sleeve that holds nothing is skipped when pricing shares, so it never blocks the vault (audit V3). A *funded* frozen sleeve currently hard-stops pricing; queued in-kind claims are tracked as audit V6 and ship with rebalance execution (W1).
+  - **Implementation status (16 Nov 2026):** a frozen or unpriced sleeve that holds nothing is skipped when pricing shares (audit V3). For a *funded* sleeve without a valid price (audit **V6**, `d1ecad4`):
+    - `redeem` and deposits stay halted — there is no fair share price, and an entry at a stale price would dilute holders.
+    - `redeem_frozen(shares, …)` (explicit opt-in) pays `shares / supply` of every **priced** sleeve's conservative value in cash now, and records `shares / supply` of each frozen sleeve's **units** as a claim for the receiver. The units leave the sleeve's books, so the remaining holders' per-share value is unchanged. The usual rules apply: operator auth + allowance, pause, fee accrual, cash actually held, and the liquidity floor measured over the priced part.
+    - `settle_claim(holder, asset)` (anyone may call; pays only the holder) settles in cash at units × **conservative** price once the asset is priced again, returning the units to the books. If the issuer clawed tokens back meanwhile, payment is capped pro rata to the reserved units still held. Settlement needs cash: the keeper raises it through policy-validated rebalances.
+    - A sleeve with outstanding claims cannot be removed (the reserved units are still held).
 
 ---
 

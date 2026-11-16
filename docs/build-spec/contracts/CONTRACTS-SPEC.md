@@ -150,6 +150,12 @@ fn deposit(env: Env, assets: i128, receiver: Address, from: Address, operator: A
 fn mint(env: Env, shares: i128, receiver: Address, from: Address, operator: Address) -> i128     // assets paid
 fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address, operator: Address) -> i128 // shares burned
 fn redeem(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> i128   // assets, conservative NAV
+// Audit V6: while a funded sleeve has no valid price (redeem halts):
+fn redeem_frozen(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> FrozenRedemption // {cash, claims: Vec<(asset, units)>}
+fn preview_redeem_frozen(env: Env, shares: i128) -> FrozenRedemption
+fn settle_claim(env: Env, holder: Address, asset: Address) -> i128  // anyone; pays holder units x conservative price
+fn get_claim(env: Env, holder: Address, asset: Address) -> i128
+fn get_claim_total(env: Env, asset: Address) -> i128
 fn preview_deposit(env: Env, assets: i128) -> i128   // == deposit result, pending fees included
 fn preview_mint(env: Env, shares: i128) -> i128
 fn preview_withdraw(env: Env, assets: i128) -> i128
