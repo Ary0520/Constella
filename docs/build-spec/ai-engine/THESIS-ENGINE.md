@@ -93,7 +93,7 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 - No illiquid assets in liquid baskets
 - Each sleeve within its declared liquidity tier
 
-**Fallback:** If HRP fails to converge → equal-weight within constraints.
+**Fail closed (audit A1 / decision D-A, implemented `fce2fed`):** there is **no** fallback that relaxes a rule. Hard rules — the profile (Cash Reserve, the default and only Phase-1 profile: vault currency ≥ 85 %, lending ≤ 15 %), the liquidity floor, and the user's issuer / single-asset caps on every asset **except the vault currency** — are never relaxed. The user's currency split is a soft target: if it conflicts, `InfeasibleAllocation` lists the reasons and offers the nearest valid allocation without it, which the user must accept. An exact LP proves feasibility, SLSQP / HRP refinements are kept only if still valid, bps rounding is cap-safe largest-remainder, and an integer-exact final check raises rather than returning an invalid allocation. The explainer discloses the vault-currency issuer exposure (e.g. "92 % depends on CIRCLE through USDC") plainly.
 
 **Covariance inputs:**
 - Historical NAV returns (where available; short histories for newer tokenized funds)
