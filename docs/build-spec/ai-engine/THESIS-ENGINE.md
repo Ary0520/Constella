@@ -59,20 +59,19 @@ class PolicyDraft(BaseModel):
 **Output:** Candidate asset list (from registry ONLY — no exceptions)
 
 ```python
+# Audit A3 / decision D-B (implemented, `3eaaa02`)
+registry = AssetRegistry.from_chain(rpc_url, passphrase, registry_id, any_account)  # registry.list_assets()
 def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[AssetCandidate]:
-    # 1. Filter by jurisdiction compatibility
-    eligible = registry.filter_by_jurisdiction(policy.jurisdiction)
-    # 2. Filter by investor class
-    eligible = [a for a in eligible if 
-                policy.investor_class in a.investor_classes_required or a.permissionless]
-    # 3. Filter by exclusions
-    eligible = [a for a in eligible if a.sleeve_type not in policy.exclusions]
-    # 4. Rank by relevance to objectives via vector similarity
-    ranked = vector_search(policy.objectives, eligible)
-    return ranked  # Only registry IDs — hallucinated assets cannot appear
+    # 1-2. Eligibility = issuer rules recorded ON CHAIN (blocked / eligible
+    #      jurisdictions, required investor classes, active flag) AND
+    #      Constella's class policy: retail = permissionless only (until
+    #      Phase 4); sanctioned jurisdictions get nothing; vague answers fail closed.
+    eligible = eligibility.eligible_assets(registry.list_assets(), policy.jurisdiction, policy.investor_class)
+    # 3. Exclusions; 4. currency alignment (vector ranking: future)
+    ...
 ```
 
-**Closed universe enforcement:** The vector search only searches over assets in the registry. Only registry contract addresses are valid outputs. If a user asks for "Amazon stock," and it's not in the registry, it cannot appear in the proposal — the diff screen will explain why.
+**Closed universe enforcement (A3):** the on-chain registry is the only source of assets, contract addresses and issuer rules; the engine keeps display text only, skips on-chain assets it has no description for, and never invents yields (unknown until a live source exists). The vector search, when added, only searches over assets in the registry. Only registry contract addresses are valid outputs. If a user asks for "Amazon stock," and it's not in the registry, it cannot appear in the proposal — the diff screen will explain why.
 
 ---
 
