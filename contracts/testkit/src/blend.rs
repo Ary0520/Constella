@@ -157,5 +157,15 @@ pub fn deploy<'a>(env: &Env, usdc_admin: &StellarAssetClient<'a>, oracle: &Addre
     BlendEnv { pool, backstop, admin, blnd, usdc, usdc_index }
 }
 
+/// Add a reserve for `asset` to a live pool. Blend requires a one-week
+/// timelock for reserve changes once the pool has left setup status
+/// (`pool/src/pool/config.rs`), so this advances the ledger by a week + 1 s.
+pub fn add_reserve(env: &Env, b: &BlendEnv, asset: &Address, decimals: u32) -> u32 {
+    b.pool.queue_set_reserve(asset, &default_reserve(decimals));
+    let now = env.ledger().timestamp();
+    env.ledger().set_timestamp(now + 7 * 24 * 3600 + 1);
+    b.pool.set_reserve(asset)
+}
+
 #[cfg(test)]
 mod test;
