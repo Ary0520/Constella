@@ -67,7 +67,7 @@ REGISTRY=$(deploy registry -- --admin $ADMIN)
 invoke admin --id $REGISTRY -- add_asset --entry "{\"contract_address\":\"$USDC\",\"asset_id\":\"USDC\",\"issuer\":\"CIRCLE\",\"sleeve_type\":0,\"liquidity_tier\":0,\"permissionless\":true,\"oracle_sources\":[\"USDC_BASE\"],\"eligible_jurisdictions\":[],\"blocked_jurisdictions\":[],\"investor_classes_required\":[],\"is_active\":true,\"added_at\":0}"
 ORACLE=$(deploy nav_oracle -- --admin $ADMIN --base_asset $USDC --decimals 7 --resolution 300)
 POLICY=$(deploy policy -- --admin $ADMIN --oracle $ORACLE)
-VAULT=$(deploy vault_strategy -- --config "{\"admin\":\"$ADMIN\",\"pause_authority\":\"$ADMIN\",\"numeraire\":\"$USDC\",\"policy_contract\":\"$POLICY\",\"oracle_contract\":\"$ORACLE\",\"registry_contract\":\"$REGISTRY\",\"treasury\":\"$ADMIN\",\"management_fee_bps\":0,\"tvl_cap\":\"10000000000000\",\"per_user_cap\":\"1000000000000\"}" --name "Constella Vault" --symbol CONST --decimals 7)
+VAULT=$(deploy vault_strategy -- --config "{\"admin\":\"$ADMIN\",\"pause_authority\":\"$ADMIN\",\"numeraire\":\"$USDC\",\"policy_contract\":\"$POLICY\",\"oracle_contract\":\"$ORACLE\",\"registry_contract\":\"$REGISTRY\",\"treasury\":\"$ADMIN\",\"performance_fee_bps\":1000,\"tvl_cap\":\"10000000000000\",\"per_user_cap\":\"1000000000000\"}" --name "Constella Vault" --symbol CONST --decimals 7)
 VERIFIER=$(deploy webauthn_verifier)
 SPONSOR=$(deploy fee_sponsor -- --admin $ADMIN --max_ops_per_hour 10 --max_ops_per_day 50 --daily_budget_stroops 100000000)
 invoke admin --id $SPONSOR -- whitelist_contract --target $VAULT

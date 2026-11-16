@@ -322,7 +322,10 @@ pub struct VaultConfig {
     pub oracle_contract: Address,
     pub registry_contract: Address,
     pub treasury: Address,
-    pub management_fee_bps: u32,
+    /// Decision D-D: share of PROFIT (above the per-share high-water mark)
+    /// paid to the treasury, in bps; at most MAX_PERFORMANCE_FEE_BPS. There
+    /// is no fee on principal, and never more than FEE_CAP_BPS_PER_YEAR.
+    pub performance_fee_bps: u32,
     /// Maximum total vault value in numéraire units (AGENT-RULES Rule 6;
     /// ROADMAP 3.2 mainnet beta: $1M). Can only be lowered in-place.
     pub tvl_cap: i128,
@@ -394,6 +397,8 @@ pub enum DataKey {
     Sleeves,
     IsPaused,
     LastFeeAccrual,
+    /// Decision D-D: conservative NAV per share at the last fee (scale = 1.0).
+    HighWaterMark,
     PendingUpgrade,
     /// Address allowed to submit rebalance proposals (audit W1).
     Keeper,
@@ -668,54 +673,84 @@ fn compute_sleeve_symbol(env: &Env, sleeve_type: SleeveType) -> Symbol {
 /// Management-fee shares owed right now and the accrual timestamp to store
 /// once they are minted. Pure: views use it to price pending fees exactly as
 /// the next state-changing call will mint them (SEP-56 previews).
-fn pending_fee_shares(env: &Env, config: &VaultConfig) -> (i128, u64) {
-    let last_accrual: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::LastFeeAccrual)
-        .unwrap_or(0);
+/// Decision D-D: at most 10 % of profit (Morpho curators charge 0-20 % of
+/// interest; many vaults charge no management fee).
+pub const MAX_PERFORMANCE_FEE_BPS: u32 = 1_000;
+/// Decision D-D: all-in ceiling - fees never exceed 0.20 % of assets per year.
+pub const FEE_CAP_BPS_PER_YEAR: i128 = 20;
+/// Fees crystallize at most once per day, so the fee does not depend on how
+/// often anyone calls `accrue_fees` (the cap slice per call would otherwise
+/// shrink with call frequency and forgive most of the profit).
+pub const FEE_CRYSTALLIZATION_SECONDS: u64 = 86_400;
+
+/// Decision D-D: (fee shares to mint, new last-accrual time, new high-water
+/// mark). Fee = performance_fee_bps of the profit since the high-water mark,
+/// measured on the CONSERVATIVE NAV per share (a manipulated price cannot
+/// create a fee), capped at FEE_CAP_BPS_PER_YEAR of assets for the elapsed
+/// time. No fee while any funded sleeve is unpriced, below the mark, or more
+/// often than once per FEE_CRYSTALLIZATION_SECONDS. After a fee the mark is
+/// the post-fee NAV per share: profit beyond the cap is forgiven.
+fn pending_fee(env: &Env, config: &VaultConfig) -> (i128, u64, i128) {
+    let scale = share_scale(env);
+    let last: u64 = env.storage().instance().get(&DataKey::LastFeeAccrual).unwrap_or(0);
+    let hwm: i128 = env.storage().instance().get(&DataKey::HighWaterMark).unwrap_or(scale);
     let now = env.ledger().timestamp();
-    if now <= last_accrual || config.management_fee_bps == 0 {
-        return (0, last_accrual);
+    if now < last.saturating_add(FEE_CRYSTALLIZATION_SECONDS) {
+        return (0, last, hwm);
     }
-
-    let elapsed = now - last_accrual;
-    let total_shares: i128 = share_supply(env);
-    if total_shares == 0 {
-        return (0, now);
+    let supply = share_supply(env);
+    if supply <= 0 {
+        return (0, now, scale);
     }
-
-    let numerator = total_shares
-        .checked_mul(config.management_fee_bps as i128)
-        .and_then(|v| v.checked_mul(elapsed as i128));
-    let denominator = (10_000i128).checked_mul(SECONDS_PER_YEAR as i128);
-
-    let d_shares = match (numerator, denominator) {
-        (Some(num), Some(den)) if den > 0 => num / den,
-        _ => 0,
+    if config.performance_fee_bps == 0 {
+        return (0, now, hwm);
+    }
+    let total = match holdings_value(env, config, NavKind::Collateral) {
+        Ok((t, _)) => t,
+        Err(_) => return (0, now, hwm), // unpriced: no fee, and that period's cap is forfeited
     };
-    if d_shares <= 0 {
-        return (0, last_accrual);
-    }
-
-    // Carry the sub-share remainder of elapsed time into the next accrual.
-    let new_last = match (denominator, total_shares.checked_mul(config.management_fee_bps as i128)) {
-        (Some(den), Some(fee_rate)) if fee_rate > 0 => last_accrual + ((d_shares * den) / fee_rate) as u64,
-        _ => now,
+    let nav = match total.checked_mul(scale) {
+        Some(v) => v / supply,
+        None => return (0, now, hwm),
     };
-    (d_shares, new_last)
+    if nav <= hwm {
+        return (0, now, hwm);
+    }
+    let elapsed = (now - last) as i128;
+    let fee = (|| -> Option<i128> {
+        let profit = (nav - hwm).checked_mul(supply)? / scale;
+        let by_profit = profit.checked_mul(config.performance_fee_bps as i128)? / 10_000;
+        let cap = total.checked_mul(FEE_CAP_BPS_PER_YEAR)?.checked_mul(elapsed)? / (10_000 * SECONDS_PER_YEAR as i128);
+        Some(by_profit.min(cap))
+    })()
+    .unwrap_or(0);
+    if fee <= 0 || fee >= total {
+        return (0, now, hwm);
+    }
+    // Shares worth `fee` after minting: d / (supply + d) = fee / total.
+    let shares = match fee.checked_mul(supply) {
+        Some(v) => v / (total - fee),
+        None => return (0, now, hwm),
+    };
+    if shares <= 0 {
+        return (0, now, hwm);
+    }
+    let new_hwm = match total.checked_mul(scale) {
+        Some(v) => v / (supply + shares),
+        None => hwm,
+    };
+    (shares, now, new_hwm)
+}
+
+fn pending_fee_shares(env: &Env, config: &VaultConfig) -> (i128, u64) {
+    let (shares, last, _) = pending_fee(env, config);
+    (shares, last)
 }
 
 fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
-    let last_accrual: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::LastFeeAccrual)
-        .unwrap_or(0);
-    let (d_shares, new_last) = pending_fee_shares(env, config);
-    if new_last != last_accrual {
-        env.storage().instance().set(&DataKey::LastFeeAccrual, &new_last);
-    }
+    let (d_shares, new_last, new_hwm) = pending_fee(env, config);
+    env.storage().instance().set(&DataKey::LastFeeAccrual, &new_last);
+    env.storage().instance().set(&DataKey::HighWaterMark, &new_hwm);
     if d_shares > 0 {
         // Audit W6: fee shares are minted like any other shares, with a SEP-41
         // mint event, so indexers can reconstruct every balance from events.
@@ -1379,7 +1414,7 @@ impl StrategyVault {
         symbol: String,
         decimals: u32,
     ) {
-        if config.management_fee_bps > 10000 || decimals > 18 {
+        if config.performance_fee_bps > MAX_PERFORMANCE_FEE_BPS || decimals > 18 {
             panic_with_error!(&env, VaultError::InvalidBps);
         }
         if config.tvl_cap <= 0 || config.per_user_cap <= 0 || config.per_user_cap > config.tvl_cap {
@@ -1407,6 +1442,7 @@ impl StrategyVault {
         env.storage()
             .instance()
             .set(&DataKey::LastFeeAccrual, &env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::HighWaterMark, &10i128.pow(decimals));
 
         let mut sleeves = Vec::new(&env);
         sleeves.push_back(SleeveState {
@@ -2309,6 +2345,11 @@ impl StrategyVault {
     pub fn accrue_fees(env: Env) -> i128 {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config)
+    }
+
+    /// Decision D-D: conservative NAV per share at which the last fee was taken.
+    pub fn get_high_water_mark(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::HighWaterMark).unwrap_or_else(|| share_scale(&env))
     }
 
     pub fn get_last_fee_accrual(env: Env) -> u64 {

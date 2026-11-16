@@ -114,7 +114,7 @@ fn setup_test_context() -> TestContext<'static> {
         oracle_contract: oracle_id.clone(),
         registry_contract: registry_id.clone(),
         treasury: treasury.clone(),
-        management_fee_bps: 100, // 1% per year
+        performance_fee_bps: 1_000, // D-D: 10 % of profit
         tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
         per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
     };
@@ -236,33 +236,19 @@ fn test_t41_instant_redemption_conservative_nav() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_t42_fee_dilution_calculation() {
+    // Decision D-D: the fee is a share of PROFIT, so a cash-only vault that
+    // earned nothing in a year mints no fee shares (the old 1 %/yr management
+    // fee would have taken 10 shares here). Profit cases: security_regressions dd::*.
     let ctx = setup_test_context();
-
-    // Management fee = 100 bps = 1% / year
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
     ctx.vault_client.deposit(&1000_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
-
-    let initial_shares = ctx.vault_client.total_supply();
     let initial_assets = ctx.vault_client.total_assets();
-    assert_eq!(initial_shares, 1000_0000000);
-    assert_eq!(initial_assets, 1000_0000000);
-    assert_eq!(ctx.vault_client.balance(&ctx.treasury), 0);
-
-    // Advance time by exactly 1 year (31,536,000 seconds)
     ctx.env.ledger().set_timestamp(1_000_000 + 31_536_000);
-
-    // Accrue fees
-    let fee_shares = ctx.vault_client.accrue_fees();
-    // 1% of 1000 shares = 10 shares
-    assert_eq!(fee_shares, 10_0000000);
-
-    // Verify treasury received diluted shares
-    assert_eq!(ctx.vault_client.balance(&ctx.treasury), 10_0000000);
-    assert_eq!(ctx.vault_client.total_supply(), 1010_0000000);
-    assert_eq!(ctx.vault_client.balance(&ctx.alice), 1000_0000000);
-
-    // Critical Invariant: Total underlying assets unchanged!
+    assert_eq!(ctx.vault_client.accrue_fees(), 0);
+    assert_eq!(ctx.vault_client.balance(&ctx.treasury), 0);
+    assert_eq!(ctx.vault_client.total_supply(), 1000_0000000);
     assert_eq!(ctx.vault_client.total_assets(), initial_assets);
+    assert_eq!(ctx.vault_client.get_high_water_mark(), 10_000_000);
 }
 
 // -------------------------------------------------------------------------
@@ -1554,7 +1540,9 @@ fn golden_events_vault() {
     g.capture(env, "bind_policy");
     // `UPGRADE` is emitted only by a successful execute_upgrade, which needs a
     // real uploaded WASM; it is verified in the local-network e2e suite.
-    g.finish(&["VAULT_INITIALIZED", "deposit", "mint", "transfer", "approve", "burn", "withdraw", "FEE_ACCRUAL",
+    // FEE_ACCRUAL needs real profit (D-D); its encoding is asserted in
+    // security_regressions `w6_fee_shares_are_announced_with_a_mint_event`.
+    g.finish(&["VAULT_INITIALIZED", "deposit", "mint", "transfer", "approve", "burn", "withdraw",
         "CAPS_LOWERED", "SLEEVES_UPDATED", "VAULT_PAUSED", "VAULT_UNPAUSED", "UPGRADE_PROPOSED", "UPGRADE_CANCELLED",
         "POLICY_BOUND"]);
 }

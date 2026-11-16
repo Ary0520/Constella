@@ -465,7 +465,7 @@ fn test_t55_sponsored_passkey_vault_deposit() {
         oracle_contract: oracle_id.clone(),
         registry_contract: registry_id.clone(),
         treasury: treasury.clone(),
-        management_fee_bps: 100,
+        performance_fee_bps: 100,
         tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
         per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
     };

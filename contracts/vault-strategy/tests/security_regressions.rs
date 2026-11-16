@@ -60,7 +60,7 @@ fn deploy_stack_with(vault_nav_feeds: bool) -> Stack<'static> {
     deploy_stack_cfg(vault_nav_feeds, 0)
 }
 
-fn deploy_stack_cfg(vault_nav_feeds: bool, management_fee_bps: u32) -> Stack<'static> {
+fn deploy_stack_cfg(vault_nav_feeds: bool, performance_fee_bps: u32) -> Stack<'static> {
     let env = Env::default();
     env.mock_all_auths(); // setup only
     env.ledger().set_timestamp(T0);
@@ -110,7 +110,7 @@ fn deploy_stack_cfg(vault_nav_feeds: bool, management_fee_bps: u32) -> Stack<'st
             oracle_contract: oracle_id.clone(),
             registry_contract: registry_id.clone(),
             treasury: treasury.clone(),
-            management_fee_bps,
+            performance_fee_bps,
             tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
             per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
         },
@@ -900,7 +900,7 @@ fn m3_fresh_deployments_cannot_be_taken_over() {
         oracle_contract: oracle,
         registry_contract: registry,
         treasury: owner.clone(),
-        management_fee_bps: 10,
+        performance_fee_bps: 10,
         tvl_cap: 1_000_000 * ONE,
         per_user_cap: 100_000 * ONE,
     };
@@ -908,7 +908,7 @@ fn m3_fresh_deployments_cannot_be_taken_over() {
     let mut hostile = legit.clone();
     hostile.admin = attacker.clone();
     hostile.treasury = attacker.clone();
-    hostile.management_fee_bps = 10_000;
+    hostile.performance_fee_bps = 1_000; // the maximum valid fee (D-D)
     let args = (hostile, String::from_str(&env, "Evil"), String::from_str(&env, "EVIL"), 7u32).into_val(&env);
     assert!(!stranger_initializes(&env, &vault, args), "vault hijack");
     assert_eq!(StrategyVaultClient::new(&env, &vault).get_config(), legit, "configuration unchanged");
@@ -930,7 +930,7 @@ fn eur_vault_config(env: &Env, admin: &Address, numeraire: &Address, registry: &
         oracle_contract: oracle,
         registry_contract: registry.clone(),
         treasury: admin.clone(),
-        management_fee_bps: 0,
+        performance_fee_bps: 0,
         tvl_cap: 1_000_000 * ONE,
         per_user_cap: 100_000 * ONE,
     }
@@ -1139,26 +1139,25 @@ fn w6_holder_can_burn_and_spender_can_burn_from_within_allowance() {
 
 #[test]
 fn w6_fee_shares_are_announced_with_a_mint_event() {
-    // FIXTURE: 25 bps/year, the ceiling in docs/build-spec/README.md ("0.05%-0.25%/year").
-    let s = deploy_stack_cfg(true, 25);
-    let alice = Address::generate(&s.env);
-    let bob = Address::generate(&s.env);
-    s.usdc_admin.mint(&alice, &(1_000 * ONE));
-    s.vault.deposit(&(1_000 * ONE), &alice, &alice, &alice);
-    assert_eq!(s.vault.balance(&s.treasury), 0);
+    // D-D: a fee only exists when the vault made a real profit - here EURC
+    // bought through real Soroswap appreciates 2 % over a year.
+    let r = dd::funded();
+    let alice = r.depositor.clone();
+    let bob = Address::generate(&r.s.env);
+    assert_eq!(r.s.vault.balance(&r.s.treasury), 0);
+    dd::price(&r, ONE * 11_016 / 10_000, r.s.vault.get_last_fee_accrual() + dd::YEAR);
+    authorize(&r.s, &alice, "transfer", (alice.clone(), bob.clone(), ONE).into_val(&r.s.env));
+    r.s.vault.transfer(&alice, &bob, &ONE);
+    let events = vault_events(&r.s); // events of the transfer call only
 
-    s.env.ledger().set_timestamp(T0 + 30 * 86_400);
-    authorize(&s, &alice, "transfer", (alice.clone(), bob.clone(), ONE).into_val(&s.env));
-    s.vault.transfer(&alice, &bob, &ONE);
-    let events = vault_events(&s); // events of the transfer call only
-
-    let fee = s.vault.balance(&s.treasury);
+    let fee = r.s.vault.balance(&r.s.treasury);
     assert!(fee > 0, "fee must have accrued");
-    let mints: std::vec::Vec<_> = events.into_iter().filter(|(t, _)| t[0] == sym("mint")).collect();
-    assert_eq!(mints, std::vec![(std::vec![sym("mint"), sc(&s.env, &s.treasury)], i128_val(fee))]);
+    let mints: std::vec::Vec<_> = events.iter().filter(|(t, _)| t[0] == sym("mint")).cloned().collect();
+    assert_eq!(mints, std::vec![(std::vec![sym("mint"), sc(&r.s.env, &r.s.treasury)], i128_val(fee))]);
+    assert!(events.iter().any(|(t, _)| t[0] == sym("FEE_ACCRUAL")), "FEE_ACCRUAL announced");
     assert_eq!(
-        s.vault.balance(&alice) + s.vault.balance(&bob) + fee,
-        s.vault.total_supply(),
+        r.s.vault.balance(&alice) + r.s.vault.balance(&bob) + fee,
+        r.s.vault.total_supply(),
         "sum of balances must equal total supply"
     );
 }
@@ -1314,30 +1313,29 @@ fn sep56_operator_redeems_only_within_the_owners_share_allowance() {
 
 #[test]
 fn sep56_previews_equal_execution_even_with_pending_fees() {
-    // FIXTURE: 25 bps/year, the ceiling in docs/build-spec/README.md.
-    let s = deploy_stack_cfg(true, 25);
-    let a = Address::generate(&s.env);
-    s.usdc_admin.mint(&a, &(10_000 * ONE));
-    s.vault.deposit(&(5_000 * ONE), &a, &a, &a);
-    let mut t = T0;
-    let mut later = |s: &Stack| {
-        t += 37 * 86_400;
-        s.env.ledger().set_timestamp(t);
+    // D-D: pending performance fees (real EURC appreciation between steps)
+    // are priced into every preview exactly as execution mints them.
+    let r = dd::funded();
+    let a = r.depositor.clone();
+    r.s.usdc_admin.mint(&a, &(10_000 * ONE));
+    let mut px = ONE * 108 / 100;
+    let mut later = |r: &R| {
+        px = px * 10_100 / 10_000; // +1 % per step
+        dd::price(r, px, r.s.env.ledger().timestamp() + 37 * 86_400);
     };
-
-    later(&s);
-    let p = s.vault.preview_deposit(&(1_000 * ONE));
-    assert_eq!(s.vault.deposit(&(1_000 * ONE), &a, &a, &a), p, "preview_deposit");
-    later(&s);
-    let p = s.vault.preview_mint(&(500 * ONE));
-    assert_eq!(s.vault.mint(&(500 * ONE), &a, &a, &a), p, "preview_mint");
-    later(&s);
-    let p = s.vault.preview_redeem(&(700 * ONE));
-    assert_eq!(s.vault.redeem(&(700 * ONE), &a, &a, &a), p, "preview_redeem");
-    later(&s);
-    let p = s.vault.preview_withdraw(&(300 * ONE));
-    assert_eq!(s.vault.withdraw(&(300 * ONE), &a, &a, &a), p, "preview_withdraw");
-    assert!(s.vault.balance(&s.treasury) > 0, "fees must actually have accrued");
+    later(&r);
+    let p = r.s.vault.preview_deposit(&(1_000 * ONE));
+    assert_eq!(r.s.vault.deposit(&(1_000 * ONE), &a, &a, &a), p, "preview_deposit");
+    later(&r);
+    let p = r.s.vault.preview_mint(&(500 * ONE));
+    assert_eq!(r.s.vault.mint(&(500 * ONE), &a, &a, &a), p, "preview_mint");
+    later(&r);
+    let p = r.s.vault.preview_redeem(&(700 * ONE));
+    assert_eq!(r.s.vault.redeem(&(700 * ONE), &a, &a, &a), p, "preview_redeem");
+    later(&r);
+    let p = r.s.vault.preview_withdraw(&(300 * ONE));
+    assert_eq!(r.s.vault.withdraw(&(300 * ONE), &a, &a, &a), p, "preview_withdraw");
+    assert!(r.s.vault.balance(&r.s.treasury) > 0, "fees must actually have accrued");
 }
 
 // ---------------------------------------------------------------------------
@@ -1355,6 +1353,8 @@ mod soroswap_factory {
     soroban_sdk::contractimport!(file = "testdata/soroswap_factory_mainnet.wasm");
 }
 const SOROSWAP_PAIR_WASM: &[u8] = include_bytes!("../testdata/soroswap_pair_mainnet.wasm");
+
+use w1::R;
 
 mod w1 {
     use super::*;
@@ -1384,7 +1384,11 @@ mod w1 {
 
     /// `setup` with a caller-chosen signed policy (W1b band / floor tests).
     pub(super) fn setup_with(policy: impl FnOnce(&Stack<'static>) -> Address) -> R {
-        let s = deploy_stack();
+        setup_with_stack(deploy_stack(), policy)
+    }
+
+    /// `setup_with` on a caller-built stack (e.g. a vault with a fee, D-D).
+    pub(super) fn setup_with_stack(s: Stack<'static>, policy: impl FnOnce(&Stack<'static>) -> Address) -> R {
         let env = &s.env;
         let eurc = policy(&s);
         let eurc_admin = token::StellarAssetClient::new(env, &eurc);
@@ -2446,5 +2450,167 @@ mod v6 {
         let real = token::Client::new(&r.s.env, &r.eurc).balance(&r.s.vault_id);
         assert_eq!(holdings(&r).1, real, "books equal the real balance after settlement");
         assert_eq!(r.s.vault.get_claim_total(&r.eurc), 0);
+    }
+}
+
+/// Decision D-D: holders pay 10 % of PROFIT above the per-share high-water
+/// mark (conservative NAV), never more than 0.20 %/yr of assets, at most once
+/// per day, and nothing when the vault earns nothing. Real profit: EURC bought
+/// through a real Soroswap pool, then its two price feeds move.
+mod dd {
+    use super::w1::*;
+    use super::*;
+
+    pub(super) const FEE_BPS: u32 = 1_000;
+    pub(super) const YEAR: u64 = 31_536_000;
+    const DAY: u64 = 86_400;
+
+    /// W1 stack with a 10 % performance fee; 5,000 USDC of EURC bought.
+    pub(super) fn funded() -> R {
+        let r = setup_with_stack(deploy_stack_cfg(true, FEE_BPS), usdc_eurc_policy);
+        let env = &r.s.env;
+        let mut p = proposal(&r, 5_000 * ONE, quote(&r, 5_000 * ONE));
+        p.weights_after = Vec::from_array(env, [(Symbol::new(env, "USDC"), 5000u32), (Symbol::new(env, "EURC"), 5000u32)]);
+        as_keeper(&r, &p);
+        env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        env.mock_all_auths();
+        r
+    }
+
+    /// Both EURC feeds report `px` at time `at` (ledger moved there).
+    pub(super) fn price(r: &R, px: i128, at: u64) {
+        let env = &r.s.env;
+        env.ledger().set_timestamp(at);
+        env.mock_all_auths();
+        for id in ["EURC_A", "EURC_B"] {
+            r.s.oracle.update_price(&Symbol::new(env, id), &px, &200_000, &at);
+        }
+    }
+
+    /// Independent model of the D-D formula from on-chain state:
+    /// (fee shares, high-water mark afterwards, fee by profit, cap).
+    fn model(r: &R, px: i128, elapsed: u64) -> (i128, i128, i128, i128) {
+        let (cash, eurc) = holdings(r);
+        let total = cash + eurc * px / ONE;
+        let supply = r.s.vault.total_supply();
+        let hwm = r.s.vault.get_high_water_mark();
+        let nav = total * ONE / supply;
+        if nav <= hwm {
+            return (0, hwm, 0, 0);
+        }
+        let by_profit = (nav - hwm) * supply / ONE * FEE_BPS as i128 / 10_000;
+        let cap = total * 20 * elapsed as i128 / (10_000 * YEAR as i128);
+        let fee = by_profit.min(cap);
+        let shares = fee * supply / (total - fee);
+        (shares, total * ONE / (supply + shares), by_profit, cap)
+    }
+
+    #[test]
+    fn profit_pays_ten_percent_when_the_cap_does_not_bind() {
+        let r = funded();
+        let last = r.s.vault.get_last_fee_accrual();
+        let px = ONE * 11_016 / 10_000; // EURC +2 % (the minimum)
+        price(&r, px, last + YEAR);
+        // The other feed reports higher: profit is measured on the MINIMUM,
+        // so a single high (or manipulated) source cannot create a fee.
+        r.s.oracle.update_price(&Symbol::new(&r.s.env, "EURC_B"), &(ONE * 11_070 / 10_000), &200_000, &(last + YEAR));
+        let (shares, hwm, by_profit, cap) = model(&r, px, YEAR);
+        assert!(by_profit > 0 && by_profit < cap, "profit-bound case: {by_profit} < {cap}");
+        assert_eq!(r.s.vault.accrue_fees(), shares);
+        assert_eq!(r.s.vault.balance(&r.s.treasury), shares);
+        assert_eq!(r.s.vault.get_high_water_mark(), hwm);
+        // The treasury's shares are worth 10 % of the profit: never more, and
+        // less only by rounding in the holders' favour (NAV per share floors to
+        // 7 decimals, times ~shares/ONE units, plus the share floor).
+        let worth = r.s.vault.convert_to_assets(&shares);
+        assert!(worth <= by_profit && by_profit - worth <= shares / ONE + 2, "worth {worth} vs fee {by_profit}");
+    }
+
+    #[test]
+    fn the_annual_cap_binds_on_fast_profit_and_the_rest_is_forgiven() {
+        let r = funded();
+        let last = r.s.vault.get_last_fee_accrual();
+        let px = ONE * 11_016 / 10_000;
+        price(&r, px, last + 2 * DAY);
+        let (shares, hwm, by_profit, cap) = model(&r, px, 2 * DAY);
+        assert!(cap < by_profit, "cap-bound case: {cap} < {by_profit}");
+        assert_eq!(r.s.vault.accrue_fees(), shares);
+        assert_eq!(r.s.vault.get_high_water_mark(), hwm);
+        // Same price a day later: nothing more is charged for that profit.
+        price(&r, px, last + 3 * DAY);
+        assert_eq!(r.s.vault.accrue_fees(), 0);
+    }
+
+    #[test]
+    fn no_fee_below_the_high_water_mark_and_only_on_new_highs() {
+        let r = funded();
+        let last = r.s.vault.get_last_fee_accrual();
+        let up = ONE * 11_016 / 10_000;
+        price(&r, up, last + YEAR);
+        assert!(r.s.vault.accrue_fees() > 0);
+        let treasury = r.s.vault.balance(&r.s.treasury);
+        // Down 2 %, then back to the old peak: no fee either time.
+        price(&r, ONE * 108 / 100, last + YEAR + DAY);
+        assert_eq!(r.s.vault.accrue_fees(), 0);
+        price(&r, up, last + YEAR + 2 * DAY);
+        assert_eq!(r.s.vault.accrue_fees(), 0, "recovering a loss is not profit");
+        // Above the peak: a fee on the excess only.
+        let higher = ONE * 11_124 / 10_000;
+        price(&r, higher, last + 2 * YEAR);
+        let (shares, _, _, _) = model(&r, higher, YEAR - 2 * DAY);
+        assert!(shares > 0);
+        assert_eq!(r.s.vault.accrue_fees(), shares);
+        assert_eq!(r.s.vault.balance(&r.s.treasury), treasury + shares);
+    }
+
+    #[test]
+    fn fees_crystallize_at_most_once_a_day() {
+        let r = funded();
+        let last = r.s.vault.get_last_fee_accrual();
+        price(&r, ONE * 11_016 / 10_000, last + YEAR);
+        assert!(r.s.vault.accrue_fees() > 0);
+        let at = r.s.vault.get_last_fee_accrual();
+        price(&r, ONE * 11_124 / 10_000, at + 3_600);
+        assert_eq!(r.s.vault.accrue_fees(), 0, "no second fee within the day");
+        assert_eq!(r.s.vault.get_last_fee_accrual(), at);
+        price(&r, ONE * 11_124 / 10_000, at + DAY);
+        assert!(r.s.vault.accrue_fees() > 0);
+    }
+
+    #[test]
+    fn no_fee_while_a_funded_sleeve_is_unpriced_and_that_time_is_forfeited() {
+        let r = funded();
+        let last = r.s.vault.get_last_fee_accrual();
+        // A year with stale EURC feeds: no fee, no panic; the clock moves on.
+        r.s.env.ledger().set_timestamp(last + YEAR);
+        assert_eq!(r.s.vault.accrue_fees(), 0);
+        assert_eq!(r.s.vault.get_last_fee_accrual(), last + YEAR);
+        // Priced again a day later: the cap covers only that day.
+        let px = ONE * 11_016 / 10_000;
+        price(&r, px, last + YEAR + DAY);
+        let (shares, _, by_profit, cap) = model(&r, px, DAY);
+        assert!(cap < by_profit);
+        assert_eq!(r.s.vault.accrue_fees(), shares);
+    }
+
+    #[test]
+    fn a_vault_that_earns_nothing_pays_nothing() {
+        let s = deploy_stack_cfg(true, FEE_BPS);
+        let alice = Address::generate(&s.env);
+        s.usdc_admin.mint(&alice, &(1_000 * ONE));
+        s.vault.deposit(&(1_000 * ONE), &alice, &alice, &alice);
+        s.env.ledger().set_timestamp(T0 + YEAR);
+        assert_eq!(s.vault.accrue_fees(), 0);
+        assert_eq!(s.vault.balance(&s.treasury), 0);
+        assert_eq!(s.vault.total_supply(), 1_000 * ONE);
+    }
+
+    #[test]
+    fn the_fee_rate_is_capped_at_ten_percent_in_the_constructor() {
+        let ok = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deploy_stack_cfg(true, FEE_BPS)));
+        assert!(ok.is_ok());
+        let too_high = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| deploy_stack_cfg(true, FEE_BPS + 1)));
+        assert!(too_high.is_err(), "a fee above 10 % of profit is refused");
     }
 }
