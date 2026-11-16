@@ -148,6 +148,9 @@ pub enum PolicyError {
     NoPendingUpdate = 18,
     /// The pending amendment's notice period has not elapsed yet.
     NoticeNotElapsed = 19,
+    /// Holdings passed to `validate_holdings` are malformed: a negative or
+    /// duplicate entry, a zero total, or a value too large to compare.
+    InvalidHoldings = 20,
 }
 
 /// Protocol minimum notice before a policy amendment takes effect (audit P4,
@@ -327,6 +330,14 @@ pub trait PolicyContractTrait {
         proposal: RebalanceProposal,
     ) -> ValidationResult;
 
+    /// Audit W1b: check what a vault ACTUALLY holds against its signed policy.
+    /// `holdings` is (registry asset_id, value in numéraire) per sleeve. The
+    /// weights are compared exactly (value x 10000 against band x total, no
+    /// rounding) with every declared band, the single-asset cap, the issuer
+    /// caps (issuer from the registry) and the cash liquidity floor. A held
+    /// asset that the policy does not declare is rejected. Read-only.
+    fn validate_holdings(env: Env, vault: Address, holdings: Vec<(Symbol, i128)>) -> ValidationResult;
+
     /// Get admin address
     fn get_admin(env: Env) -> Address;
 }
@@ -340,6 +351,131 @@ fn is_cash_sleeve(env: &Env, st: &Symbol) -> bool {
     bytes.eq_ignore_ascii_case(b"cash")
         || bytes.eq_ignore_ascii_case(b"cash_stable")
         || bytes.eq_ignore_ascii_case(b"cash_sleeve")
+}
+
+fn verdict(env: &Env, err: Option<(PolicyError, &str)>) -> ValidationResult {
+    match err {
+        None => ValidationResult { is_valid: true, code: 0, message: Symbol::new(env, "VALID") },
+        Some((e, msg)) => ValidationResult { is_valid: false, code: e as u32, message: Symbol::new(env, msg) },
+    }
+}
+
+/// `value / total` compared with `bps / 10000` exactly: returns
+/// value*10000 - bps*total sign, or None on overflow.
+fn cmp_weight(value: i128, total: i128, bps: u32) -> Option<core::cmp::Ordering> {
+    let lhs = value.checked_mul(10_000)?;
+    let rhs = total.checked_mul(bps as i128)?;
+    Some(lhs.cmp(&rhs))
+}
+
+/// Audit W1b: the checks behind `validate_holdings`.
+fn check_holdings(env: &Env, vault: &Address, holdings: &Vec<(Symbol, i128)>) -> Option<(PolicyError, &'static str)> {
+    use core::cmp::Ordering::{Greater, Less};
+    let config: PolicyConfig = match env.storage().instance().get(&DataKey::PolicyConfig(vault.clone())) {
+        Some(c) => c,
+        None => return Some((PolicyError::PolicyNotFound, "POLICY_NOT_FOUND")),
+    };
+    if !config.is_active {
+        return Some((PolicyError::PolicyNotFound, "POLICY_INACTIVE"));
+    }
+    let targets: Vec<SleeveTarget> = env
+        .storage()
+        .instance()
+        .get(&DataKey::SleeveTargets(vault.clone()))
+        .unwrap_or_else(|| Vec::new(env));
+
+    let mut total = 0i128;
+    for i in 0..holdings.len() {
+        let (id, value) = holdings.get_unchecked(i);
+        if value < 0 {
+            return Some((PolicyError::InvalidHoldings, "NEGATIVE_HOLDING"));
+        }
+        for j in (i + 1)..holdings.len() {
+            if holdings.get_unchecked(j).0 == id {
+                return Some((PolicyError::InvalidHoldings, "DUPLICATE_HOLDING"));
+            }
+        }
+        total = match total.checked_add(value) {
+            Some(t) => t,
+            None => return Some((PolicyError::InvalidHoldings, "HOLDINGS_OVERFLOW")),
+        };
+    }
+    if total == 0 {
+        return Some((PolicyError::InvalidHoldings, "EMPTY_HOLDINGS"));
+    }
+    let value_of = |id: &Symbol| -> i128 {
+        for (h, v) in holdings.iter() {
+            if h == *id {
+                return v;
+            }
+        }
+        0
+    };
+
+    // Anything held must be declared by the signed policy.
+    for (id, value) in holdings.iter() {
+        if value > 0 && !targets.iter().any(|t| t.asset_id == id) {
+            return Some((PolicyError::AssetNotInPolicy, "UNDECLARED_HOLDING"));
+        }
+    }
+    // Every declared band, on actual values.
+    let mut cash = 0i128;
+    for t in targets.iter() {
+        let v = value_of(&t.asset_id);
+        match (cmp_weight(v, total, t.min_band_bps), cmp_weight(v, total, t.max_band_bps)) {
+            (Some(lo), Some(hi)) => {
+                if lo == Less || hi == Greater {
+                    return Some((PolicyError::WeightBandExceeded, "ACTUAL_OUT_OF_BAND"));
+                }
+            }
+            _ => return Some((PolicyError::InvalidHoldings, "HOLDINGS_OVERFLOW")),
+        }
+        if is_cash_sleeve(env, &t.sleeve_type) {
+            cash = cash.saturating_add(v);
+        }
+    }
+    // Single-asset cap and issuer caps (issuer recorded in the registry).
+    let registry = AssetRegistryClient::new(env, &config.registry_address);
+    let mut issuers: Vec<(Symbol, i128)> = Vec::new(env);
+    for (id, value) in holdings.iter() {
+        if value == 0 {
+            continue;
+        }
+        match cmp_weight(value, total, config.max_single_asset_bps) {
+            Some(Greater) => return Some((PolicyError::SingleAssetCapExceeded, "ACTUAL_SINGLE_ASSET_CAP")),
+            None => return Some((PolicyError::InvalidHoldings, "HOLDINGS_OVERFLOW")),
+            _ => {}
+        }
+        let entry = match registry.get_asset(&id) {
+            Some(e) if e.is_active => e,
+            _ => return Some((PolicyError::AssetNotRegistered, "ASSET_NOT_REGISTERED")),
+        };
+        let mut found = false;
+        for k in 0..issuers.len() {
+            let (issuer, sum) = issuers.get_unchecked(k);
+            if issuer == entry.issuer {
+                issuers.set(k, (issuer, sum.saturating_add(value)));
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            issuers.push_back((entry.issuer, value));
+        }
+    }
+    for (_, sum) in issuers.iter() {
+        match cmp_weight(sum, total, config.max_issuer_bps) {
+            Some(Greater) => return Some((PolicyError::IssuerCapExceeded, "ACTUAL_ISSUER_CAP")),
+            None => return Some((PolicyError::InvalidHoldings, "HOLDINGS_OVERFLOW")),
+            _ => {}
+        }
+    }
+    // Cash liquidity floor.
+    match cmp_weight(cash, total, config.min_liquidity_sleeve_bps) {
+        Some(Less) => Some((PolicyError::LiquidityFloorBreached, "ACTUAL_LIQUIDITY_FLOOR")),
+        None => Some((PolicyError::InvalidHoldings, "HOLDINGS_OVERFLOW")),
+        _ => None,
+    }
 }
 
 fn validate_terms(
@@ -1049,6 +1185,10 @@ impl PolicyContractTrait for PolicyContract {
         };
         RebalanceValidated { vault, is_valid: res.is_valid, code: res.code }.publish(&env);
         res
+    }
+
+    fn validate_holdings(env: Env, vault: Address, holdings: Vec<(Symbol, i128)>) -> ValidationResult {
+        verdict(&env, check_holdings(&env, &vault, &holdings))
     }
 
     fn get_admin(env: Env) -> Address {

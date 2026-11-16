@@ -2206,3 +2206,118 @@ fn golden_events_policy() {
     g.finish(&["POLICY_REGISTERED", "REBALANCE_VALIDATED", "POLICY_UPDATE_PROPOSED", "POLICY_NOTICE_SET",
         "POLICY_UPDATE_CANCELLED", "POLICY_UPDATED"]);
 }
+
+// ---------------------------------------------------------------------------
+// Audit W1b: validate_holdings checks ACTUAL values against the signed policy.
+// sample_sleeves bands: USDC 10-25 %, EURC 5-15 %, BENJI 15-25 %,
+// EUSTBL 15-25 %, BLND 5-25 %; USDC and EURC are cash, both issued by CIRCLE.
+// ---------------------------------------------------------------------------
+
+const K: i128 = 10_000_000; // one bps of a 10_000-unit basket, in 7-decimal units
+
+/// A fresh vault under sample_sleeves with the given floor / caps.
+fn holdings_policy(ctx: &TestContext, floor: u32, single: u32, issuer: u32) -> Address {
+    let vault = Address::generate(&ctx.env);
+    PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(
+        &vault, &ctx.owner, &sample_hash(&ctx.env, 0x1b), &ctx.registry_address,
+        &floor, &single, &issuer, &50, &500, &sample_sleeves(&ctx.env),
+    );
+    vault
+}
+
+/// Holdings in bps-of-basket units (x K), in sample_sleeves order.
+fn basket(env: &Env, usdc: i128, eurc: i128, benji: i128, eustbl: i128, blnd: i128) -> Vec<(Symbol, i128)> {
+    vec![
+        env,
+        (Symbol::new(env, "CIRCLE_USDC"), usdc),
+        (Symbol::new(env, "CIRCLE_EURC"), eurc),
+        (Symbol::new(env, "FRANKLIN_BENJI"), benji),
+        (Symbol::new(env, "SPIKO_EUSTBL"), eustbl),
+        (Symbol::new(env, "BLEND_BLND"), blnd),
+    ]
+}
+
+fn holdings_code(ctx: &TestContext, vault: &Address, h: &Vec<(Symbol, i128)>) -> (bool, u32) {
+    let r = PolicyContractClient::new(&ctx.env, &ctx.policy_address).validate_holdings(vault, h);
+    (r.is_valid, r.code)
+}
+
+#[test]
+fn w1b_holdings_inside_every_band_and_cap_are_valid() {
+    let ctx = setup_test_context();
+    let vault = holdings_policy(&ctx, 1000, 2500, 3500);
+    let h = basket(&ctx.env, 2000 * K, 1000 * K, 2500 * K, 2500 * K, 2000 * K);
+    assert_eq!(holdings_code(&ctx, &vault, &h), (true, 0));
+}
+
+#[test]
+fn w1b_band_edges_are_compared_exactly() {
+    let ctx = setup_test_context();
+    let vault = holdings_policy(&ctx, 1000, 10_000, 10_000);
+    // BENJI exactly 25.00 % is allowed; one stroop more (total unchanged) is not.
+    let edge = basket(&ctx.env, 2000 * K, 1000 * K, 2500 * K, 2500 * K, 2000 * K);
+    assert_eq!(holdings_code(&ctx, &vault, &edge), (true, 0));
+    let over = basket(&ctx.env, 2000 * K, 1000 * K, 2500 * K + 1, 2500 * K, 2000 * K - 1);
+    assert_eq!(holdings_code(&ctx, &vault, &over), (false, PolicyError::WeightBandExceeded as u32));
+    // BENJI one stroop under its 15 % minimum (the stroop goes to BLND, which
+    // stays inside its own band, so only the minimum can catch it).
+    let under = basket(&ctx.env, 2500 * K, 1500 * K, 1500 * K - 1, 2500 * K, 2000 * K + 1);
+    assert_eq!(holdings_code(&ctx, &vault, &under), (false, PolicyError::WeightBandExceeded as u32));
+}
+
+#[test]
+fn w1b_a_declared_sleeve_missing_from_holdings_counts_as_zero() {
+    let ctx = setup_test_context();
+    let vault = holdings_policy(&ctx, 1000, 10_000, 10_000);
+    // BLND (min 5 %) omitted entirely.
+    let mut h = basket(&ctx.env, 2500 * K, 1500 * K, 2500 * K, 2500 * K, 0);
+    h.pop_back();
+    h.push_back((Symbol::new(&ctx.env, "CIRCLE_USDC"), 0)); // duplicate id is malformed
+    assert_eq!(holdings_code(&ctx, &vault, &h), (false, PolicyError::InvalidHoldings as u32));
+    h.pop_back();
+    assert_eq!(holdings_code(&ctx, &vault, &h), (false, PolicyError::WeightBandExceeded as u32));
+}
+
+#[test]
+fn w1b_an_undeclared_holding_is_rejected_unless_empty() {
+    let ctx = setup_test_context();
+    let vault = holdings_policy(&ctx, 1000, 10_000, 10_000);
+    let mut h = basket(&ctx.env, 2000 * K, 1000 * K, 2500 * K, 2500 * K, 2000 * K);
+    h.push_back((Symbol::new(&ctx.env, "FRANKLIN_USDF"), 0));
+    assert_eq!(holdings_code(&ctx, &vault, &h), (true, 0), "a zero balance of an undeclared asset is harmless");
+    h.set(5, (Symbol::new(&ctx.env, "FRANKLIN_USDF"), 1));
+    assert_eq!(holdings_code(&ctx, &vault, &h), (false, PolicyError::AssetNotInPolicy as u32));
+}
+
+#[test]
+fn w1b_single_asset_issuer_and_floor_are_checked_on_values() {
+    let ctx = setup_test_context();
+    let h = basket(&ctx.env, 2000 * K, 1000 * K, 2500 * K, 2500 * K, 2000 * K);
+    let single = holdings_policy(&ctx, 1000, 2000, 10_000);
+    assert_eq!(holdings_code(&ctx, &single, &h), (false, PolicyError::SingleAssetCapExceeded as u32));
+    // CIRCLE (USDC + EURC) holds 30 %.
+    let issuer = holdings_policy(&ctx, 1000, 10_000, 2999);
+    assert_eq!(holdings_code(&ctx, &issuer, &h), (false, PolicyError::IssuerCapExceeded as u32));
+    let issuer_ok = holdings_policy(&ctx, 1000, 10_000, 3000);
+    assert_eq!(holdings_code(&ctx, &issuer_ok, &h), (true, 0));
+    // Cash (USDC + EURC) is 30 %; a 30.01 % floor fails, 30 % passes.
+    let floor = holdings_policy(&ctx, 3001, 10_000, 10_000);
+    assert_eq!(holdings_code(&ctx, &floor, &h), (false, PolicyError::LiquidityFloorBreached as u32));
+    let floor_ok = holdings_policy(&ctx, 3000, 10_000, 10_000);
+    assert_eq!(holdings_code(&ctx, &floor_ok, &h), (true, 0));
+}
+
+#[test]
+fn w1b_malformed_or_unknown_inputs_fail_closed() {
+    let ctx = setup_test_context();
+    let vault = holdings_policy(&ctx, 1000, 10_000, 10_000);
+    let neg = basket(&ctx.env, -1, 1000 * K, 2500 * K, 2500 * K, 2000 * K);
+    assert_eq!(holdings_code(&ctx, &vault, &neg), (false, PolicyError::InvalidHoldings as u32));
+    let empty = basket(&ctx.env, 0, 0, 0, 0, 0);
+    assert_eq!(holdings_code(&ctx, &vault, &empty), (false, PolicyError::InvalidHoldings as u32));
+    let huge = basket(&ctx.env, i128::MAX / 4, i128::MAX / 8, i128::MAX / 4, i128::MAX / 4, i128::MAX / 8);
+    assert_eq!(holdings_code(&ctx, &vault, &huge), (false, PolicyError::InvalidHoldings as u32));
+    let stranger = Address::generate(&ctx.env);
+    let h = basket(&ctx.env, 2000 * K, 1000 * K, 2500 * K, 2500 * K, 2000 * K);
+    assert_eq!(holdings_code(&ctx, &stranger, &h), (false, PolicyError::PolicyNotFound as u32));
+}
