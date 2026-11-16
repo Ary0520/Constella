@@ -518,7 +518,9 @@ fn test_t55_sponsored_passkey_vault_deposit() {
     env.mock_all_auths(); // remaining steps are sponsor/admin bookkeeping
     assert_eq!(shares_minted, 500_0000000);
 
-    // C) Sponsor records the sponsored transaction
+    // C) The designated relayer (audit F1b) records the sponsored transaction
+    let relayer = Address::generate(&env);
+    sponsor_client.set_relayer(&relayer);
     sponsor_client.record_sponsored_op(&user_account_id, &vault_id, &fee_bid_stroops);
 
     // D) Verification of balances & zero-gas sponsorship accounting
