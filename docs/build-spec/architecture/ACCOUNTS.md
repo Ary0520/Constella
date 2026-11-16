@@ -171,7 +171,7 @@ Using **Stellar Wallets Kit** for wallet connection:
 ## Implementation Checklist
 
 - [ ] Passkey smart account using OpenZeppelin smart-account framework
-- [ ] Fee-bump transaction sponsorship for all user vault operations
+- [x] Sponsorship of user vault operations (audit F1/S2, 16 Nov 2026): `services/relayer` — the relayer account is the transaction source and pays; passkey users sign only auth entries; quotas recorded on chain first (fee-sponsor relayer role). Proven zero-gas on a real local network. Classic-account fee-bump (CAP-15) path still to do
 - [ ] Reserve sponsorship for classic accounts (if used)
 - [ ] Sponsor account with spend limits and rate limits
 - [ ] Stellar Wallets Kit integration (upgraded to v28+)
