@@ -111,9 +111,14 @@ def parse_thesis(
                 if is_max and not is_min:
                     ambiguities.append(f"A maximum cash share ({_fmt(pct)}) is not supported; the cash sleeve is a minimum (liquidity floor). Kept the default floor.")
                     continue
-                min_liquidity_sleeve = pct
+                if has_explicit_liquidity and pct != min_liquidity_sleeve:
+                    ambiguities.append(f"Conflicting cash reserves ({_fmt(min_liquidity_sleeve)}, {_fmt(pct)}); applied the higher.")
+                # Several readings: the higher floor is the safer one.
+                min_liquidity_sleeve = max(pct, min_liquidity_sleeve) if has_explicit_liquidity else pct
                 has_explicit_liquidity = True
                 confidence["min_liquidity_sleeve"] = 0.95
+                if pct < 0.10:
+                    ambiguities.append(f"Requested cash reserve {_fmt(pct)} is below the 10% default; please confirm on the review screen.")
             # Check for USD / dollar exposure
             elif any(term in ctx_lower for term in ["dollar", "usd", "$", "us t-bill"]):
                 currency_exposure["USD"] = pct

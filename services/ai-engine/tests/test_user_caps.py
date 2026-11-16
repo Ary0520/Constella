@@ -82,3 +82,11 @@ def test_the_users_caps_reach_the_policy_they_sign():
     signed = assemble_canonical_policy(p, optimize_portfolio(p, cands), cands, created_at="2026-11-17T00:00:00Z")
     assert signed.constraints.max_issuer_weight_bps == 2000
     assert signed.constraints.max_single_asset_weight_bps == 1500
+
+
+def test_two_cash_floors_take_the_higher_whatever_the_order():
+    for text in ["Keep at least 20% cash, and a 5% buffer, rest in dollar t-bills.",
+                 "Keep a 5% buffer, and at least 20% cash, rest in dollar t-bills."]:
+        p = parse_thesis(text)
+        assert p.min_liquidity_sleeve == 0.20, text
+        assert any("applied the higher" in a for a in p.ambiguities)
