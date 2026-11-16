@@ -713,6 +713,27 @@ fn sleeve_value(
     Ok((value, pd.timestamp))
 }
 
+/// Audit W1b: the signed policy's CURRENT target for each sleeve, in sleeve
+/// order (0 for a sleeve the policy does not declare, e.g. after an
+/// amendment dropped it), or None while no policy is bound. Read live, so an
+/// activated amendment takes effect without anyone re-running set_sleeves.
+fn signed_targets(env: &Env, config: &VaultConfig, sleeves: &Vec<SleeveState>) -> Option<Vec<u32>> {
+    let policy = PolicyClient::new(env, &config.policy_contract);
+    let me = env.current_contract_address();
+    policy.get_policy_config(&me)?;
+    let targets = policy.get_sleeve_targets(&me);
+    let registry = AssetRegistryClient::new(env, &config.registry_contract);
+    let mut out = Vec::new(env);
+    for sleeve in sleeves.iter() {
+        let weight = match registry.get_asset_by_address(&sleeve.contract_address) {
+            Some(entry) => targets.iter().find(|t| t.asset_id == entry.asset_id).map(|t| t.target_weight_bps).unwrap_or(0),
+            None => 0,
+        };
+        out.push_back(weight);
+    }
+    Some(out)
+}
+
 /// Audit W1b: value every sleeve as actually held (measured balance, capped
 /// by the booked balance, at its asset's median price; cash at face value)
 /// under its registry asset ID, and require the signed policy to accept the
@@ -1655,6 +1676,9 @@ impl StrategyVault {
             values.push_back(value);
         }
 
+        // Empty vault: weight by the signed policy's current targets (audit
+        // W1b); the stored targets only before any policy is bound.
+        let signed = if total > 0 { None } else { signed_targets(&env, &config, &sleeves) };
         let mut weight_sum = 0i128;
         let mut weighted_haircut = 0i128;
         for i in 0..sleeves.len() {
@@ -1662,7 +1686,10 @@ impl StrategyVault {
             let weight = if total > 0 {
                 values.get(i).unwrap()
             } else {
-                sleeve.target_weight_bps as i128
+                match &signed {
+                    Some(t) => t.get_unchecked(i) as i128,
+                    None => sleeve.target_weight_bps as i128,
+                }
             };
             weight_sum = overflow(weight_sum.checked_add(weight));
             weighted_haircut = overflow(
@@ -1786,11 +1813,22 @@ impl StrategyVault {
     }
 
     // Sleeve Management & Info
+    /// The sleeve layout. Once a policy is bound, `target_weight_bps` shows
+    /// the signed policy's CURRENT target (audit W1b), not a stored copy.
     pub fn get_sleeves(env: Env) -> Vec<SleeveState> {
-        env.storage()
+        let mut sleeves: Vec<SleeveState> = env
+            .storage()
             .instance()
             .get(&DataKey::Sleeves)
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(targets) = signed_targets(&env, &get_config(&env), &sleeves) {
+            for i in 0..sleeves.len() {
+                let mut s = sleeves.get_unchecked(i);
+                s.target_weight_bps = targets.get_unchecked(i);
+                sleeves.set(i, s);
+            }
+        }
+        sleeves
     }
 
     /// Replace the sleeve layout (targets, bands, tiers). Admin only.
