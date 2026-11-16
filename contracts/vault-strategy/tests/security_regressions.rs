@@ -1877,3 +1877,364 @@ mod w1b {
         assert!(r.s.vault.try_deposit(&(100 * ONE), &bob, &bob, &bob).is_err(), "no deposit at an unknown price");
     }
 }
+
+/// Decision D-H / Blend adapter: the vault supplies USDC into a REAL Blend v2
+/// pool (mainnet WASMs via constella-testkit), holds the position as bTokens,
+/// values it at the oracle's live-b_rate price and withdraws it again - every
+/// leg policy-validated, measured on the vault's own balances, and re-checked
+/// against the signed policy afterwards.
+mod blend_sleeve {
+    use super::*;
+    use constella_testkit::blend::{self, pool::Request, BORROW, RATE_SCALE, SUPPLY_COLLATERAL};
+    use constella_vault_strategy::{RebalanceProposal as VP, TradeOperation as VT, TradeRoute as VR};
+
+    const ROUTE_UNAVAILABLE: u32 = 24;
+    const SLEEVE_HAS_HOLDINGS: u32 = 16;
+    const NOW: u64 = 1_731_600_000;
+
+    struct X {
+        s: Stack<'static>,
+        b: blend::BlendEnv<'static>,
+        pool: Address,
+        keeper: Address,
+        alice: Address,
+        owner: Address,
+        eurc: Address,
+    }
+
+    fn setup() -> X {
+        setup_with(false)
+    }
+
+    /// `with_eurc`: also an EURC sleeve (priced by two feeds, declared in the
+    /// policy) - a token that is NOT the Blend position's underlying.
+    fn setup_with(with_eurc: bool) -> X {
+        let s = deploy_stack();
+        let env = &s.env;
+        env.cost_estimate().budget().reset_unlimited();
+        env.ledger().set_timestamp(NOW); // Blend's backstop epoch is 2015
+        let b = blend::deploy(env, &s.usdc_admin, &s.oracle.address);
+        let pool = b.pool.address.clone();
+        s.oracle.set_blend_factory(&b.factory.address);
+        s.oracle.register_blend_position(&pool, &s.usdc_addr);
+        AssetRegistryClient::new(env, &s.registry_id).add_asset(&AssetEntry {
+            contract_address: pool.clone(),
+            asset_id: Symbol::new(env, "BLEND_USDC_SUPPLY"),
+            issuer: Symbol::new(env, "BLEND"),
+            sleeve_type: RegSleeve::Lending,
+            liquidity_tier: 1,
+            permissionless: true,
+            oracle_sources: Vec::from_array(env, [Symbol::new(env, "BLEND_B_RATE")]),
+            eligible_jurisdictions: Vec::new(env),
+            blocked_jurisdictions: Vec::new(env),
+            investor_classes_required: Vec::new(env),
+            is_active: true,
+            added_at: NOW,
+        });
+        let eurc = s.env.register_stellar_asset_contract_v2(Address::generate(env)).address();
+        let mut layout: std::vec::Vec<(&str, &str, u32)> = std::vec![("USDC", "cash", 5000), ("BLEND_USDC_SUPPLY", "lending", 5000)];
+        if with_eurc {
+            AssetRegistryClient::new(env, &s.registry_id).add_asset(&AssetEntry {
+                contract_address: eurc.clone(),
+                asset_id: Symbol::new(env, "EURC"),
+                issuer: Symbol::new(env, "CIRCLE"),
+                sleeve_type: RegSleeve::Cash,
+                liquidity_tier: 0,
+                permissionless: true,
+                oracle_sources: Vec::from_array(env, [Symbol::new(env, "EURC_A"), Symbol::new(env, "EURC_B")]),
+                eligible_jurisdictions: Vec::new(env),
+                blocked_jurisdictions: Vec::new(env),
+                investor_classes_required: Vec::new(env),
+                is_active: true,
+                added_at: NOW,
+            });
+            let key = Symbol::new(env, "EURC");
+            s.oracle.configure_sleeve(&key, &200, &2);
+            for id in ["EURC_A", "EURC_B"] {
+                let mut src = oracle_source(env, id, &eurc, ONE * 108 / 100);
+                src.sleeve = key.clone();
+                src.timestamp = env.ledger().timestamp();
+                s.oracle.register_source(&src);
+            }
+            layout = std::vec![("USDC", "cash", 4000), ("BLEND_USDC_SUPPLY", "lending", 3000), ("EURC", "eur_sovereign", 3000)];
+        }
+        let mut targets = Vec::new(env);
+        for &(id, kind, w) in layout.iter() {
+            targets.push_back(SleeveTarget { asset_id: Symbol::new(env, id), target_weight_bps: w, min_band_bps: 0,
+                max_band_bps: 10_000, sleeve_type: Symbol::new(env, kind) });
+        }
+        let owner = Address::generate(env);
+        s.policy.register_policy(&s.vault_id, &owner, &soroban_sdk::BytesN::from_array(env, &[0xb1; 32]), &s.registry_id,
+            &1000, &10_000, &10_000, &50, &500, &targets);
+        let w = |i: usize| layout[i].2;
+        let mut sleeves = Vec::new(env);
+        sleeves.push_back(SleeveState { asset_id: String::from_str(env, "USDC"), contract_address: s.usdc_addr.clone(),
+            target_weight_bps: w(0), band_bps: 5000, current_balance: 0, sleeve_type: SleeveType::CashStable, liquidity_tier: 0 });
+        sleeves.push_back(SleeveState { asset_id: String::from_str(env, "BLEND_USDC_SUPPLY"), contract_address: pool.clone(),
+            target_weight_bps: w(1), band_bps: 5000, current_balance: 0, sleeve_type: SleeveType::Lending, liquidity_tier: 1 });
+        if with_eurc {
+            sleeves.push_back(SleeveState { asset_id: String::from_str(env, "EURC"), contract_address: eurc.clone(),
+                target_weight_bps: w(2), band_bps: 5000, current_balance: 0, sleeve_type: SleeveType::EurSovereign, liquidity_tier: 0 });
+        }
+        s.vault.set_sleeves(&sleeves);
+        let keeper = Address::generate(env);
+        s.vault.set_keeper(&keeper);
+        let alice = Address::generate(env);
+        s.usdc_admin.mint(&alice, &(10_000 * ONE));
+        s.vault.deposit(&(10_000 * ONE), &alice, &alice, &alice);
+        X { s, b, pool, keeper, alice, owner, eurc }
+    }
+
+    fn leg(x: &X, asset_in: &Address, asset_out: &Address, amount_in: i128, min_out: i128, route: VR) -> VP {
+        let env = &x.s.env;
+        VP {
+            vault: x.s.vault_id.clone(),
+            policy_hash: x.s.policy.get_policy_hash(&x.s.vault_id),
+            operations: Vec::from_array(env, [VT { asset_in: asset_in.clone(), asset_out: asset_out.clone(), amount_in,
+                min_amount_out: min_out, route }]),
+            weights_after: Vec::from_array(env, [(Symbol::new(env, "USDC"), 7000u32), (Symbol::new(env, "BLEND_USDC_SUPPLY"), 3000u32)]),
+            deadline: env.ledger().timestamp() + 600,
+            proposer: x.keeper.clone(),
+        }
+    }
+
+    fn run(x: &X, p: &VP) -> Result<(), soroban_sdk::Error> {
+        authorize(&x.s, &x.keeper, "rebalance", (p.clone(),).into_val(&x.s.env));
+        match x.s.vault.try_rebalance(p) {
+            Ok(_) => Ok(()),
+            Err(e) => Err(e.unwrap()),
+        }
+    }
+
+    fn b_tokens(x: &X) -> i128 {
+        x.b.pool.get_positions(&x.s.vault_id).supply.get(x.b.usdc_index).unwrap_or(0)
+    }
+
+    fn booked(x: &X) -> (i128, i128) {
+        let sl = x.s.vault.get_sleeves();
+        (sl.get(0).unwrap().current_balance, sl.get(1).unwrap().current_balance)
+    }
+
+    fn supply_3000(x: &X) {
+        let p = leg(x, &x.s.usdc_addr, &x.pool, 3_000 * ONE, 3_000 * ONE * 999 / 1000, VR::Blend);
+        run(x, &p).unwrap();
+    }
+
+    /// A borrower creates real utilization (USDC collateral, USDC debt).
+    fn borrow(x: &X, collateral: i128, debt: i128) {
+        let env = &x.s.env;
+        env.mock_all_auths();
+        let who = Address::generate(env);
+        x.s.usdc_admin.mint(&who, &collateral);
+        x.b.pool.submit(&who, &who, &who, &Vec::from_array(env, [
+            Request { request_type: SUPPLY_COLLATERAL, address: x.s.usdc_addr.clone(), amount: collateral },
+            Request { request_type: BORROW, address: x.s.usdc_addr.clone(), amount: debt },
+        ]));
+    }
+
+    #[test]
+    fn a_supply_into_real_blend_is_measured_and_booked_in_btokens() {
+        let x = setup();
+        let p = leg(&x, &x.s.usdc_addr, &x.pool, 3_000 * ONE, 3_000 * ONE * 999 / 1000, VR::Blend);
+        authorize(&x.s, &x.keeper, "rebalance", (p.clone(),).into_val(&x.s.env));
+        x.s.vault.rebalance(&p);
+        let used = x.s.env.cost_estimate().resources();
+        assert!(used.instructions < 100_000_000, "{} instructions (mainnet tx limit 100M)", used.instructions);
+        assert!(used.mem_bytes < 40 * 1024 * 1024, "{} bytes (mainnet tx limit 40 MB)", used.mem_bytes);
+        assert!(x.s.env.auths().iter().all(|(a, _)| *a == x.keeper), "only the keeper signs");
+        // Fresh reserve: 1 bToken = 1 USDC. Booked = the pool's own record.
+        assert_eq!(b_tokens(&x), 3_000 * ONE);
+        assert_eq!(booked(&x), (7_000 * ONE, 3_000 * ONE));
+        assert_eq!(x.s.usdc.balance(&x.s.vault_id), 7_000 * ONE);
+        assert!(x.b.pool.get_positions(&x.s.vault_id).collateral.is_empty(), "plain supply: never collateral");
+        assert_eq!(x.s.vault.total_assets(), 10_000 * ONE);
+    }
+
+    #[test]
+    fn interest_earned_in_blend_raises_the_share_price() {
+        let x = setup();
+        supply_3000(&x);
+        borrow(&x, 20_000 * ONE, 10_000 * ONE); // 15k power >= 13.3k
+        x.s.env.ledger().set_timestamp(x.s.env.ledger().timestamp() + 30 * 24 * 3600);
+        let rate = x.b.pool.get_reserve(&x.s.usdc_addr).data.b_rate;
+        assert!(rate > RATE_SCALE);
+        let price = ONE * rate / RATE_SCALE; // the oracle's price per bToken
+        let expected = 7_000 * ONE + b_tokens(&x) * price / ONE;
+        assert!(expected > 10_000 * ONE);
+        assert_eq!(x.s.vault.total_assets(), expected);
+        assert!(x.s.vault.convert_to_assets(&ONE) > ONE, "every share is worth more");
+        // A further supply now buys FEWER bTokens than USDC; the books follow
+        // the pool's own record exactly.
+        let before = b_tokens(&x);
+        let p = leg(&x, &x.s.usdc_addr, &x.pool, 1_000 * ONE, 1_000 * ONE * RATE_SCALE / rate * 999 / 1000, VR::Blend);
+        run(&x, &p).unwrap();
+        let bought = b_tokens(&x) - before;
+        assert!(bought < 1_000 * ONE);
+        assert_eq!(booked(&x), (6_000 * ONE, b_tokens(&x)));
+    }
+
+    #[test]
+    fn a_withdraw_returns_the_position_with_its_interest_as_cash() {
+        let x = setup();
+        supply_3000(&x);
+        borrow(&x, 20_000 * ONE, 10_000 * ONE);
+        x.s.env.ledger().set_timestamp(x.s.env.ledger().timestamp() + 30 * 24 * 3600);
+        let held = b_tokens(&x);
+        let rate = x.b.pool.get_reserve(&x.s.usdc_addr).data.b_rate;
+        let worth = held * rate / RATE_SCALE;
+        let p = leg(&x, &x.pool, &x.s.usdc_addr, held, worth * 999 / 1000, VR::Blend);
+        authorize(&x.s, &x.keeper, "rebalance", (p.clone(),).into_val(&x.s.env));
+        x.s.vault.rebalance(&p);
+        assert_eq!(b_tokens(&x), 0);
+        let (cash, blend_booked) = booked(&x);
+        assert_eq!(blend_booked, 0);
+        let received = cash - 7_000 * ONE;
+        assert!(received > 3_000 * ONE && received <= worth && received >= worth - 1, "{received} vs {worth}");
+        assert_eq!(x.s.usdc.balance(&x.s.vault_id), cash);
+    }
+
+    /// Blend's liquidity risk is real: a withdraw that would push utilization
+    /// to 100 % reverts inside Blend, and the whole rebalance with it.
+    #[test]
+    fn a_withdraw_the_pool_cannot_pay_reverts_atomically() {
+        let x = setup();
+        let env = &x.s.env;
+        env.mock_all_auths();
+        // EURC collateral priced by Constella's oracle (two feeds).
+        let eurc = env.register_stellar_asset_contract_v2(Address::generate(env)).address();
+        blend::add_reserve(env, &x.b, &eurc, 7);
+        let sleeve = Symbol::new(env, "EURC");
+        x.s.oracle.configure_sleeve(&sleeve, &200, &2);
+        for (id, px) in [("EURC_A", 10_800_000i128), ("EURC_B", 10_700_000i128)] {
+            let mut src = oracle_source(env, id, &eurc, px);
+            src.sleeve = sleeve.clone();
+            src.timestamp = env.ledger().timestamp();
+            x.s.oracle.register_source(&src);
+        }
+        supply_3000(&x);
+        // Borrow 95 % of the vault's 3,000 (Blend's max_util) against EURC.
+        env.mock_all_auths();
+        let who = Address::generate(env);
+        token::StellarAssetClient::new(env, &eurc).mint(&who, &(10_000 * ONE));
+        x.b.pool.submit(&who, &who, &who, &Vec::from_array(env, [
+            Request { request_type: SUPPLY_COLLATERAL, address: eurc.clone(), amount: 10_000 * ONE },
+            Request { request_type: BORROW, address: x.s.usdc_addr.clone(), amount: 2_850 * ONE },
+        ]));
+        let held = b_tokens(&x);
+        let rate = x.b.pool.get_reserve(&x.s.usdc_addr).data.b_rate;
+        let worth = |b: i128| b * rate / RATE_SCALE;
+        // Fair value minus 0.1 % (inside the signed 0.5 %): the POLICY accepts,
+        // and Blend itself refuses - utilization would reach 100 %.
+        let all = leg(&x, &x.pool, &x.s.usdc_addr, held, worth(held) * 999 / 1000, VR::Blend);
+        assert_eq!(run(&x, &all), Err(contract_error(1207)), "Blend InvalidUtilRate, not a policy rejection");
+        assert_eq!(b_tokens(&x), held);
+        assert_eq!(booked(&x), (7_000 * ONE, held));
+        assert_eq!(x.s.usdc.balance(&x.s.vault_id), 7_000 * ONE);
+        // What the pool can pay, it pays.
+        let some = leg(&x, &x.pool, &x.s.usdc_addr, 100 * ONE, worth(100 * ONE) * 999 / 1000, VR::Blend);
+        run(&x, &some).unwrap();
+        assert!(booked(&x).0 >= 7_099 * ONE);
+        assert_eq!(booked(&x).1, b_tokens(&x));
+    }
+
+    #[test]
+    fn a_blend_position_is_never_routed_through_an_amm() {
+        let x = setup();
+        // A real Soroswap router IS configured (through the 48 h delay), so the
+        // refusal comes from the Blend guard, not from a missing router.
+        let _router = real_soroswap(&x, None);
+        let p = leg(&x, &x.s.usdc_addr, &x.pool, 1_000 * ONE, 999 * ONE, VR::Soroswap);
+        assert_eq!(run(&x, &p), Err(contract_error(ROUTE_UNAVAILABLE)));
+        assert_eq!(booked(&x), (10_000 * ONE, 0));
+    }
+
+    /// A Blend leg must pair the position with ITS underlying: supplying "from
+    /// EURC" would otherwise move the vault's USDC while booking the spend
+    /// against the EURC sleeve.
+    #[test]
+    fn a_blend_leg_must_use_the_positions_own_underlying() {
+        let x = setup_with(true);
+        let env = &x.s.env;
+        env.mock_all_auths();
+        // The vault first buys real EURC through a real Soroswap pool.
+        let router = real_soroswap(&x, Some(&x.eurc));
+        for id in ["EURC_A", "EURC_B"] {
+            x.s.oracle.update_price(&Symbol::new(env, id), &(ONE * 108 / 100), &200_000, &env.ledger().timestamp());
+        }
+        let path = Vec::from_array(env, [x.s.usdc_addr.clone(), x.eurc.clone()]);
+        let out = router.router_get_amounts_out(&(1_000 * ONE), &path).get(1).unwrap();
+        let mut buy = leg(&x, &x.s.usdc_addr, &x.eurc, 1_000 * ONE, out, VR::Soroswap);
+        buy.weights_after = Vec::from_array(env, [(Symbol::new(env, "USDC"), 9000u32), (Symbol::new(env, "BLEND_USDC_SUPPLY"), 0u32),
+            (Symbol::new(env, "EURC"), 1000u32)]);
+        run(&x, &buy).unwrap();
+        assert_eq!(x.s.vault.get_sleeves().get(2).unwrap().current_balance, out);
+
+        // Now a policy-valid "supply from EURC" into the USDC position.
+        let mut p = leg(&x, &x.eurc, &x.pool, 500 * ONE, 500 * ONE * 108 / 100 * 999 / 1000, VR::Blend);
+        p.weights_after = buy.weights_after.clone();
+        let usdc_before = x.s.usdc.balance(&x.s.vault_id);
+        assert_eq!(run(&x, &p), Err(contract_error(ROUTE_UNAVAILABLE)));
+        assert_eq!(x.s.usdc.balance(&x.s.vault_id), usdc_before, "no USDC moved");
+        assert_eq!(b_tokens(&x), 0);
+        assert_eq!(x.s.vault.get_sleeves().get(2).unwrap().current_balance, out, "EURC books untouched");
+
+        // And a withdraw must pay out the position's underlying, not EURC.
+        let mut fund = leg(&x, &x.s.usdc_addr, &x.pool, 1_000 * ONE, 999 * ONE, VR::Blend);
+        fund.weights_after = buy.weights_after.clone();
+        run(&x, &fund).unwrap();
+        let held = b_tokens(&x);
+        let mut out_wrong = leg(&x, &x.pool, &x.eurc, 500 * ONE, 500 * ONE * 100 / 108 * 999 / 1000, VR::Blend);
+        out_wrong.weights_after = buy.weights_after.clone();
+        let usdc_before = x.s.usdc.balance(&x.s.vault_id);
+        assert_eq!(run(&x, &out_wrong), Err(contract_error(ROUTE_UNAVAILABLE)));
+        assert_eq!(b_tokens(&x), held);
+        assert_eq!(x.s.usdc.balance(&x.s.vault_id), usdc_before);
+        assert_eq!(x.s.vault.get_sleeves().get(2).unwrap().current_balance, out, "EURC books untouched");
+    }
+
+    /// A real Soroswap factory + router, configured on the vault through the
+    /// 48 h delay; with `pair`, a deep USDC/`pair` pool at 1.08.
+    fn real_soroswap<'a>(x: &X, pair: Option<&Address>) -> soroswap_router::Client<'a> {
+        let env = &x.s.env;
+        env.mock_all_auths();
+        let pair_hash = env.deployer().upload_contract_wasm(SOROSWAP_PAIR_WASM);
+        let factory = soroswap_factory::Client::new(env, &env.register(soroswap_factory::WASM, ()));
+        factory.initialize(&Address::generate(env), &pair_hash);
+        let router = soroswap_router::Client::new(env, &env.register(soroswap_router::WASM, ()));
+        router.initialize(&factory.address);
+        if let Some(other) = pair {
+            let lp = Address::generate(env);
+            x.s.usdc_admin.mint(&lp, &(10_800_000 * ONE));
+            token::StellarAssetClient::new(env, other).mint(&lp, &(10_000_000 * ONE));
+            router.add_liquidity(&x.s.usdc_addr, other, &(10_800_000 * ONE), &(10_000_000 * ONE), &0, &0, &lp,
+                &(env.ledger().timestamp() + 10_000));
+        }
+        x.s.vault.propose_router(&VR::Soroswap, &router.address);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600);
+        x.s.vault.activate_router(&VR::Soroswap);
+        router
+    }
+
+    /// A funded Blend sleeve cannot be dropped from the layout, even after the
+    /// policy stops declaring it: its bTokens are read from the pool itself.
+    #[test]
+    fn a_funded_blend_sleeve_cannot_be_removed() {
+        let x = setup();
+        supply_3000(&x);
+        let env = &x.s.env;
+        env.mock_all_auths();
+        let usdc_only = Vec::from_array(env, [SleeveTarget { asset_id: Symbol::new(env, "USDC"), target_weight_bps: 10_000,
+            min_band_bps: 0, max_band_bps: 10_000, sleeve_type: Symbol::new(env, "cash") }]);
+        x.s.policy.update_policy(&x.s.vault_id, &soroban_sdk::BytesN::from_array(env, &[0xb2; 32]),
+            &1000, &10_000, &10_000, &50, &500, &usdc_only);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 48 * 3600 + 1);
+        x.s.policy.activate_policy_update(&x.s.vault_id);
+        let _ = &x.owner;
+        let mut cash_only = Vec::new(env);
+        let mut usdc = x.s.vault.get_sleeves().get(0).unwrap();
+        usdc.target_weight_bps = 10_000;
+        cash_only.push_back(usdc);
+        assert_eq!(x.s.vault.try_set_sleeves(&cash_only).unwrap_err().unwrap(), contract_error(SLEEVE_HAS_HOLDINGS));
+        let _ = &x.alice;
+    }
+}

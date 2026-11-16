@@ -373,6 +373,7 @@ dependencies = [
  "constella-nav-oracle",
  "constella-policy",
  "constella-registry",
+ "constella-testkit",
  "soroban-sdk",
  "stellar-tokens",
 ]

@@ -4,7 +4,8 @@
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
-    symbol_short, token, vec, Address, BytesN, Env, FromVal, IntoVal, MuxedAddress, String, Symbol, SymbolStr, Vec,
+    symbol_short, token, vec, Address, BytesN, Env, FromVal, IntoVal, Map, MuxedAddress, String, Symbol, SymbolStr,
+    Vec,
 };
 // Audit W2/W4.2: the share ledger (balances, allowances, total supply) uses the
 // OpenZeppelin stellar-tokens storage primitives: per-holder persistent
@@ -406,6 +407,8 @@ pub enum TradeRoute {
     Soroswap = 1,
     Aquarius = 2,
     Sdex = 3,
+    /// Blend v2 supply / withdraw (decision D-H), lockstep with the policy.
+    Blend = 4,
 }
 
 #[contracttype]
@@ -465,6 +468,88 @@ pub trait NavOracleInterface {
     fn collateral_price(env: Env, asset: Address) -> Option<PriceData>;
     fn get_source(env: Env, source_id: Symbol) -> Option<OracleSource>;
     fn get_sleeve_sources(env: Env, sleeve_id: Symbol) -> Vec<Symbol>;
+    /// Decision D-H: the Blend position priced under `pool`, if any. The
+    /// oracle only registers pools of the official Blend factory.
+    fn blend_position(env: Env, pool: Address) -> Option<BlendPositionRef>;
+}
+
+/// Mirror of `constella_nav_oracle::BlendPosition`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendPositionRef {
+    pub pool: Address,
+    pub underlying: Address,
+}
+
+/// Mirrors of Blend v2 types (blend-contracts-v2 `pool/src/storage.rs`,
+/// `pool/src/pool/{reserve,user,actions}.rs`); decoded by field name.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserveConfigRef {
+    pub index: u32,
+    pub decimals: u32,
+    pub c_factor: u32,
+    pub l_factor: u32,
+    pub util: u32,
+    pub max_util: u32,
+    pub r_base: u32,
+    pub r_one: u32,
+    pub r_two: u32,
+    pub r_three: u32,
+    pub reactivity: u32,
+    pub supply_cap: i128,
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserveDataRef {
+    pub d_rate: i128,
+    pub b_rate: i128,
+    pub ir_mod: i128,
+    pub b_supply: i128,
+    pub d_supply: i128,
+    pub backstop_credit: i128,
+    pub last_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserveRef {
+    pub asset: Address,
+    pub config: BlendReserveConfigRef,
+    pub data: BlendReserveDataRef,
+    pub scalar: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendPositionsRef {
+    pub liabilities: Map<u32, i128>,
+    pub collateral: Map<u32, i128>,
+    pub supply: Map<u32, i128>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendRequestRef {
+    pub request_type: u32,
+    pub address: Address,
+    pub amount: i128,
+}
+
+/// Blend v2 request types used by the vault: plain (non-collateral) supply
+/// and withdraw only - the vault never borrows, so it has no health factor
+/// and cannot be liquidated.
+const BLEND_SUPPLY: u32 = 0;
+const BLEND_WITHDRAW: u32 = 1;
+const BLEND_RATE_SCALE: i128 = 1_000_000_000_000;
+
+#[contractclient(name = "BlendPoolClient")]
+pub trait BlendPoolInterface {
+    fn get_reserve(env: Env, asset: Address) -> BlendReserveRef;
+    fn get_positions(env: Env, address: Address) -> BlendPositionsRef;
+    fn submit(env: Env, from: Address, spender: Address, to: Address, requests: Vec<BlendRequestRef>) -> BlendPositionsRef;
 }
 
 #[contracttype]
@@ -924,6 +1009,82 @@ fn real_balance(env: &Env, asset: &Address) -> i128 {
     token::Client::new(env, asset).balance(&env.current_contract_address())
 }
 
+/// The Blend position behind a sleeve, if it is one: only `Lending` sleeves
+/// are looked up, and the oracle decides (single source of truth, D-H).
+fn blend_of(env: &Env, sleeve: &SleeveState) -> Option<BlendPositionRef> {
+    if sleeve.sleeve_type != SleeveType::Lending {
+        return None;
+    }
+    NavOracleClient::new(env, &get_config(env).oracle_contract).blend_position(&sleeve.contract_address)
+}
+
+/// The vault's plain-supply bTokens in a Blend reserve (never collateral).
+fn blend_b_tokens(env: &Env, pool: &BlendPoolClient, index: u32) -> i128 {
+    pool.get_positions(&env.current_contract_address()).supply.get(index).unwrap_or(0)
+}
+
+/// What the vault really holds of a sleeve: bTokens for a Blend position,
+/// otherwise its token balance.
+fn real_holding(env: &Env, sleeve: &SleeveState) -> i128 {
+    match blend_of(env, sleeve) {
+        Some(pos) => {
+            let pool = BlendPoolClient::new(env, &pos.pool);
+            let index = pool.get_reserve(&pos.underlying).config.index;
+            blend_b_tokens(env, &pool, index)
+        }
+        None => real_balance(env, &sleeve.contract_address),
+    }
+}
+
+/// Decision D-H: one Blend leg. Supply when `asset_out` is a Blend position
+/// whose underlying is `asset_in`; withdraw for the reverse. Returns
+/// (spent, received) MEASURED on the vault's own balances - token balance and
+/// bToken position - never taken from the pool's return value.
+fn blend_leg(env: &Env, config: &VaultConfig, op: &TradeOperation) -> (i128, i128) {
+    let oracle = NavOracleClient::new(env, &config.oracle_contract);
+    let (pos, supplying) = match (oracle.blend_position(&op.asset_out), oracle.blend_position(&op.asset_in)) {
+        (Some(p), None) if p.underlying == op.asset_in => (p, true),
+        (None, Some(p)) if p.underlying == op.asset_out => (p, false),
+        _ => panic_with_error!(env, VaultError::RouteUnavailable),
+    };
+    let me = env.current_contract_address();
+    let pool = BlendPoolClient::new(env, &pos.pool);
+    let reserve = pool.get_reserve(&pos.underlying);
+    let index = reserve.config.index;
+    let underlying = token::Client::new(env, &pos.underlying);
+    let (b_before, u_before) = (blend_b_tokens(env, &pool, index), underlying.balance(&me));
+    let request = if supplying {
+        // The pool pulls `amount_in` from the vault: authorize exactly that.
+        env.authorize_as_current_contract(vec![
+            env,
+            InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: pos.underlying.clone(),
+                    fn_name: symbol_short!("transfer"),
+                    args: (me.clone(), pos.pool.clone(), op.amount_in).into_val(env),
+                },
+                sub_invocations: vec![env],
+            }),
+        ]);
+        BlendRequestRef { request_type: BLEND_SUPPLY, address: pos.underlying.clone(), amount: op.amount_in }
+    } else {
+        // Blend withdraws in underlying units and burns ceil(amount / b_rate)
+        // bTokens; rounding the conversion down keeps the burn <= amount_in.
+        let amount = match op.amount_in.checked_mul(reserve.data.b_rate) {
+            Some(v) => v / BLEND_RATE_SCALE,
+            None => panic_with_error!(env, VaultError::MathOverflow),
+        };
+        BlendRequestRef { request_type: BLEND_WITHDRAW, address: pos.underlying.clone(), amount }
+    };
+    pool.submit(&me, &me, &me, &vec![env, request]);
+    let (b_after, u_after) = (blend_b_tokens(env, &pool, index), underlying.balance(&me));
+    if supplying {
+        (u_before - u_after, b_after - b_before)
+    } else {
+        (b_before - b_after, u_after - u_before)
+    }
+}
+
 /// Holdings used for every valuation: min(recorded, actually held).
 ///
 /// Audit V2: recorded balances change only through value-moving flows
@@ -932,7 +1093,7 @@ fn real_balance(env: &Env, asset: &Address) -> i128 {
 /// freeze-and-burn lowers NAV immediately, while unsolicited transfers into the
 /// vault never raise it (no donation-based share-price manipulation).
 fn sleeve_holdings(env: &Env, sleeve: &SleeveState) -> i128 {
-    let held = real_balance(env, &sleeve.contract_address);
+    let held = real_holding(env, sleeve);
     if held < sleeve.current_balance {
         held
     } else {
@@ -1922,7 +2083,7 @@ impl StrategyVault {
                     break;
                 }
             }
-            if !kept && (e.current_balance != 0 || real_balance(&env, &e.contract_address) != 0) {
+            if !kept && (e.current_balance != 0 || real_holding(&env, &e) != 0) {
                 panic_with_error!(&env, VaultError::SleeveHasHoldings);
             }
         }
@@ -2106,11 +2267,6 @@ impl StrategyVault {
 
         let mut sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(&env));
         for op in proposal.operations.iter() {
-            let router: Address = match op.route {
-                TradeRoute::Soroswap => env.storage().instance().get(&DataKey::Router(TradeRoute::Soroswap as u32))
-                    .unwrap_or_else(|| panic_with_error!(&env, VaultError::RouteUnavailable)),
-                _ => panic_with_error!(&env, VaultError::RouteUnavailable),
-            };
             let has = |a: &Address| sleeves.iter().any(|s| s.contract_address == *a);
             if !has(&op.asset_in) || !has(&op.asset_out) {
                 panic_with_error!(&env, VaultError::SleeveNotFound);
@@ -2121,7 +2277,19 @@ impl StrategyVault {
             if op.amount_in > sleeve_holdings(&env, &s_in) {
                 panic_with_error!(&env, VaultError::InsufficientBalance);
             }
-            let (spent, received) = swap_on_soroswap(&env, &router, &op, proposal.deadline);
+            let (spent, received) = match op.route {
+                TradeRoute::Soroswap => {
+                    // A Blend position is not a token: never route it through an AMM.
+                    if blend_of(&env, &s_in).is_some() || blend_of(&env, &sleeves.get_unchecked(i_out)).is_some() {
+                        panic_with_error!(&env, VaultError::RouteUnavailable);
+                    }
+                    let router: Address = env.storage().instance().get(&DataKey::Router(TradeRoute::Soroswap as u32))
+                        .unwrap_or_else(|| panic_with_error!(&env, VaultError::RouteUnavailable));
+                    swap_on_soroswap(&env, &router, &op, proposal.deadline)
+                }
+                TradeRoute::Blend => blend_leg(&env, &config, &op),
+                _ => panic_with_error!(&env, VaultError::RouteUnavailable),
+            };
             if spent > op.amount_in || received < op.min_amount_out {
                 panic_with_error!(&env, VaultError::SlippageExceeded);
             }
