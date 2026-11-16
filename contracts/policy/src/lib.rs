@@ -47,9 +47,28 @@ pub struct OraclePriceRef {
     pub source: Symbol,
 }
 
+/// Mirror of `constella_nav_oracle::BlendPosition` (decision D-H).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendPositionRef {
+    pub pool: Address,
+    pub underlying: Address,
+}
+
 #[contractclient(name = "OraclePriceClient")]
 pub trait OraclePriceInterface {
     fn asset_price(env: Env, asset: Address) -> Option<OraclePriceRef>;
+    fn blend_position(env: Env, pool: Address) -> Option<BlendPositionRef>;
+}
+
+/// Decimals of an asset leg. A Blend position is not a token: its bTokens
+/// use the underlying's decimals (blend-contracts-v2 storage.rs: b_supply is
+/// "in the underlying token's decimals"), and the oracle names the underlying.
+fn leg_decimals(env: &Env, oracle: &OraclePriceClient, asset: &Address) -> u32 {
+    match oracle.blend_position(asset) {
+        Some(pos) => token::Client::new(env, &pos.underlying).decimals(),
+        None => token::Client::new(env, asset).decimals(),
+    }
 }
 
 #[contractclient(name = "AssetRegistryClient")]
@@ -213,6 +232,9 @@ pub enum TradeRoute {
     Soroswap = 1,
     Aquarius = 2,
     Sdex = 3,
+    /// Blend v2 supply (asset_in = underlying, asset_out = pool position) or
+    /// withdraw (the reverse); amounts in underlying units / bTokens.
+    Blend = 4,
 }
 
 #[contracttype]
@@ -1154,8 +1176,8 @@ impl PolicyContractTrait for PolicyContract {
                     return res;
                 }
             };
-            let dec_in = token::Client::new(&env, &op.asset_in).decimals();
-            let dec_out = token::Client::new(&env, &op.asset_out).decimals();
+            let dec_in = leg_decimals(&env, &oracle, &op.asset_in);
+            let dec_out = leg_decimals(&env, &oracle, &op.asset_out);
             let checked = (|| -> Option<bool> {
                 let value_in = op.amount_in.checked_mul(p_in)? / 10i128.checked_pow(dec_in)?;
                 let min_value_out = op.min_amount_out.checked_mul(p_out)? / 10i128.checked_pow(dec_out)?;

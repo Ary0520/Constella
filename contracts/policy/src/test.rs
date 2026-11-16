@@ -2321,3 +2321,112 @@ fn w1b_malformed_or_unknown_inputs_fail_closed() {
     let h = basket(&ctx.env, 2000 * K, 1000 * K, 2500 * K, 2500 * K, 2000 * K);
     assert_eq!(holdings_code(&ctx, &stranger, &h), (false, PolicyError::PolicyNotFound as u32));
 }
+
+// ---------------------------------------------------------------------------
+// Decision D-H: Blend legs (route Blend) on the REAL Blend v2 pool. The
+// position is priced by the oracle from the pool's live b_rate; its bTokens
+// use the underlying's decimals.
+// ---------------------------------------------------------------------------
+mod blend_route {
+    use super::*;
+    use constella_testkit::blend::{self, pool::Request, BORROW, RATE_SCALE, SCALAR_7, SUPPLY, SUPPLY_COLLATERAL};
+    use soroban_sdk::token::StellarAssetClient;
+
+    struct B {
+        ctx: TestContext,
+        pool: Address,
+        policy: PolicyContractClient<'static>,
+    }
+
+    fn setup() -> B {
+        let ctx = setup_test_context();
+        ctx.env.cost_estimate().budget().reset_unlimited();
+        let usdc_admin = StellarAssetClient::new(&ctx.env, &ctx.usdc_addr);
+        let b = blend::deploy(&ctx.env, &usdc_admin, &ctx.oracle_address);
+        let pool = b.pool.address.clone();
+        let registry = AssetRegistryClient::new(&ctx.env, &ctx.registry_address);
+        register_registry_asset(&ctx.env, &registry, &pool, "BLEND_USDC_SUPPLY", "BLEND", SleeveType::Lending);
+        NavOracleClient::new(&ctx.env, &ctx.oracle_address).register_blend_position(&pool, &ctx.usdc_addr);
+        let policy = PolicyContractClient::new(&ctx.env, &ctx.policy_address);
+        let sleeves = vec![
+            &ctx.env,
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "CIRCLE_USDC"), target_weight_bps: 5000, min_band_bps: 0,
+                max_band_bps: 10_000, sleeve_type: Symbol::new(&ctx.env, "cash") },
+            SleeveTarget { asset_id: Symbol::new(&ctx.env, "BLEND_USDC_SUPPLY"), target_weight_bps: 5000, min_band_bps: 0,
+                max_band_bps: 10_000, sleeve_type: Symbol::new(&ctx.env, "lending") },
+        ];
+        policy.register_policy(&ctx.vault, &ctx.owner, &sample_hash(&ctx.env, 0xb1), &ctx.registry_address,
+            &1000, &10_000, &10_000, &50, &500, &sleeves);
+        // Real borrowing so the reserve earns interest (b_rate > 1).
+        let lender = Address::generate(&ctx.env);
+        usdc_admin.mint(&lender, &(100_000 * SCALAR_7));
+        b.pool.submit(&lender, &lender, &lender, &vec![&ctx.env, Request { request_type: SUPPLY, address: ctx.usdc_addr.clone(), amount: 100_000 * SCALAR_7 }]);
+        let borrower = Address::generate(&ctx.env);
+        usdc_admin.mint(&borrower, &(80_000 * SCALAR_7));
+        b.pool.submit(&borrower, &borrower, &borrower, &vec![&ctx.env,
+            Request { request_type: SUPPLY_COLLATERAL, address: ctx.usdc_addr.clone(), amount: 80_000 * SCALAR_7 },
+            Request { request_type: BORROW, address: ctx.usdc_addr.clone(), amount: 40_000 * SCALAR_7 }]);
+        // Health: 80k x 0.75 = 60k >= 40k / 0.75 = 53.3k. At this utilization
+        // suppliers earn ~0.5 %/year (measured: b_rate 1.00496 after 1 year);
+        // 4 years separate b_rate valuation clearly from the 0.5 % slippage cap.
+        ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + 4 * 365 * 24 * 3600);
+        assert!(b.pool.get_reserve(&ctx.usdc_addr).data.b_rate > RATE_SCALE * 101 / 100, "over 1 % earned");
+        B { ctx, pool, policy }
+    }
+
+    fn leg(b: &B, asset_in: &Address, asset_out: &Address, amount_in: i128, min_out: i128) -> RebalanceProposal {
+        let env = &b.ctx.env;
+        RebalanceProposal {
+            vault: b.ctx.vault.clone(),
+            policy_hash: current_policy_hash(env, &b.ctx.policy_address, &b.ctx.vault),
+            operations: vec![env, TradeOperation { asset_in: asset_in.clone(), asset_out: asset_out.clone(), amount_in,
+                min_amount_out: min_out, route: TradeRoute::Blend }],
+            weights_after: vec![env, (Symbol::new(env, "CIRCLE_USDC"), 5000u32), (Symbol::new(env, "BLEND_USDC_SUPPLY"), 5000u32)],
+            deadline: env.ledger().timestamp() + 600,
+            proposer: b.ctx.proposer.clone(),
+        }
+    }
+
+    fn b_rate(b: &B) -> i128 {
+        NavOracleClient::new(&b.ctx.env, &b.ctx.oracle_address).asset_price(&b.pool).unwrap().price * RATE_SCALE / SCALAR_7
+    }
+
+    #[test]
+    fn a_supply_leg_is_valued_at_the_live_b_rate() {
+        let b = setup();
+        let usdc = b.ctx.usdc_addr.clone();
+        // 1,000 USDC buys 1,000 / b_rate bTokens; 0.5 % slippage allowed.
+        let fair = 1_000 * SCALAR_7 * RATE_SCALE / b_rate(&b);
+        assert!(fair < 990 * SCALAR_7, "bTokens are worth more than 1 USDC: not valued 1:1");
+        let ok = leg(&b, &usdc, &b.pool, 1_000 * SCALAR_7, fair * 9_951 / 10_000);
+        let r = b.policy.validate_rebalance(&b.ctx.vault, &ok);
+        assert!(r.is_valid, "{:?}", r.message);
+        let greedy = leg(&b, &usdc, &b.pool, 1_000 * SCALAR_7, fair * 9_949 / 10_000);
+        assert_eq!(b.policy.validate_rebalance(&b.ctx.vault, &greedy).code, PolicyError::SlippageLimitExceeded as u32);
+    }
+
+    #[test]
+    fn a_withdraw_leg_is_valued_at_the_live_b_rate() {
+        let b = setup();
+        let usdc = b.ctx.usdc_addr.clone();
+        let worth = 1_000 * SCALAR_7 * b_rate(&b) / RATE_SCALE;
+        let ok = leg(&b, &b.pool, &usdc, 1_000 * SCALAR_7, worth * 9_951 / 10_000);
+        assert!(b.policy.validate_rebalance(&b.ctx.vault, &ok).is_valid);
+        let greedy = leg(&b, &b.pool, &usdc, 1_000 * SCALAR_7, worth * 9_949 / 10_000);
+        assert_eq!(b.policy.validate_rebalance(&b.ctx.vault, &greedy).code, PolicyError::SlippageLimitExceeded as u32);
+    }
+
+    #[test]
+    fn a_blend_position_the_policy_does_not_declare_cannot_be_bought() {
+        let b = setup();
+        let env = &b.ctx.env;
+        // A second real pool, registered and priced, but not in the signed policy.
+        let usdc_admin = StellarAssetClient::new(env, &b.ctx.usdc_addr);
+        let other = blend::deploy(env, &usdc_admin, &b.ctx.oracle_address).pool.address.clone();
+        let registry = AssetRegistryClient::new(env, &b.ctx.registry_address);
+        register_registry_asset(env, &registry, &other, "BLEND_OTHER", "BLEND", SleeveType::Lending);
+        NavOracleClient::new(env, &b.ctx.oracle_address).register_blend_position(&other, &b.ctx.usdc_addr);
+        let p = leg(&b, &b.ctx.usdc_addr, &other, 1_000 * SCALAR_7, 990 * SCALAR_7);
+        assert_eq!(b.policy.validate_rebalance(&b.ctx.vault, &p).code, PolicyError::AssetNotInPolicy as u32);
+    }
+}
