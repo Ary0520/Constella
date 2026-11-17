@@ -2470,6 +2470,16 @@ impl StrategyVault {
     /// move vault funds, so it takes effect only after 48 h (anyone activates).
     pub fn propose_router(env: Env, route: TradeRoute, router: Address) {
         get_config(&env).admin.require_auth();
+        // Decision D-K: the delay protects depositors from a router swap. A
+        // vault's FIRST router, set while no shares exist, has nobody to
+        // protect yet (fresh testnet / factory vault): set atomically here,
+        // so no depositor can arrive between proposal and activation. Any
+        // later change, or any change once shares exist, waits 48 h.
+        if !env.storage().instance().has(&DataKey::Router(route as u32)) && share_supply(&env) == 0 {
+            env.storage().instance().set(&DataKey::Router(route as u32), &router);
+            RouterProposed { route: route as u32, router, effective_at: env.ledger().timestamp() }.publish(&env);
+            return;
+        }
         let effective_at = env.ledger().timestamp().saturating_add(ROUTER_CHANGE_DELAY_SECONDS);
         env.storage().instance().set(&DataKey::PendingRouter(route as u32), &PendingRouter { router: router.clone(), effective_at });
         RouterProposed { route: route as u32, router, effective_at }.publish(&env);

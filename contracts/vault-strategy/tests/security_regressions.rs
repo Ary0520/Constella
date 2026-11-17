@@ -1421,10 +1421,10 @@ mod w1 {
         router.add_liquidity(&s.usdc_addr, &eurc, &(10_800_000 * ONE), &(10_000_000 * ONE), &0, &0, &lp, &(T0 + 10_000));
 
         // Router through the 48h delay (a router can move vault funds).
+        // Fresh vault, no shares yet: the first router is immediate (D-K).
         s.vault.propose_router(&VaultRoute::Soroswap, &router.address);
         let now = T0 + DELAY;
         env.ledger().set_timestamp(now);
-        s.vault.activate_router(&VaultRoute::Soroswap);
         // Feeds refreshed after the wait (their feeders push).
         for (id, px) in [("USDC_A", ONE), ("USDC_B", ONE), ("EURC_A", ONE * 108 / 100), ("EURC_B", ONE * 108 / 100)] {
             s.oracle.update_price(&Symbol::new(env, id), &px, &200_000, &now);
@@ -2721,8 +2721,9 @@ mod dk {
         s.env.mock_all_auths();
         let router = Address::generate(&s.env);
         s.vault.propose_router(&VaultRoute::Soroswap, &router);
-        s.vault.activate_router(&VaultRoute::Soroswap);
+        // Set in the same call: no pending window for a depositor to fall into.
         assert_eq!(s.vault.get_router(&VaultRoute::Soroswap), Some(router.clone()));
+        assert!(s.vault.try_activate_router(&VaultRoute::Soroswap).is_err(), "nothing pending");
         // A second change (still no shares) waits: a router was already set.
         let other = Address::generate(&s.env);
         s.vault.propose_router(&VaultRoute::Soroswap, &other);
