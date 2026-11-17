@@ -84,12 +84,14 @@ def test_blend_legs_use_the_blend_route_and_no_amm_quote():
 
 
 def test_buys_never_spend_more_cash_than_the_vault_will_have():
-    # 30 % floor target but only 10 % cash: buys are scaled to the cash.
-    s = [usdc(1_000 * ONE, target=1000), eurc(0, target=4500), Sleeve("X", "CX", 4500, 200, 9_000 * ONE, ONE, False)]
+    # Cash target 0: the EURC buy (5000) would need the sale's full value,
+    # but only its minimum (after slippage) is certain - buys are scaled.
+    s = [usdc(1_000 * ONE, target=0), eurc(0, target=5000), Sleeve("X", "CX", 5000, 200, 9_000 * ONE, ONE, False)]
     p = plan(s, ONE, 200, 50, lambda a, b, amt: amt)
     sells = sum(o.min_amount_out for o in p.operations if o.asset_out == USDC)
     spent = sum(o.amount_in for o in p.operations if o.asset_in == USDC)
-    assert spent <= 1_000 * ONE + sells
+    assert sells < 4_000 * ONE  # the sale's certain proceeds are below its value
+    assert spent <= 1_000 * ONE + sells and spent > 4_900 * ONE
 
 
 @pytest.mark.parametrize("vals", [[1, 1, 1], [3, 3, 4], [0, 0, 7], [999_999, 1, 0]])
@@ -105,3 +107,12 @@ def test_min_out_is_exact_across_decimals():
         need = amt * a.price // 10 ** 7 * (10000 - 37)
         assert (m * b.price // 10 ** 6) * 10000 >= need
         assert m == 0 or ((m - 1) * b.price // 10 ** 6) * 10000 < need
+
+
+def test_an_unpriced_sleeve_blocks_the_plan_even_if_it_would_not_trade():
+    # EURC sits at target but has no price: total value is unknown, so no
+    # weights - and no trades for the other sleeves - can be trusted.
+    s = [usdc(7_000 * ONE, target=8000), eurc(1_000 * ONE, target=1000, price=None),
+         Sleeve("X", "CX", 1000, 200, 2_000 * ONE, ONE, False)]
+    with pytest.raises(PlanError, match="EURC has no valid oracle price"):
+        plan(s, ONE, 200, 50, lambda a, b, amt: amt)

@@ -108,9 +108,12 @@ def min_out_for(s_in: Sleeve, s_out: Sleeve, amount_in: int, max_slippage_bps: i
     keep = 10000 - max_slippage_bps
     need = amount_in * s_in.price // 10 ** s_in.decimals * keep  # = required min_value_out * 10000
     min_value_out = -(-need // 10000)
+    # m = ceil(min_value_out * 10^d / p) gives m * p / 10^d >= min_value_out
+    # exactly, so its floor is >= the integer min_value_out, which is
+    # ceil(need / 10000); and m - 1 falls short. Exact, no search needed.
     m = -(-min_value_out * 10 ** s_out.decimals // s_out.price)
-    while (m * s_out.price // 10 ** s_out.decimals) * 10000 < need:
-        m += 1
+    if (m * s_out.price // 10 ** s_out.decimals) * 10000 < need:  # unreachable (proof above)
+        raise PlanError("internal rounding error")
     return m
 
 
