@@ -2067,6 +2067,56 @@ mod blend_sleeve {
         assert_eq!(x.s.vault.total_assets(), 10_000 * ONE);
     }
 
+    /// Audit A3: Blend v2's supply rate, computed from the pool's live data
+    /// with Blend's own interest model (pool/src/pool/interest.rs: three-part
+    /// curve, kink at 95 %, ir_mod; supply = borrow x util x (1 - bstop_rate)),
+    /// must match what the REAL pool then accrues. ceil/floor as in Blend.
+    fn mul_ceil(a: i128, b: i128, s: i128) -> i128 { (a * b + s - 1) / s }
+    fn div_ceil(a: i128, b: i128, s: i128) -> i128 { (a * s + b - 1) / b }
+    const S7: i128 = 10_000_000;
+
+    /// (borrow APR, supply APR), 7 decimals; the same function as
+    /// services/ai-engine/src/yields.py (cross-checked by test vectors).
+    fn blend_rates(c: &blend::pool::ReserveConfig, d: &blend::pool::ReserveData, bstop_rate: u32) -> (i128, i128) {
+        let liabilities = mul_ceil(d.d_supply, d.d_rate, RATE_SCALE);
+        let supply = d.b_supply * d.b_rate / RATE_SCALE;
+        let util = if liabilities == 0 { 0 } else if liabilities >= supply { S7 } else { div_ceil(liabilities, supply, S7) };
+        let target = c.util as i128;
+        let (r0, r1, r2, r3) = (c.r_base as i128, c.r_one as i128, c.r_two as i128, c.r_three as i128);
+        let borrow = if util <= target {
+            mul_ceil(mul_ceil(div_ceil(util, target, S7), r1, S7) + r0, d.ir_mod, S7)
+        } else if util <= 9_500_000 {
+            mul_ceil(mul_ceil(div_ceil(util - target, 9_500_000 - target, S7), r2, S7) + r1 + r0, d.ir_mod, S7)
+        } else {
+            mul_ceil(div_ceil(util - 9_500_000, 500_000, S7), r3, S7) + mul_ceil(d.ir_mod, r2 + r1 + r0, S7)
+        };
+        let supply_apr = borrow * util / S7 * (S7 - bstop_rate as i128) / S7;
+        (borrow, supply_apr)
+    }
+
+    #[test]
+    fn the_blend_supply_rate_formula_matches_what_the_real_pool_accrues() {
+        let x = setup();
+        supply_3000(&x);
+        borrow(&x, 20_000 * ONE, 10_000 * ONE);
+        let env = &x.s.env;
+        let r0 = x.b.pool.get_reserve(&x.s.usdc_addr);
+        let bstop = x.b.pool.get_config().bstop_rate;
+        let (borrow_apr, supply_apr) = blend_rates(&r0.config, &r0.data, bstop);
+        assert!(supply_apr > 0 && supply_apr < borrow_apr);
+        std::println!("VECTOR util_target={} r=({},{},{},{}) ir_mod={} b_rate={} d_rate={} b_supply={} d_supply={} bstop={} -> borrow={} supply={}",
+            r0.config.util, r0.config.r_base, r0.config.r_one, r0.config.r_two, r0.config.r_three, r0.data.ir_mod, r0.data.b_rate,
+            r0.data.d_rate, r0.data.b_supply, r0.data.d_supply, bstop, borrow_apr, supply_apr);
+        let day = 86_400u64;
+        env.ledger().set_timestamp(env.ledger().timestamp() + day);
+        let r1 = x.b.pool.get_reserve(&x.s.usdc_addr);
+        // Measured: the b_rate growth over one day, annualised (Blend accrues
+        // simple interest per load, over a 365-day year).
+        let measured = (r1.data.b_rate - r0.data.b_rate) * S7 * 31_536_000 / (r0.data.b_rate * day as i128);
+        let err = (measured - supply_apr).abs() * 10_000 / supply_apr; // in bps of the rate
+        assert!(err <= 1, "formula {supply_apr} vs real pool {measured} ({err} bps off)");
+    }
+
     #[test]
     fn interest_earned_in_blend_raises_the_share_price() {
         let x = setup();
