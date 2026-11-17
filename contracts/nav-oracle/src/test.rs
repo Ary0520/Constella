@@ -2328,3 +2328,17 @@ mod blend_position {
         assert!(s.oracle.blend_position(&s.b.pool.address).is_none());
     }
 }
+
+/// A1 (storage rent): price reads and pushes renew the oracle's instance for
+/// 30 days (its history entries were already renewed).
+#[test]
+fn a1_regular_use_keeps_the_oracle_live() {
+    use soroban_sdk::testutils::storage::Instance as _;
+    let env = Env::default();
+    let (client, _, base) = setup_oracle(&env);
+    for _ in 0..12 {
+        env.ledger().with_mut(|l| { l.sequence_number += 30 * 17_280; l.timestamp += 30 * 86_400; });
+        let _ = client.asset_price(&base);
+    }
+    env.as_contract(&client.address, || assert!(env.storage().instance().get_ttl() >= 29 * 17_280));
+}

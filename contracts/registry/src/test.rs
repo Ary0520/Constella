@@ -504,3 +504,19 @@ fn golden_events_registry() {
     g.capture(&env, "deactivate_asset");
     g.finish(&["ASSET_ADDED", "ASSET_DEACTIVATED"]);
 }
+
+/// A1 (storage rent): every call in a transaction renews the registry's
+/// instance for 30 days, so assets in regular use never archive.
+#[test]
+fn a1_regular_use_keeps_the_registry_live() {
+    use soroban_sdk::testutils::{storage::Instance as _, Ledger};
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let id = env.register(AssetRegistry, (admin,));
+    let client = AssetRegistryClient::new(&env, &id);
+    for _ in 0..12 {
+        env.ledger().with_mut(|l| { l.sequence_number += 30 * 17_280; l.timestamp += 30 * 86_400; });
+        let _ = client.list_assets();
+    }
+    env.as_contract(&id, || assert!(env.storage().instance().get_ttl() >= 29 * 17_280));
+}

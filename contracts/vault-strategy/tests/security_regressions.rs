@@ -2325,6 +2325,23 @@ mod v6 {
         (r, held)
     }
 
+    /// A1 (storage rent): a claim is money owed - its entries are renewed for
+    /// 30 days whenever they are written or settled-against.
+    #[test]
+    fn a1_claim_entries_are_renewed_when_written() {
+        use soroban_sdk::testutils::storage::Persistent as _;
+        let (r, _) = frozen(3_000 * ONE);
+        let alice = r.depositor.clone();
+        r.s.vault.redeem_frozen(&(1_000 * ONE), &alice, &alice, &alice);
+        let env = &r.s.env;
+        env.as_contract(&r.s.vault.address, || {
+            let claim = (Symbol::new(env, "Claim"), alice.clone(), r.eurc.clone());
+            let total = (Symbol::new(env, "ClaimTotal"), r.eurc.clone());
+            assert!(env.storage().persistent().get_ttl(&claim) >= 29 * 17_280);
+            assert!(env.storage().persistent().get_ttl(&total) >= 29 * 17_280);
+        });
+    }
+
     fn resume(r: &R, a: i128, b: i128) {
         let env = &r.s.env;
         let t = env.ledger().timestamp();
