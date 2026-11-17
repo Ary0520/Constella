@@ -62,7 +62,7 @@ If ANY check fails: **rebalance rejected in its entirety**.
 ## Implementation status (audit W1a `c732a97`, W1b `b1faf5d`)
 - `vault.rebalance(proposal)`: only the designated **keeper** (set by the admin) submits; a paused vault refuses; the signed policy's `validate_rebalance` must accept the proposal.
 - **Soroswap legs:** the vault authorizes exactly one `token.transfer(vault → pair, amount_in)` for the router. Spent and received are **measured on the vault's own balances**, so a lying or compromised router cannot over-spend or under-deliver: the vault itself enforces `spent ≤ amount_in` and `received ≥ min_amount_out`. Holdings are booked from those measured deltas only. Events: `REBALANCE_STEP`, `REBALANCE_COMPLETE`.
-- **Routers:** set with `propose_router` and active only after **48 h** (`activate_router`), because a router can move vault funds.
+- **Routers:** set with `propose_router` and active only after **48 h** (`activate_router`), because a router can move vault funds. **Decision D-K:** a vault's *first* router per route, proposed while the vault has **no shares outstanding**, is set atomically inside `propose_router` (nobody to protect yet: fresh testnet / factory vault). Any later change, or any change once shares exist, waits 48 h.
 - **Post-trade check (W1b):** the proposal's `weights_after` is only a claim. After the swaps, the vault values every sleeve as **actually held** (measured balance, capped by the booked balance, at its own asset's median price; cash at face value) and the policy's `validate_holdings` must accept the result: every signed band, single-asset cap, issuer caps and the cash liquidity floor, compared exactly. Otherwise the whole rebalance reverts with `AllocationOutOfPolicy`, swaps included. A sleeve without a valid price stops it with `OracleUnavailable`.
 - **Targets (W1b):** once a policy is bound, `set_sleeves` accepts only sleeves declared in it with exactly the signed target weight (`SleeveTargetMismatch`). Targets are read **live** from the policy (`get_sleeves`, empty-vault risk sheet), so an activated amendment applies without re-running `set_sleeves`. If an amendment drops a sleeve the vault still holds, the next rebalance must sell it to zero (the post-trade check rejects undeclared holdings).
 - **Blend adapter (decision D-H, `000f40a`):** route `Blend`. A `Lending` sleeve whose address the oracle knows as a Blend position (official-factory pools only) is held as **plain-supply bTokens** (never collateral: the vault never borrows, so it cannot be liquidated). Supply authorizes exactly one `transfer(vault → pool, amount_in)`; withdraw converts bTokens to underlying at the live `b_rate`, rounded down so Blend burns ≤ `amount_in`. Spent and received are measured on the vault's token balance and its bToken position; the other leg must be the position's own underlying; Soroswap never routes a Blend position. Liquidity risk is real: Blend refuses a withdraw that would take utilization to 100 % (`InvalidUtilRate` 1207) and the whole rebalance reverts — cash for redemptions must come from the cash sleeve, as the liquidity floor requires.
@@ -147,8 +147,12 @@ A keeper is an off-chain bot that:
 4. Monitors oracle validity and circuit breakers
 5. Extends Soroban state TTLs (rent management)
 
-**Keeper implementation:**
-- TypeScript process (runs continuously)
+**Keeper implementation (implemented, `services/keeper`, `3d02e42`):**
+- Python process (stellar-sdk 17), one keeper key per deployment; see `services/keeper/README.md`
+- Plans by mirroring the vault's valuation; each leg's `min_amount_out` is the smallest value the policy's slippage check accepts; a pool quote below it refuses the plan (no trading against an off-oracle pool)
+- Pre-validates with `policy.validate_rebalance`, submits only after an enforcing simulation (the vault re-checks actual holdings)
+- Settles frozen-sleeve claims (`settle_claim`, from `CLAIM_RECORDED` events)
+- Proven on a real local network with the release WASMs and real Soroswap WASMs (6 scenarios); TTL extension and alerting are not built yet
 - Submits transactions signed by a dedicated keeper keypair
 - Keeper keypair has no admin authority — it can only propose rebalances
 - Policy contract rejects any unauthorized operation
