@@ -2555,3 +2555,57 @@ mod a1b {
         assert_eq!(amend(&plain, vec![env, sleeve(env, "CIRCLE_USDC", "numeraire"), sleeve(env, "CIRCLE_EURC", "cash")]), bad, "add");
     }
 }
+
+// ---------------------------------------------------------------------------
+// A1 (storage rent): per-vault records live in their own persistent entries
+// (the shared instance entry would grow with every factory vault and is
+// loaded on every call), every record touched in a transaction is renewed
+// for 30 days, and so is the instance - so a vault in regular use never
+// finds its policy archived.
+// ---------------------------------------------------------------------------
+mod a1_rent {
+    use super::*;
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+
+    const DAY: u32 = 17_280;
+
+    fn register(ctx: &TestContext, vault: &Address) {
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(vault, &ctx.owner, &sample_hash(&ctx.env, 0x51),
+            &ctx.registry_address, &1000, &10_000, &10_000, &50, &500, &sample_sleeves(&ctx.env));
+    }
+
+    #[test]
+    fn per_vault_records_are_persistent_entries_not_instance_data() {
+        let ctx = setup_test_context();
+        let vault = Address::generate(&ctx.env);
+        register(&ctx, &vault);
+        ctx.env.as_contract(&ctx.policy_address, || {
+            for key in [DataKey::PolicyConfig(vault.clone()), DataKey::SleeveTargets(vault.clone())] {
+                assert!(ctx.env.storage().persistent().has(&key), "{key:?} must be its own entry");
+                assert!(!ctx.env.storage().instance().has(&key), "{key:?} must not grow the instance");
+                assert!(ctx.env.storage().persistent().get_ttl(&key) >= 29 * DAY);
+            }
+        });
+    }
+
+    #[test]
+    fn a_vault_in_regular_use_never_finds_its_policy_archived() {
+        let ctx = setup_test_context();
+        let env = &ctx.env;
+        let vault = Address::generate(env);
+        register(&ctx, &vault);
+        let policy = PolicyContractClient::new(env, &ctx.policy_address);
+        let holdings = vec![env, (Symbol::new(env, "CIRCLE_USDC"), 1i128)];
+        // One check a month for a year. Without renewal the TTL runs out and
+        // the entries are archived (on a real network every access then needs
+        // a paid restore); the TTLs below prove each use renews them.
+        for _ in 0..12 {
+            env.ledger().with_mut(|l| { l.sequence_number += 30 * DAY; l.timestamp += 30 * 86_400; });
+            let _ = policy.validate_holdings(&vault, &holdings);
+        }
+        env.as_contract(&ctx.policy_address, || {
+            assert!(env.storage().instance().get_ttl() >= 29 * DAY);
+            assert!(env.storage().persistent().get_ttl(&DataKey::PolicyConfig(vault.clone())) >= 29 * DAY);
+        });
+    }
+}
