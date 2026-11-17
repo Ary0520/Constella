@@ -2762,3 +2762,69 @@ mod dk {
         assert_eq!(s.vault.get_router(&VaultRoute::Soroswap), Some(router));
     }
 }
+
+/// Audit A3 (real yield numbers): the vault records its own conservative NAV
+/// per share at most once a day (bounded history), so realised yield comes
+/// from the chain itself - never an invented number.
+mod a3 {
+    use super::w1::*;
+    use super::*;
+
+    fn with_eurc() -> R {
+        let r = setup();
+        let env = &r.s.env;
+        let usdc_in = 3_000 * ONE;
+        let mut p = proposal(&r, usdc_in, quote(&r, usdc_in));
+        p.weights_after = Vec::from_array(env, [(Symbol::new(env, "USDC"), 7000u32), (Symbol::new(env, "EURC"), 3000u32)]);
+        as_keeper(&r, &p);
+        env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        env.mock_all_auths();
+        r
+    }
+
+    fn next_day(r: &R, eurc_px: i128) {
+        let env = &r.s.env;
+        env.ledger().with_mut(|l| { l.timestamp += 86_400; l.sequence_number += 17_280; });
+        let t = env.ledger().timestamp();
+        for (id, px) in [("USDC_A", ONE), ("USDC_B", ONE), ("EURC_A", eurc_px), ("EURC_B", eurc_px)] {
+            r.s.oracle.update_price(&Symbol::new(env, id), &px, &200_000, &t);
+        }
+    }
+
+    #[test]
+    fn one_conservative_nav_point_per_day_from_the_chain() {
+        let r = with_eurc();
+        assert!(r.s.vault.get_nav_history().is_empty());
+        let mut px = ONE * 108 / 100;
+        for _ in 0..3 {
+            next_day(&r, px);
+            r.s.vault.accrue_fees();
+            r.s.vault.accrue_fees(); // same day: no second point
+            px += ONE / 100;
+        }
+        let h = r.s.vault.get_nav_history();
+        assert_eq!(h.len(), 3);
+        let last = h.last().unwrap();
+        assert_eq!(last.timestamp, r.s.env.ledger().timestamp());
+        assert_eq!(last.nav, r.s.vault.get_nav_conservative().unwrap().price, "the vault's own conservative NAV");
+        assert!(h.get(0).unwrap().nav < h.get(1).unwrap().nav && h.get(1).unwrap().nav < h.get(2).unwrap().nav, "EURC rose");
+    }
+
+    #[test]
+    fn unpriced_days_record_nothing_and_history_is_bounded() {
+        let r = with_eurc();
+        let env = &r.s.env;
+        // A day with stale feeds (no push): no point.
+        env.ledger().with_mut(|l| { l.timestamp += 86_400; l.sequence_number += 17_280; });
+        r.s.vault.accrue_fees();
+        assert!(r.s.vault.get_nav_history().is_empty());
+        for _ in 0..(constella_vault_strategy::NAV_HISTORY_MAX + 5) {
+            next_day(&r, ONE * 108 / 100);
+            r.s.vault.accrue_fees();
+        }
+        let h = r.s.vault.get_nav_history();
+        assert_eq!(h.len(), constella_vault_strategy::NAV_HISTORY_MAX);
+        assert_eq!(h.last().unwrap().timestamp, env.ledger().timestamp(), "oldest dropped, newest kept");
+    }
+}

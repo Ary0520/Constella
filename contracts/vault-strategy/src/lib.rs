@@ -684,6 +684,16 @@ pub const FEE_CAP_BPS_PER_YEAR: i128 = 20;
 /// often anyone calls `accrue_fees` (the cap slice per call would otherwise
 /// shrink with call frequency and forgive most of the profit).
 pub const FEE_CRYSTALLIZATION_SECONDS: u64 = 86_400;
+/// Audit A3: at most this many daily NAV points are kept (oldest dropped).
+pub const NAV_HISTORY_MAX: u32 = 90;
+
+/// Audit A3: one conservative NAV-per-share observation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NavPoint {
+    pub timestamp: u64,
+    pub nav: i128,
+}
 
 /// Decision D-D: (fee shares to mint, new last-accrual time, new high-water
 /// mark). Fee = performance_fee_bps of the profit since the high-water mark,
@@ -2347,6 +2357,11 @@ impl StrategyVault {
     }
 
     // Fee Engine
+    /// Audit A3: daily conservative NAV per share, oldest first (<= NAV_HISTORY_MAX).
+    pub fn get_nav_history(env: Env) -> Vec<NavPoint> {
+        Vec::new(&env)
+    }
+
     pub fn accrue_fees(env: Env) -> i128 {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config)
