@@ -29,6 +29,14 @@ class AssetRegistry:
     def from_chain(cls, rpc_url: str, network_passphrase: str, registry_id: str, source_account: str) -> "AssetRegistry":
         return cls.from_entries(load_onchain_entries(rpc_url, network_passphrase, registry_id, source_account))
 
+    def apply_yields(self, yields: Dict[str, float]) -> None:
+        """Audit A3: live rates read from the chain (src/yields.py). Assets
+        without a live source keep 0 = unknown (never an assumed number)."""
+        for asset_id, pct in yields.items():
+            a = self._assets.get(asset_id)
+            if a is not None:
+                a.current_yield_pct = float(pct)
+
     def get_asset(self, asset_id: str) -> Optional[AssetCandidate]:
         return self._assets.get(asset_id)
 

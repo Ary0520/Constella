@@ -254,8 +254,17 @@ def explain_facts(policy: PolicyDraft, opt: OptimizationResult, report: Explanat
         "max_issuer_pct": round(policy.max_issuer_weight * 100, 1),
         "warnings": report.issuer_concentration_warnings,
         "needs_confirmation": report.ambiguity_clarifications,
-        "yields_note": "Live yields are not yet available; none are quoted.",
+        **_yield_facts(opt, candidates),
     }
+
+
+def _yield_facts(opt: OptimizationResult, candidates: List[AssetCandidate]) -> Dict:
+    live = {c.display_name: round(c.current_yield_pct, 2) for c in candidates
+            if opt.weights.get(c.asset_id, 0) > 0 and c.current_yield_pct > 0}
+    if not live:
+        return {"yields_note": "No live yield is available for these assets; none are quoted."}
+    return {"variable_rates_pct_per_year": live,
+            "yields_note": "Rates are read live from the chain and change continuously; they are not promised."}
 
 
 def _numbers(text: str) -> set:

@@ -57,3 +57,22 @@ def test_not_enough_data_is_unknown_not_zero():
     assert realized_apr_pct([]) is None
     assert realized_apr_pct([(0, 10_000_000)]) is None
     assert realized_apr_pct([(0, 10_000_000), (3_600, 10_001_000)]) is None
+
+
+def test_live_rates_reach_the_explanation_only_when_real():
+    from src.explainer import generate_explanation
+    from src.optimizer import optimize_portfolio
+    from src.thesis_llm import explain_facts
+    from tests.test_optimizer_fail_closed import cands, retail
+    p = retail(currency_exposure={})
+    c = cands(p)
+    for a in c:
+        a.current_yield_pct = 0.0
+    r = optimize_portfolio(p, c)
+    rep = generate_explanation("safe runway", p, r, c)
+    assert "variable_rates_pct_per_year" not in explain_facts(p, r, rep, c)
+    blend = next(a for a in c if a.asset_id == "BLEND_USDC_SUPPLY")
+    blend.current_yield_pct = 1.52551
+    facts = explain_facts(p, r, rep, c)
+    assert facts["variable_rates_pct_per_year"] == {blend.display_name: 1.53}
+    assert "not promised" in facts["yields_note"]
