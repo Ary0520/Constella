@@ -60,6 +60,8 @@ The model helps with language only; it proposes and never decides.
 
 ---
 
+**Real yield numbers (audit A3, implemented):** `src/yields.py` reads rates from the chain, never assumes them. Blend supply APR = Blend v2's own interest model on the pool's live reserve data (verified against the real pool's accrual to <= 1 bp); vault realised APR = the vault's own daily conservative NAV history (`get_nav_history`, at most one point a day, 90 kept). Assets without a live source stay 0 = unknown and are never quoted. Rates are simple APRs, variable, never promised.
+
 **LLM-assisted Explain (D-J):** the model writes a ≤ 120-word summary and 2-4 risks from a structured facts object only (allocation, vault currency, profile, floor, cap, warnings, items needing confirmation). It is discarded if it contains any number not in the facts or any promise ("guaranteed", "risk-free", "insured", ...). The deterministic `ExplanationReport` remains the authoritative explanation.
 
 **Tests:** offline `tests/test_thesis_llm.py` (82 total in the suite; guard mutation 21/21); live `tests/test_llm_live.py`, opt-in (`CONSTELLA_LIVE_LLM=1`, key in env, shared $0.03 guard) — 3/3 on Claude Haiku 5.5, $0.00088 per run (17 Nov 2026).
