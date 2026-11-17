@@ -13,6 +13,7 @@ members = [
     "threshold-policy",
     "testkit",
     "vault-factory",
+    "account-factory",
 ]
 
 [workspace.package]
