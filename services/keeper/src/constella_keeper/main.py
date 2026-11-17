@@ -9,7 +9,15 @@ Keeper loop. Per vault, per tick:
      and pays only the holder); a claim that cannot settle yet is retried.
 Config (env): CONSTELLA_RPC_URL, CONSTELLA_NETWORK_PASSPHRASE, KEEPER_SECRET,
 KEEPER_VAULTS (comma-separated), KEEPER_INTERVAL_SECONDS (300), KEEPER_ONCE,
-KEEPER_DRY_RUN, KEEPER_STATE_FILE, KEEPER_DEADLINE_SECONDS (300).
+KEEPER_DRY_RUN, KEEPER_STATE_FILE, KEEPER_DEADLINE_SECONDS (300),
+KEEPER_TTL_MIN_DAYS (20), KEEPER_TTL_EXTEND_DAYS (30).
+
+Storage rent (A1): contracts renew what a transaction touches; the keeper
+renews whatever is idle - the vault / policy / oracle / registry instances
+and their WASM code, the vault's policy records and open claims - when
+fewer than KEEPER_TTL_MIN_DAYS remain. (User share balances are renewed by
+use; an idle one that archives is restored automatically by the next
+transaction that needs it, at a fee.)
 """
 from __future__ import annotations
 
@@ -19,9 +27,10 @@ import sys
 import time
 from typing import Dict
 
-from stellar_sdk import scval
+from stellar_sdk import scval, xdr
 
-from constella_keeper.chain import Chain, ChainError, proposal_scval
+from constella_keeper.chain import (Chain, ChainError, code_key, data_key, enum_key, instance_key, proposal_scval,
+                                    scalar_addr)
 from constella_keeper.planner import PlanError, plan
 
 
@@ -113,7 +122,41 @@ def settle_claims(chain: Chain, vault: str, state: Dict, dry_run: bool) -> list:
     return out
 
 
-def tick(chain: Chain, vaults, state: Dict, dry_run: bool, deadline_s: int) -> None:
+DAY_LEDGERS = 17_280
+
+
+def rent_keys(chain: Chain, vault: str, state: Dict):
+    cfg = chain.read(vault, "get_config")
+    contracts = [vault] + [str(getattr(cfg[k], "address", cfg[k])) for k in ("policy_contract", "oracle_contract", "registry_contract")]
+    policy = contracts[1]
+    keys = [instance_key(c) for c in contracts]
+    v = scalar_addr(vault)
+    keys += [data_key(policy, enum_key(k, v)) for k in ("PolicyConfig", "SleeveTargets", "PendingUpdate", "NoticePeriod")]
+    for holder, asset in state.get(vault, {}).get("claims", []):
+        keys.append(data_key(vault, enum_key("Claim", scalar_addr(holder), scalar_addr(asset))))
+    return keys
+
+
+def renew_storage(chain: Chain, vaults, state: Dict, min_days: int, extend_days: int, dry_run: bool) -> Dict:
+    keys = []
+    for v in vaults:
+        keys += rent_keys(chain, v, state)
+    found = chain.live_until(keys)
+    codes = {chain.wasm_hash(x) for k, (_, x) in found.items()
+             if xdr.LedgerKey.from_xdr(k).contract_data.key.type == xdr.SCValType.SCV_LEDGER_KEY_CONTRACT_INSTANCE}
+    code_keys = [code_key(h) for h in codes]
+    found.update(chain.live_until(code_keys))
+    latest = chain.latest_ledger()
+    due = [xdr.LedgerKey.from_xdr(k) for k, (until, _) in found.items() if until - latest < min_days * DAY_LEDGERS]
+    missing = len({k.to_xdr() for k in keys}) - len([k for k in found if k not in {c.to_xdr() for c in code_keys}])
+    result = {"action": "rent", "checked": len(found), "due": len(due), "absent": missing}
+    if due and not dry_run:
+        result.update(chain.extend(due, extend_days * DAY_LEDGERS))
+    return result
+
+
+def tick(chain: Chain, vaults, state: Dict, dry_run: bool, deadline_s: int,
+         ttl_min_days: int = 20, ttl_extend_days: int = 30) -> None:
     for v in vaults:
         try:
             log(vault=v, **rebalance_vault(chain, v, dry_run, deadline_s))
@@ -124,6 +167,10 @@ def tick(chain: Chain, vaults, state: Dict, dry_run: bool, deadline_s: int) -> N
                 log(vault=v, **c)
         except Exception as e:
             log(vault=v, action="claims-error", reason=f"{type(e).__name__}: {str(e)[:300]}")
+    try:
+        log(**renew_storage(chain, vaults, state, ttl_min_days, ttl_extend_days, dry_run))
+    except Exception as e:
+        log(action="rent-error", reason=f"{type(e).__name__}: {str(e)[:300]}")
 
 
 def cli() -> None:
@@ -140,7 +187,8 @@ def cli() -> None:
     log(action="start", keeper=chain.keeper, vaults=vaults, dry_run=dry)
     while True:
         state = load_state(state_file)
-        tick(chain, vaults, state, dry, deadline_s)
+        tick(chain, vaults, state, dry, deadline_s, int(env.get("KEEPER_TTL_MIN_DAYS", "20")),
+             int(env.get("KEEPER_TTL_EXTEND_DAYS", "30")))
         save_state(state_file, state)
         if env.get("KEEPER_ONCE") == "1":
             return

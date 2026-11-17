@@ -10,7 +10,8 @@
 #   4. a key that is not the vault's keeper does nothing;
 #   5. a frozen EURC price -> a user redeems (cash now + a claim); price back
 #      -> the keeper settles the claim to the user;
-#   6. a paused vault is skipped.
+#   6. the keeper renews idle storage (rent) for every contract, code, policy record;
+#   7. a paused vault is skipped.
 # Usage (repo root, after `stellar contract build`): services/keeper/tests/localnet_e2e.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -142,6 +143,23 @@ usdc_after=$(view --id $USDC -- balance --id $USER | tr -d '"')
 [ "$usdc_after" -gt "$usdc_before" ] || fail "holder not paid"
 echo "holder paid $((usdc_after - usdc_before)) USDC units for the claim"
 
-echo "--- 6. paused -> skip"; invoke admin --id $VAULT -- pause; out=$(keeper "$KS"); echo "$out"
+echo "--- 6. storage rent: the keeper renews idle entries"
+out=$(docker run --rm --network $NET -v "$ROOT/services/keeper:/svc" -v "$WORK:/work" -w /svc \
+  -e CONSTELLA_RPC_URL=$RPC -e "CONSTELLA_NETWORK_PASSPHRASE=$PASS" -e KEEPER_SECRET="$KS" -e KEEPER_VAULTS=$VAULT \
+  -e KEEPER_ONCE=1 -e KEEPER_STATE_FILE=/work/keeper_state.json -e KEEPER_TTL_MIN_DAYS=35 -e KEEPER_TTL_EXTEND_DAYS=40 $PY_IMAGE \
+  sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; constella-keeper' 2>&1 | grep '"rent"'); echo "$out"
+echo "$out" | grep -q '"hash"' || fail "rent extension not submitted"
+python3 -c "import json,sys; d=json.loads(sys.argv[1]); assert d['due']>=10 and d['checked']>=10, d" "$out" || fail "too few entries renewed"
+py_ttl=$(docker run --rm --network $NET -v "$ROOT/services/keeper:/svc" -w /svc -e RPC=$RPC -e POLICY=$POLICY -e VAULT=$VAULT $PY_IMAGE sh -c '
+  pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; python -c "
+import os; from stellar_sdk import SorobanServer
+from constella_keeper.chain import data_key, enum_key, instance_key, scalar_addr
+s=SorobanServer(os.environ[\"RPC\"]); latest=s.get_latest_ledger().sequence
+ks=[instance_key(os.environ[\"POLICY\"]), data_key(os.environ[\"POLICY\"], enum_key(\"PolicyConfig\", scalar_addr(os.environ[\"VAULT\"])))]
+print(min((e.live_until_ledger-latest)//17280 for e in s.get_ledger_entries(ks).entries))"')
+echo "policy instance + PolicyConfig now live for >= $py_ttl days"
+[ "$py_ttl" -ge 39 ] || fail "entries not renewed to 40 days"
+
+echo "--- 7. paused -> skip"; invoke admin --id $VAULT -- pause; out=$(keeper "$KS"); echo "$out"
 echo "$out" | grep -q '"reason": "vault paused"' || fail "paused vault not skipped"
 echo "KEEPER E2E PASS"

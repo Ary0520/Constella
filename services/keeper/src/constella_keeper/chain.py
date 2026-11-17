@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, List, Optional, Sequence
 
-from stellar_sdk import Keypair, SorobanServer, TransactionBuilder, scval, xdr
+from stellar_sdk import Address, Keypair, SorobanDataBuilder, SorobanServer, TransactionBuilder, scval, xdr
 from stellar_sdk.soroban_rpc import EventFilter, EventFilterType, GetTransactionStatus, SendTransactionStatus
 
 from constella_keeper.planner import Plan, Sleeve
@@ -149,6 +149,44 @@ class Chain:
             time.sleep(1)
         raise ChainError(f"{fn} not confirmed within {self.timeout_s}s: {sent.hash}")
 
+    # ---------------------------------------------------------------- rent
+    def live_until(self, keys: List[xdr.LedgerKey]) -> Dict[str, Any]:
+        """{key_xdr: (live_until_ledger, entry_xdr)} for entries that exist."""
+        out: Dict[str, Any] = {}
+        for i in range(0, len(keys), 50):
+            resp = self.server.get_ledger_entries(keys[i:i + 50])
+            for e in resp.entries or []:
+                out[e.key] = (e.live_until_ledger, e.xdr)
+        return out
+
+    def wasm_hash(self, instance_entry_xdr: str) -> bytes:
+        data = xdr.LedgerEntryData.from_xdr(instance_entry_xdr)
+        return bytes(data.contract_data.val.instance.executable.wasm_hash.hash)
+
+    def extend(self, keys: List[xdr.LedgerKey], extend_to: int) -> Dict[str, Any]:
+        """ExtendFootprintTTL (permissionless; the keeper pays) for `keys`."""
+        acct = self.server.load_account(self.keeper)
+        data = SorobanDataBuilder().set_read_only(keys).build()
+        tx = (TransactionBuilder(acct, self.passphrase, base_fee=100).append_extend_footprint_ttl_op(extend_to)
+              .set_soroban_data(data).set_timeout(60).build())
+        sim = self.server.simulate_transaction(tx)
+        if sim.error:
+            raise ChainError(f"extend simulation failed: {sim.error[:300]}")
+        tx = self.server.prepare_transaction(tx, sim)
+        tx.sign(self.kp)
+        sent = self.server.send_transaction(tx)
+        if sent.status not in (SendTransactionStatus.PENDING, SendTransactionStatus.DUPLICATE):
+            raise ChainError(f"extend not accepted: {sent.status}")
+        deadline = time.time() + self.timeout_s
+        while time.time() < deadline:
+            r = self.server.get_transaction(sent.hash)
+            if r.status == GetTransactionStatus.SUCCESS:
+                return {"hash": sent.hash, "ledger": r.ledger}
+            if r.status == GetTransactionStatus.FAILED:
+                raise ChainError(f"extend failed on chain: {sent.hash}")
+            time.sleep(1)
+        raise ChainError(f"extend not confirmed: {sent.hash}")
+
     # ---------------------------------------------------------------- claims
     def claim_events(self, vault: str, start_ledger: Optional[int], cursor: Optional[str]):
         """(holder, asset) pairs from CLAIM_RECORDED events, and the next cursor."""
@@ -161,6 +199,26 @@ class Chain:
             t = [scval.to_native(xdr.SCVal.from_xdr(x)) for x in e.topic]
             pairs.append((addr(t[1]), addr(t[2])))
         return pairs, getattr(resp, "cursor", None)
+
+
+# ------------------------------------------------------------ storage rent (A1)
+def instance_key(contract: str) -> xdr.LedgerKey:
+    return data_key(contract, xdr.SCVal(xdr.SCValType.SCV_LEDGER_KEY_CONTRACT_INSTANCE))
+
+
+def data_key(contract: str, key: xdr.SCVal) -> xdr.LedgerKey:
+    return xdr.LedgerKey(type=xdr.LedgerEntryType.CONTRACT_DATA, contract_data=xdr.LedgerKeyContractData(
+        contract=Address(contract).to_xdr_sc_address(), key=key, durability=xdr.ContractDataDurability.PERSISTENT))
+
+
+def code_key(wasm_hash: bytes) -> xdr.LedgerKey:
+    return xdr.LedgerKey(type=xdr.LedgerEntryType.CONTRACT_CODE,
+                         contract_code=xdr.LedgerKeyContractCode(hash=xdr.Hash(wasm_hash)))
+
+
+def enum_key(variant: str, *fields: xdr.SCVal) -> xdr.SCVal:
+    """A #[contracttype] tuple-variant key, e.g. DataKey::PolicyConfig(vault)."""
+    return scval.to_vec([scval.to_symbol(variant), *fields])
 
 
 def scalar_addr(a: str) -> xdr.SCVal:
