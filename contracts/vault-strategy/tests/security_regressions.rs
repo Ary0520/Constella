@@ -2706,3 +2706,42 @@ mod a1b {
         assert!(s.vault.get_policy_hash().is_some());
     }
 }
+
+/// Decision D-K: a vault's FIRST router takes effect immediately while no
+/// shares exist (nobody to protect yet, e.g. a fresh testnet or factory
+/// vault); once anyone holds shares - or once a router was ever set - every
+/// change waits 48 h.
+mod dk {
+    use super::*;
+    use constella_vault_strategy::TradeRoute as VaultRoute;
+
+    #[test]
+    fn the_first_router_is_immediate_while_the_vault_has_no_shares() {
+        let s = deploy_stack();
+        s.env.mock_all_auths();
+        let router = Address::generate(&s.env);
+        s.vault.propose_router(&VaultRoute::Soroswap, &router);
+        s.vault.activate_router(&VaultRoute::Soroswap);
+        assert_eq!(s.vault.get_router(&VaultRoute::Soroswap), Some(router.clone()));
+        // A second change (still no shares) waits: a router was already set.
+        let other = Address::generate(&s.env);
+        s.vault.propose_router(&VaultRoute::Soroswap, &other);
+        assert!(s.vault.try_activate_router(&VaultRoute::Soroswap).is_err());
+        assert_eq!(s.vault.get_router(&VaultRoute::Soroswap), Some(router));
+    }
+
+    #[test]
+    fn once_anyone_holds_shares_even_the_first_router_waits_48_hours() {
+        let s = deploy_stack();
+        s.env.mock_all_auths();
+        let user = Address::generate(&s.env);
+        s.usdc_admin.mint(&user, &(100 * ONE));
+        s.vault.deposit(&(100 * ONE), &user, &user, &user);
+        let router = Address::generate(&s.env);
+        s.vault.propose_router(&VaultRoute::Soroswap, &router);
+        assert!(s.vault.try_activate_router(&VaultRoute::Soroswap).is_err());
+        s.env.ledger().set_timestamp(s.env.ledger().timestamp() + 48 * 3600);
+        s.vault.activate_router(&VaultRoute::Soroswap);
+        assert_eq!(s.vault.get_router(&VaultRoute::Soroswap), Some(router));
+    }
+}
