@@ -2787,7 +2787,9 @@ mod a3 {
         let env = &r.s.env;
         env.ledger().with_mut(|l| { l.timestamp += 86_400; l.sequence_number += 17_280; });
         let t = env.ledger().timestamp();
-        for (id, px) in [("USDC_A", ONE), ("USDC_B", ONE), ("EURC_A", eurc_px), ("EURC_B", eurc_px)] {
+        // The two EURC feeds differ by 0.5 % (inside the deviation limit), so
+        // the conservative NAV (minimum) differs from the deposit NAV (median).
+        for (id, px) in [("USDC_A", ONE), ("USDC_B", ONE), ("EURC_A", eurc_px), ("EURC_B", eurc_px + eurc_px / 200)] {
             r.s.oracle.update_price(&Symbol::new(env, id), &px, &200_000, &t);
         }
     }

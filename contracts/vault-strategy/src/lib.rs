@@ -409,6 +409,8 @@ pub enum DataKey {
     /// Executor contract per trade route (u32 = TradeRoute discriminant).
     Router(u32),
     PendingRouter(u32),
+    /// Audit A3: daily conservative NAV points (persistent, bounded).
+    NavHistory,
 }
 
 // Rebalance proposal types - mirrors of constella-policy (keep in lockstep;
@@ -769,7 +771,34 @@ fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
         mint_shares_internal(env, &config.treasury, d_shares);
         FeeAccrual { treasury: config.treasury.clone(), shares: d_shares }.publish(env);
     }
+    record_nav_point(env, config);
     d_shares
+}
+
+/// Audit A3: append the conservative NAV per share (the same figure as
+/// `get_nav_conservative`) at most once per day, only while every funded
+/// sleeve is priced; keep the newest NAV_HISTORY_MAX points. Realised yield
+/// is then computed from the chain's own record.
+fn record_nav_point(env: &Env, config: &VaultConfig) {
+    let key = DataKey::NavHistory;
+    let mut h: Vec<NavPoint> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(env));
+    let now = env.ledger().timestamp();
+    if let Some(last) = h.last() {
+        if now < last.timestamp.saturating_add(FEE_CRYSTALLIZATION_SECONDS) {
+            return;
+        }
+    }
+    let supply = share_supply(env);
+    if supply <= 0 {
+        return;
+    }
+    let Some(nav) = compute_nav(env, config, NavKind::Collateral, supply) else { return };
+    h.push_back(NavPoint { timestamp: now, nav: nav.price });
+    while h.len() > NAV_HISTORY_MAX {
+        h.pop_front();
+    }
+    env.storage().persistent().set(&key, &h);
+    env.storage().persistent().extend_ttl(&key, CLAIM_TTL_THRESHOLD, CLAIM_TTL_EXTEND_TO);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2359,7 +2388,7 @@ impl StrategyVault {
     // Fee Engine
     /// Audit A3: daily conservative NAV per share, oldest first (<= NAV_HISTORY_MAX).
     pub fn get_nav_history(env: Env) -> Vec<NavPoint> {
-        Vec::new(&env)
+        env.storage().persistent().get(&DataKey::NavHistory).unwrap_or_else(|| Vec::new(&env))
     }
 
     pub fn accrue_fees(env: Env) -> i128 {
