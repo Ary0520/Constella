@@ -81,6 +81,9 @@ def run() -> None:
     relayers = E["RELAYERS"].split(",")
     sponsor = E["SPONSOR"]
     one = 10_000_000
+    # Creating the account through the relayer (audit A2) was itself a
+    # sponsored op on this account's quota: measure from that baseline.
+    base_ops = Chain().view(sponsor, "get_user_stats", [scval.to_address(acct)])["daily_ops"]
 
     usdc_before = chain.balance(usdc, acct)
     xlm_user_before = chain.balance(native, acct)
@@ -110,8 +113,8 @@ def run() -> None:
         fail(f"set_keeper must not be sponsored: {code} {res}")
 
     stats = chain.view(sponsor, "get_user_stats", [scval.to_address(acct)])
-    if stats["daily_ops"] != 0:
-        fail(f"refused requests consumed quota: {stats}")
+    if stats["daily_ops"] != base_ops:
+        fail(f"refused requests consumed quota: {stats} (baseline {base_ops})")
     if {r: chain.balance(native, r) for r in relayers} != xlm_relayers_before:
         fail("refused requests cost the relayers XLM")
 
@@ -144,7 +147,7 @@ def run() -> None:
     if xlm_relayer_before - xlm_relayer_after != paid:
         fail("the relayer's XLM did not drop by exactly the fees charged")
     stats = chain.view(sponsor, "get_user_stats", [scval.to_address(acct)])
-    if stats["daily_ops"] != 1:
+    if stats["daily_ops"] != base_ops + 1:
         fail(f"the sponsored op was not recorded on chain: {stats}")
 
     print("ZERO-GAS DEPOSIT PASS")

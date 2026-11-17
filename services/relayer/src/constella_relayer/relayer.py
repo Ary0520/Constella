@@ -58,6 +58,7 @@ class Relayer:
         max_fee_stroops: int,
         inclusion_fee: int = 100,
         timeout_seconds: int = 30,
+        account_max_fee_stroops: int = 30_000_000,
     ):
         if max_fee_stroops <= inclusion_fee:
             raise ValueError("max_fee_stroops must exceed the inclusion fee")
@@ -69,6 +70,9 @@ class Relayer:
         self.sponsor = sponsor_contract
         self.allowed = allowed
         self.max_fee = max_fee_stroops
+        # Deploying an account pays its storage rent (~1.8 XLM on a local
+        # network, measured): its own cap, so user calls stay tightly capped.
+        self.account_max_fee = account_max_fee_stroops
         self.inclusion_fee = inclusion_fee
         self.timeout = timeout_seconds
         self.relayer_addresses = frozenset(k.public_key for k in keypairs)
@@ -139,15 +143,47 @@ class Relayer:
 
     def submit(self, func_b64: str, auth_b64: list[str]) -> Submitted:
         v = validate(func_b64, auth_b64, self.allowed, self.relayer_addresses)
-        if self._view("is_whitelisted", [scval.to_address(v.contract)]) is not True:
-            raise Rejected("TARGET_NOT_WHITELISTED", v.contract)
+        return self._sponsor(v.host_function, v.auth, v.user, v.contract, v.function)
+
+    def _read(self, contract: str, fn: str, args: list[xdr.SCVal]):
+        source = self.keypairs[0].public_key
+        seq = self.server.load_account(source).sequence
+        tx = self._builder(source, seq).append_invoke_contract_function_op(contract, fn, args).build()
+        sim = self.server.simulate_transaction(tx)
+        if sim.error:
+            raise Rejected("SIMULATION_FAILED", f"{fn}: {sim.error}")
+        return scval.to_native(xdr.SCVal.from_xdr(sim.results[0].xdr))
+
+    def create_account(self, factory: str, owner_key: bytes) -> dict:
+        """Audit A2: deploy the user's passkey account through the account
+        factory, paid by the relayer, within the fee-sponsor's on-chain
+        budget. The call is built HERE (never client-supplied) and needs no
+        signature. Returns the existing account without spending anything."""
+        key = scval.to_bytes(owner_key)
+        existing = self._read(factory, "account_of", [key])
+        if existing is not None:
+            return {"account": getattr(existing, "address", str(existing)), "existing": True}
+        user = self._read(factory, "address_for", [key])
+        user = getattr(user, "address", str(user))
+        hf = xdr.HostFunction(
+            type=xdr.HostFunctionType.HOST_FUNCTION_TYPE_INVOKE_CONTRACT,
+            invoke_contract=xdr.InvokeContractArgs(contract_address=Address(factory).to_xdr_sc_address(),
+                                                   function_name=xdr.SCSymbol(b"create_account"), args=[key]))
+        done = self._sponsor(hf, [], user, factory, "create_account", self.account_max_fee)
+        return {"account": user, "existing": False, **{k: v for k, v in done.__dict__.items() if k != "user"}}
+
+    def _sponsor(self, host_function, auth, user: str, contract: str, function: str,
+                 max_fee: int | None = None) -> Submitted:
+        cap = self.max_fee if max_fee is None else max_fee
+        if self._view("is_whitelisted", [scval.to_address(contract)]) is not True:
+            raise Rejected("TARGET_NOT_WHITELISTED", contract)
         i = self._acquire()
         try:
             kp = self.keypairs[i]
             me = kp.public_key
             seq = self.server.load_account(me).sequence
             user_tx = self._builder(me, seq + 1).append_operation(
-                InvokeHostFunction(host_function=v.host_function, auth=v.auth)).build()
+                InvokeHostFunction(host_function=host_function, auth=auth)).build()
             try:
                 # Auth entries are present, so the simulation ENFORCES them:
                 # the account's real __check_auth runs here.
@@ -155,18 +191,18 @@ class Relayer:
             except PrepareTransactionException as e:
                 raise Rejected("SIMULATION_FAILED", str(e.simulate_transaction_response.error)) from None
             fee = prepared.transaction.fee
-            if fee > self.max_fee:
-                raise Rejected("FEE_TOO_HIGH", f"{fee} > {self.max_fee}")
+            if fee > cap:
+                raise Rejected("FEE_TOO_HIGH", f"{fee} > {cap}")
             record = self._builder(me, seq).append_invoke_contract_function_op(
                 self.sponsor, "record_sponsored_op",
-                [scval.to_address(me), scval.to_address(v.user), scval.to_address(v.contract), scval.to_uint64(fee)]).build()
+                [scval.to_address(me), scval.to_address(user), scval.to_address(contract), scval.to_uint64(fee)]).build()
             try:
                 record = self.server.prepare_transaction(record)
             except PrepareTransactionException as e:
                 raise Rejected("SPONSOR_REFUSED", str(e.simulate_transaction_response.error)) from None
             record_hash, record_fee = self._send(record, kp)
             tx_hash, fee_charged = self._send(prepared, kp)
-            return Submitted(relayer=me, hash=tx_hash, user=v.user, contract=v.contract, function=v.function,
+            return Submitted(relayer=me, hash=tx_hash, user=user, contract=contract, function=function,
                              fee_charged=fee_charged, record_hash=record_hash, record_fee_charged=record_fee)
         finally:
             self._locks[i].release()

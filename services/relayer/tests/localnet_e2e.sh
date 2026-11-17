@@ -21,7 +21,7 @@ WORK=$(mktemp -d)
 cleanup() { docker rm -f $NODE $RELAY >/dev/null 2>&1 || true; docker network rm $NET >/dev/null 2>&1 || true; rm -rf "$WORK"; }
 trap cleanup EXIT
 fail() { echo "E2E FAIL: $*" >&2; [ -n "${RELAY_LOGS:-}" ] && docker logs $RELAY 2>&1 | tail -20 >&2; exit 1; }
-for c in registry nav_oracle policy vault_strategy webauthn_verifier smart_account fee_sponsor; do
+for c in registry nav_oracle policy vault_strategy webauthn_verifier smart_account fee_sponsor account_factory; do
   [ -f "$W/constella_$c.wasm" ] || fail "build the contracts first ($W/constella_$c.wasm missing)"
 done
 
@@ -69,25 +69,27 @@ ORACLE=$(deploy nav_oracle -- --admin $ADMIN --base_asset $USDC --decimals 7 --r
 POLICY=$(deploy policy -- --admin $ADMIN --oracle $ORACLE)
 VAULT=$(deploy vault_strategy -- --config "{\"admin\":\"$ADMIN\",\"pause_authority\":\"$ADMIN\",\"numeraire\":\"$USDC\",\"policy_contract\":\"$POLICY\",\"oracle_contract\":\"$ORACLE\",\"registry_contract\":\"$REGISTRY\",\"treasury\":\"$ADMIN\",\"performance_fee_bps\":1000,\"tvl_cap\":\"10000000000000\",\"per_user_cap\":\"1000000000000\"}" --name "Constella Vault" --symbol CONST --decimals 7)
 VERIFIER=$(deploy webauthn_verifier)
-SPONSOR=$(deploy fee_sponsor -- --admin $ADMIN --max_ops_per_hour 10 --max_ops_per_day 50 --daily_budget_stroops 100000000)
+SPONSOR=$(deploy fee_sponsor -- --admin $ADMIN --max_ops_per_hour 10 --max_ops_per_day 50 --daily_budget_stroops 1000000000)
 invoke admin --id $SPONSOR -- whitelist_contract --target $VAULT
 invoke admin --id $SPONSOR -- add_relayer --relayer $R1
 invoke admin --id $SPONSOR -- add_relayer --relayer $R2
+# Audit A2: accounts are created through the account factory, paid by the relayer.
+ACCT_HASH=$(cli contract upload --wasm /wasm/constella_smart_account.wasm --source admin 2>"$WORK/err" | tail -1); [ ${#ACCT_HASH} = 64 ] || fail "account wasm upload: $(tail -3 "$WORK/err")"
+ACCOUNT_FACTORY=$(deploy account_factory -- --admin $ADMIN --verifier $VERIFIER --account_wasm_hash $ACCT_HASH)
+invoke admin --id $SPONSOR -- whitelist_contract --target $ACCOUNT_FACTORY
 
 py() { docker run --rm --network $NET -v "$ROOT/services/relayer:/svc" -v "$WORK:/work" -w /svc "$@"; }
 PUBKEY=$(py $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e ".[dev]" >/dev/null 2>&1; python tests/localnet_driver.py keygen /work/passkey.pem')
 [ ${#PUBKEY} = 130 ] || fail "passkey keygen: $PUBKEY"
-ACCOUNT=$(deploy smart_account -- --verifier $VERIFIER --owner_key $PUBKEY --name owner)
-invoke issuer --id $USDC -- mint --to $ACCOUNT --amount 10000000000
+ACCOUNT=PENDING
 PUBKEY2=$(py $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e ".[dev]" >/dev/null 2>&1; python tests/localnet_driver.py keygen /work/passkey2.pem')
 [ ${#PUBKEY2} = 130 ] || fail "passkey2 keygen: $PUBKEY2"
-ACCOUNT2=$(deploy smart_account -- --verifier $VERIFIER --owner_key $PUBKEY2 --name owner)
-invoke issuer --id $USDC -- mint --to $ACCOUNT2 --amount 10000000000
-echo "registry $REGISTRY  vault $VAULT  sponsor $SPONSOR  accounts $ACCOUNT $ACCOUNT2  relayer pool $R1 $R2"
+echo "registry $REGISTRY  vault $VAULT  sponsor $SPONSOR  account factory $ACCOUNT_FACTORY  relayer pool $R1 $R2"
 
 docker run -d --rm --name $RELAY --network $NET -v "$ROOT/services/relayer:/svc" -w /svc \
   -e CONSTELLA_RPC_URL=$RPC -e "CONSTELLA_NETWORK_PASSPHRASE=$PASS" -e RELAYER_SECRETS="$RELAYER_SECRETS" \
   -e SPONSOR_CONTRACT_ID=$SPONSOR -e "SPONSOR_ALLOWED=$VAULT:deposit,redeem,withdraw,redeem_frozen" \
+  -e ACCOUNT_FACTORY_ID=$ACCOUNT_FACTORY -e ACCOUNTS_PER_IP_PER_DAY=3 -e RELAYER_TRUST_PROXY=1 \
   -e RELAYER_HOST=0.0.0.0 -e RELAYER_PORT=8787 $PY_IMAGE \
   sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; constella-relayer' >/dev/null
 RELAY_LOGS=1
@@ -95,6 +97,27 @@ for i in $(seq 1 60); do
   docker run --rm --network $NET curlimages/curl:8.10.1 -s http://$RELAY:8787/health 2>/dev/null | grep -q '"ok": true' && break
   sleep 2; [ "$i" = 60 ] && fail "relayer never became healthy"
 done
+
+# --- A2: zero-XLM users get their passkey account from the relayer.
+new_account() { docker run --rm --network $NET curlimages/curl:8.10.1 -s -w '\n%{http_code}' -X POST http://$RELAY:8787/accounts \
+  -H 'Content-Type: application/json' -H "X-Forwarded-For: $2" -d "{\"owner_key\":\"$1\"}"; }
+field() { python3 -c "import json,sys; print(json.loads(sys.argv[1])[sys.argv[2]])" "$1" "$2"; }
+r=$(new_account $PUBKEY 203.0.113.7); code=${r##*$'\n'}; body=${r%$'\n'*}
+[ "$code" = 200 ] || fail "account creation: $r"; ACCOUNT=$(field "$body" account)
+[ "$(field "$body" existing)" = False ] || fail "first creation should be new"
+r=$(new_account $PUBKEY 203.0.113.7); body=${r%$'\n'*}
+[ "$(field "$body" account)" = "$ACCOUNT" ] && [ "$(field "$body" existing)" = True ] || fail "repeat should return the same account: $r"
+r=$(new_account $PUBKEY2 203.0.113.7); body=${r%$'\n'*}; ACCOUNT2=$(field "$body" account)
+[[ $ACCOUNT == C* && $ACCOUNT2 == C* && $ACCOUNT != $ACCOUNT2 ]] || fail "accounts: $ACCOUNT $ACCOUNT2"
+[ "$(cli contract invoke --id $ACCOUNT_FACTORY --source admin --send=no -- is_account --account $ACCOUNT 2>/dev/null | tail -1)" = true ] || fail "not attested by the factory"
+K3=$(py $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e ".[dev]" >/dev/null 2>&1; python tests/localnet_driver.py keygen /work/k3.pem')
+K4=$(py $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e ".[dev]" >/dev/null 2>&1; python tests/localnet_driver.py keygen /work/k4.pem')
+r=$(new_account $K3 203.0.113.7); [ "${r##*$'\n'}" = 200 ] || fail "third account: $r"
+r=$(new_account $K4 203.0.113.7); [ "${r##*$'\n'}" = 429 ] || fail "fourth account from one client must be rate limited: $r"
+r=$(new_account $K4 198.51.100.9); [ "${r##*$'\n'}" = 200 ] || fail "another client is not limited: $r"
+echo "ACCOUNT CREATION PASS: $ACCOUNT $ACCOUNT2 (relayer-paid, deterministic, idempotent, rate limited)"
+invoke issuer --id $USDC -- mint --to $ACCOUNT --amount 10000000000
+invoke issuer --id $USDC -- mint --to $ACCOUNT2 --amount 10000000000
 
 drive() { py -e RPC=$RPC -e "PASS=$PASS" -e VIEWER=$VIEWER -e RELAYER_URL=http://$RELAY:8787 -e ACCOUNT=$ACCOUNT \
   -e VAULT=$VAULT -e USDC=$USDC -e NATIVE=$NATIVE -e RELAYERS=$R1,$R2 -e SPONSOR=$SPONSOR -e VERIFIER=$VERIFIER \
