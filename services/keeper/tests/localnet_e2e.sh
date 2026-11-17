@@ -11,7 +11,8 @@
 #   5. a frozen EURC price -> a user redeems (cash now + a claim); price back
 #      -> the keeper settles the claim to the user;
 #   6. the keeper renews idle storage (rent) for every contract, code, policy record;
-#   7. a paused vault is skipped.
+#   7. a paused vault is skipped;
+#   8. the watchdog emails ALERTs (paused vault, low keeper balance) to a local SMTP sink, then RESOLVED.
 # Usage (repo root, after `stellar contract build`): services/keeper/tests/localnet_e2e.sh
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -162,4 +163,26 @@ echo "policy instance + PolicyConfig now live for >= $py_ttl days"
 
 echo "--- 7. paused -> skip"; invoke admin --id $VAULT -- pause; out=$(keeper "$KS"); echo "$out"
 echo "$out" | grep -q '"reason": "vault paused"' || fail "paused vault not skipped"
+echo "--- 8. watchdog (D-M): alert emails to a local SMTP sink, then RESOLVED"
+SINK=constella-smtp-sink
+docker rm -f $SINK >/dev/null 2>&1 || true
+docker run -d --rm --name $SINK --network $NET $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore aiosmtpd==1.4.6 >/dev/null 2>&1; python -u -m aiosmtpd -n -l 0.0.0.0:1025 -c aiosmtpd.handlers.Debugging' >/dev/null
+for i in $(seq 1 60); do docker logs $SINK 2>&1 | grep -q . && break; docker run --rm --network $NET $PY_IMAGE python -c "import socket; socket.create_connection(('$SINK',1025),2)" >/dev/null 2>&1 && break; sleep 2; done
+watchdog() { docker run --rm --network $NET -v "$ROOT/services/watchdog:/svc" -v "$WORK:/work" -w /svc \
+  -e CONSTELLA_RPC_URL=$RPC -e "CONSTELLA_NETWORK_PASSPHRASE=$PASS" -e WATCHDOG_NETWORK=local -e WATCHDOG_SOURCE=$ADMIN \
+  -e WATCHDOG_VAULTS=$VAULT -e "WATCHDOG_ACCOUNTS=keeper:$KEEPER:100000" -e WATCHDOG_ONCE=1 \
+  -e WATCHDOG_STATE_FILE=/work/wd_state.json -e WATCHDOG_STATUS_FILE=/work/wd_status.json \
+  -e ALERT_SMTP_HOST=$SINK -e ALERT_SMTP_PORT=1025 -e ALERT_SMTP_TLS=none -e ALERT_FROM=watchdog@constella.local -e ALERT_TO=ops@constella.local \
+  $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; constella-watchdog' 2>&1 | grep '"action"'; }
+out=$(watchdog); echo "$out"
+echo "$out" | grep -q '"failing": 2' || fail "expected exactly 2 failing checks (paused vault, low keeper balance)"
+sleep 2; mails=$(docker logs $SINK 2>&1)
+echo "$mails" | grep -q "Subject: \[Constella local\] ALERT: vault .* is PAUSED" || fail "no paused-vault alert email"
+echo "$mails" | grep -q "Subject: \[Constella local\] ALERT: keeper balance" || fail "no low-balance alert email"
+invoke admin --id $VAULT -- unpause
+out=$(watchdog); echo "$out"
+sleep 2; docker logs $SINK 2>&1 | grep -q "Subject: \[Constella local\] RESOLVED: vault .* is running" || fail "no RESOLVED email"
+out=$(watchdog); echo "$out" | grep -q '"notices": 0' || fail "a healthy re-check must not email again"
+docker rm -f $SINK >/dev/null 2>&1 || true
+echo "WATCHDOG PASS"
 echo "KEEPER E2E PASS"
