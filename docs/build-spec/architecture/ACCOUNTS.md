@@ -56,6 +56,12 @@ For users who don't own XLM and don't want to think about blockchain, this is a 
 
 ---
 
+### Sponsored account creation (audit A2, implemented `f9694d9`, `0fbcebd`)
+
+`contracts/account-factory`: `create_account(owner_key)` is **permissionless** and deploys the audited passkey smart account with the factory's fixed WebAuthn verifier at `salt = SHA-256(owner_key)`. The address is a function of the key (`address_for`), so it can be shown before it exists, nobody can squat it, and only that key controls it; a repeat returns the existing account; `is_account` attests origin; code for future accounts changes only after 48 h.
+
+The relayer exposes `POST /accounts {"owner_key": hex}`: it builds the call itself (never client-supplied), pays through the normal sponsored path (whitelist, enforcing simulation, `record_sponsored_op` against the on-chain daily budget), and limits abuse per client IP per day (3) and globally per day (200). **Cost:** deploying an account pays its storage rent - **~1.82 XLM measured on a local network** (re-measure on testnet) - so account creation has its own fee cap (`ACCOUNT_MAX_FEE_STROOPS`, 3 XLM) separate from user calls (0.1 XLM). This is a real per-user acquisition cost.
+
 ## Fee Sponsorship Architecture
 
 ```
