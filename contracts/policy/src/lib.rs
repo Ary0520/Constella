@@ -367,6 +367,27 @@ pub trait PolicyContractTrait {
     fn get_admin(env: Env) -> Address;
 }
 
+
+/// A1 (storage rent): 30 days, renewed whenever an entry is used in a
+/// transaction (reads in simulations do not persist and renew nothing; the
+/// keeper's extend job covers idle entries).
+const DAY_LEDGERS: u32 = 17_280;
+const TTL_THRESHOLD: u32 = 29 * DAY_LEDGERS;
+const TTL_EXTEND_TO: u32 = 30 * DAY_LEDGERS;
+
+/// Renew the instance and this vault's records. Per-vault records are their
+/// own persistent entries: the instance is loaded on every call and has a
+/// size cap, so it must not grow with each factory vault.
+fn renew(env: &Env, vault: &Address) {
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
+    for key in [DataKey::PolicyConfig(vault.clone()), DataKey::SleeveTargets(vault.clone()),
+                DataKey::PendingUpdate(vault.clone()), DataKey::NoticePeriod(vault.clone())] {
+        if env.storage().persistent().has(&key) {
+            env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        }
+    }
+}
+
 #[contract]
 pub struct PolicyContract;
 
@@ -414,7 +435,7 @@ fn cmp_weight(value: i128, total: i128, bps: u32) -> Option<core::cmp::Ordering>
 /// Audit W1b: the checks behind `validate_holdings`.
 fn check_holdings(env: &Env, vault: &Address, holdings: &Vec<(Symbol, i128)>) -> Option<(PolicyError, &'static str)> {
     use core::cmp::Ordering::{Greater, Less};
-    let config: PolicyConfig = match env.storage().instance().get(&DataKey::PolicyConfig(vault.clone())) {
+    let config: PolicyConfig = match env.storage().persistent().get(&DataKey::PolicyConfig(vault.clone())) {
         Some(c) => c,
         None => return Some((PolicyError::PolicyNotFound, "POLICY_NOT_FOUND")),
     };
@@ -423,7 +444,7 @@ fn check_holdings(env: &Env, vault: &Address, holdings: &Vec<(Symbol, i128)>) ->
     }
     let targets: Vec<SleeveTarget> = env
         .storage()
-        .instance()
+        .persistent()
         .get(&DataKey::SleeveTargets(vault.clone()))
         .unwrap_or_else(|| Vec::new(env));
 
@@ -640,7 +661,7 @@ impl PolicyContractTrait for PolicyContract {
 
         if env
             .storage()
-            .instance()
+            .persistent()
             .has(&DataKey::PolicyConfig(vault.clone()))
         {
             panic_with_error!(&env, PolicyError::PolicyAlreadyRegistered);
@@ -683,11 +704,12 @@ impl PolicyContractTrait for PolicyContract {
         };
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::PolicyConfig(vault.clone()), &config);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::SleeveTargets(vault.clone()), &sleeves);
+        renew(&env, &vault);
 
         PolicyRegistered { vault, policy_hash, owner, terms_hash }.publish(&env);
     }
@@ -703,9 +725,10 @@ impl PolicyContractTrait for PolicyContract {
         rebalance_band_bps: u32,
         new_sleeves: Vec<SleeveTarget>,
     ) {
+        renew(&env, &vault);
         let config: PolicyConfig = match env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PolicyConfig(vault.clone()))
         {
             Some(cfg) => cfg,
@@ -726,7 +749,7 @@ impl PolicyContractTrait for PolicyContract {
         // D-A: the numéraire is fixed at binding (checked by the vault, which
         // is not consulted on amendments), so an amendment cannot add,
         // remove or change it.
-        let current: Vec<SleeveTarget> = env.storage().instance().get(&DataKey::SleeveTargets(vault.clone())).unwrap_or_else(|| Vec::new(&env));
+        let current: Vec<SleeveTarget> = env.storage().persistent().get(&DataKey::SleeveTargets(vault.clone())).unwrap_or_else(|| Vec::new(&env));
         if numeraire_of(&env, &new_sleeves) != numeraire_of(&env, &current) {
             panic_with_error!(&env, PolicyError::NumeraireSleeveInvalid);
         }
@@ -761,16 +784,17 @@ impl PolicyContractTrait for PolicyContract {
             effective_at,
         };
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::PendingUpdate(vault.clone()), &pending);
 
         PolicyUpdateProposed { vault, new_hash, effective_at, terms_hash }.publish(&env);
     }
 
     fn activate_policy_update(env: Env, vault: Address) {
+        renew(&env, &vault);
         let pending: PendingPolicyUpdate = match env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PendingUpdate(vault.clone()))
         {
             Some(p) => p,
@@ -781,7 +805,7 @@ impl PolicyContractTrait for PolicyContract {
         }
         let mut config: PolicyConfig = match env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PolicyConfig(vault.clone()))
         {
             Some(cfg) => cfg,
@@ -798,13 +822,13 @@ impl PolicyContractTrait for PolicyContract {
         config.terms_hash = pending.terms_hash.clone();
 
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::PolicyConfig(vault.clone()), &config);
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::SleeveTargets(vault.clone()), &pending.sleeves);
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::PendingUpdate(vault.clone()));
 
         PolicyUpdated {
@@ -817,9 +841,10 @@ impl PolicyContractTrait for PolicyContract {
     }
 
     fn cancel_policy_update(env: Env, vault: Address) {
+        renew(&env, &vault);
         let config: PolicyConfig = match env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PolicyConfig(vault.clone()))
         {
             Some(cfg) => cfg,
@@ -828,26 +853,28 @@ impl PolicyContractTrait for PolicyContract {
         config.owner.require_auth();
         let pending: PendingPolicyUpdate = match env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PendingUpdate(vault.clone()))
         {
             Some(p) => p,
             None => panic_with_error!(&env, PolicyError::NoPendingUpdate),
         };
         env.storage()
-            .instance()
+            .persistent()
             .remove(&DataKey::PendingUpdate(vault.clone()));
         PolicyUpdateCancelled { vault, new_hash: pending.new_hash }.publish(&env);
     }
 
     fn get_pending_policy_update(env: Env, vault: Address) -> Option<PendingPolicyUpdate> {
-        env.storage().instance().get(&DataKey::PendingUpdate(vault))
+        renew(&env, &vault);
+        env.storage().persistent().get(&DataKey::PendingUpdate(vault))
     }
 
     fn set_notice_period(env: Env, vault: Address, seconds: u64) {
+        renew(&env, &vault);
         let config: PolicyConfig = match env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PolicyConfig(vault.clone()))
         {
             Some(cfg) => cfg,
@@ -859,15 +886,16 @@ impl PolicyContractTrait for PolicyContract {
             panic_with_error!(&env, PolicyError::NoticeTooShort);
         }
         env.storage()
-            .instance()
+            .persistent()
             .set(&DataKey::NoticePeriod(vault.clone()), &seconds);
         PolicyNoticeSet { vault, previous_seconds: current, new_seconds: seconds }.publish(&env);
     }
 
     fn get_notice_period(env: Env, vault: Address) -> u64 {
+        renew(&env, &vault);
         let stored: u64 = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::NoticePeriod(vault))
             .unwrap_or(PROTOCOL_MIN_NOTICE_SECONDS);
         if stored < PROTOCOL_MIN_NOTICE_SECONDS {
@@ -878,9 +906,10 @@ impl PolicyContractTrait for PolicyContract {
     }
 
     fn get_policy_hash(env: Env, vault: Address) -> BytesN<32> {
+        renew(&env, &vault);
         match env
             .storage()
-            .instance()
+            .persistent()
             .get::<_, PolicyConfig>(&DataKey::PolicyConfig(vault))
         {
             Some(config) => config.policy_hash,
@@ -889,12 +918,14 @@ impl PolicyContractTrait for PolicyContract {
     }
 
     fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfig> {
-        env.storage().instance().get(&DataKey::PolicyConfig(vault))
+        renew(&env, &vault);
+        env.storage().persistent().get(&DataKey::PolicyConfig(vault))
     }
 
     fn get_sleeve_targets(env: Env, vault: Address) -> Vec<SleeveTarget> {
+        renew(&env, &vault);
         env.storage()
-            .instance()
+            .persistent()
             .get(&DataKey::SleeveTargets(vault))
             .unwrap_or_else(|| Vec::new(&env))
     }
@@ -904,9 +935,10 @@ impl PolicyContractTrait for PolicyContract {
         vault: Address,
         proposal: RebalanceProposal,
     ) -> ValidationResult {
+        renew(&env, &vault);
         let config: PolicyConfig = match env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::PolicyConfig(vault.clone()))
         {
             Some(c) => c,
@@ -1001,7 +1033,7 @@ impl PolicyContractTrait for PolicyContract {
         // 3. Verify each proposed weight is within [min_band_bps, max_band_bps] for declared sleeves
         let sleeves: Vec<SleeveTarget> = env
             .storage()
-            .instance()
+            .persistent()
             .get(&DataKey::SleeveTargets(vault.clone()))
             .unwrap_or_else(|| Vec::new(&env));
 
@@ -1268,6 +1300,7 @@ impl PolicyContractTrait for PolicyContract {
     }
 
     fn validate_holdings(env: Env, vault: Address, holdings: Vec<(Symbol, i128)>) -> ValidationResult {
+        renew(&env, &vault);
         verdict(&env, check_holdings(&env, &vault, &holdings))
     }
 

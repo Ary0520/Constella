@@ -639,6 +639,8 @@ pub trait PolicyInterface {
 }
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
+const CLAIM_TTL_THRESHOLD: u32 = 29 * 17_280;
+const CLAIM_TTL_EXTEND_TO: u32 = 30 * 17_280;
 
 fn get_config(env: &Env) -> VaultConfig {
     match env.storage().instance().get(&DataKey::Config) {
@@ -1592,6 +1594,9 @@ impl StrategyVault {
             let key = DataKey::Claim(receiver.clone(), asset.clone());
             let owed: i128 = env.storage().persistent().get(&key).unwrap_or(0);
             env.storage().persistent().set(&key, &(owed + units));
+            // A1: money owed must not archive; renewed on every write (the
+            // keeper's extend job covers claims that wait longer).
+            env.storage().persistent().extend_ttl(&key, CLAIM_TTL_THRESHOLD, CLAIM_TTL_EXTEND_TO);
             let total_key = DataKey::ClaimTotal(asset.clone());
             let total: i128 = env.storage().instance().get(&total_key).unwrap_or(0);
             env.storage().instance().set(&total_key, &(total + units));

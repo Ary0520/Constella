@@ -2336,9 +2336,8 @@ mod v6 {
         let env = &r.s.env;
         env.as_contract(&r.s.vault.address, || {
             let claim = (Symbol::new(env, "Claim"), alice.clone(), r.eurc.clone());
-            let total = (Symbol::new(env, "ClaimTotal"), r.eurc.clone());
             assert!(env.storage().persistent().get_ttl(&claim) >= 29 * 17_280);
-            assert!(env.storage().persistent().get_ttl(&total) >= 29 * 17_280);
+            // Claim totals are instance data, renewed on every vault call.
         });
     }
 

@@ -1182,6 +1182,13 @@ fn apply_source(env: &Env, source: &OracleSource) {
     record_snapshot(env, &source.asset);
 }
 
+/// A1 (storage rent): every call in a transaction renews the instance for
+/// 30 days (reads in simulations persist nothing; the keeper's extend job
+/// covers idle periods).
+fn bump(env: &Env) {
+    env.storage().instance().extend_ttl(29 * 17_280, 30 * 17_280);
+}
+
 #[contract]
 pub struct NavOracle;
 
@@ -1190,6 +1197,7 @@ impl NavOracle {
     /// Runs atomically as part of deployment, so no one can claim an
     /// uninitialized oracle (audit M3). There is no `initialize` entrypoint.
     pub fn __constructor(env: Env, admin: Address, base_asset: Address, decimals: u32, resolution: u32) {
+        bump(&env);
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::PauseAuthority, &admin);
         env.storage().instance().set(&DataKey::BaseAsset, &base_asset);
@@ -1209,6 +1217,7 @@ impl NavOracleTrait for NavOracle {
         deviation_threshold_bps: u32,
         min_valid_sources: u32,
     ) {
+        bump(&env);
         admin_of(&env).require_auth();
         if deviation_threshold_bps == 0
             || deviation_threshold_bps > MAX_DEVIATION_THRESHOLD_BPS
@@ -1233,6 +1242,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn register_source(env: Env, source: OracleSource) {
+        bump(&env);
         admin_of(&env).require_auth();
         validate_source(&env, &source);
         if is_pull_source(&env, &source.source_id) {
@@ -1252,6 +1262,7 @@ impl NavOracleTrait for NavOracle {
         liquidity_depth_usd: i128,
         timestamp: u64,
     ) {
+        bump(&env);
 
         let mut source: OracleSource = match env
             .storage()
@@ -1303,12 +1314,14 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice> {
+        bump(&env);
         // Audit O6: only a single-asset sleeve has a sleeve-level price.
         let asset = single_asset_of_sleeve(&env, &sleeve_id)?;
         Self::collateral_price(env, asset)
     }
 
     fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice> {
+        bump(&env);
         // Audit O6: only a single-asset sleeve has a sleeve-level price.
         let asset = single_asset_of_sleeve(&env, &sleeve_id)?;
         let valid_sources = evaluate_asset(&env, &asset).ok()?;
@@ -1316,6 +1329,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn collateral_price(env: Env, asset: Address) -> Option<SourcedPrice> {
+        bump(&env);
         if let Some(pos) = blend_position_of(&env, &asset) {
             return blend_price(&env, &pos, true);
         }
@@ -1334,6 +1348,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData> {
+        bump(&env);
         let Asset::Stellar(asset) = asset else { return None };
         if timestamp > env.ledger().timestamp() {
             return None;
@@ -1346,6 +1361,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn asset_price(env: Env, asset: Address) -> Option<SourcedPrice> {
+        bump(&env);
         let base: Address = env.storage().instance().get(&DataKey::BaseAsset)?;
         if asset == base {
             let decimals: u32 = env.storage().instance().get(&DataKey::Decimals)?;
@@ -1363,6 +1379,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn lastprice(env: Env, asset: Asset) -> Option<PriceData> {
+        bump(&env);
         // Audit W5: live evaluation. The former implementation returned a
         // stored price even after the sources went stale or the sleeve paused;
         // a consumer with a looser staleness window (Blend: 24h) would then
@@ -1372,6 +1389,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>> {
+        bump(&env);
         if records == 0 || records > MAX_PRICE_RECORDS {
             return None;
         }
@@ -1400,6 +1418,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn base(env: Env) -> Asset {
+        bump(&env);
         match base_asset(&env) {
             Some(a) => Asset::Stellar(a),
             None => panic_with_error!(&env, OracleError::NotInitialized),
@@ -1407,6 +1426,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn decimals(env: Env) -> u32 {
+        bump(&env);
         match env.storage().instance().get(&DataKey::Decimals) {
             Some(d) => d,
             None => panic_with_error!(&env, OracleError::NotInitialized),
@@ -1414,6 +1434,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn resolution(env: Env) -> u32 {
+        bump(&env);
         match env.storage().instance().get(&DataKey::Resolution) {
             Some(r) => r,
             None => panic_with_error!(&env, OracleError::NotInitialized),
@@ -1421,11 +1442,13 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn assets(env: Env) -> Vec<Asset> {
+        bump(&env);
         let all: Vec<Address> = env.storage().instance().get(&DataKey::AllAssets).unwrap_or_else(|| Vec::new(&env));
         Vec::from_iter(&env, all.iter().map(Asset::Stellar))
     }
 
     fn register_blend_position(env: Env, pool: Address, underlying: Address) {
+        bump(&env);
         admin_of(&env).require_auth();
         let taken = blend_position_of(&env, &pool).is_some()
             || env.storage().instance().has(&DataKey::AssetSleeve(pool.clone()))
@@ -1454,10 +1477,12 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn blend_position(env: Env, pool: Address) -> Option<BlendPosition> {
+        bump(&env);
         blend_position_of(&env, &pool)
     }
 
     fn set_blend_factory(env: Env, factory: Address) {
+        bump(&env);
         admin_of(&env).require_auth();
         if env.storage().instance().has(&DataKey::BlendFactory) {
             panic_with_error!(&env, OracleError::BlendFactoryAlreadySet);
@@ -1466,10 +1491,12 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn get_blend_factory(env: Env) -> Option<Address> {
+        bump(&env);
         env.storage().instance().get(&DataKey::BlendFactory)
     }
 
     fn is_sleeve_paused(env: Env, sleeve_id: Symbol) -> bool {
+        bump(&env);
         if let Some(config) = env
             .storage()
             .instance()
@@ -1482,6 +1509,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol) {
+        bump(&env);
         let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
             Some(a) => a,
             None => panic_with_error!(&env, OracleError::NotInitialized),
@@ -1560,6 +1588,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn clear_circuit_breaker(env: Env, sleeve_id: Symbol) {
+        bump(&env);
         let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
             Some(a) => a,
             None => panic_with_error!(&env, OracleError::NotInitialized),
@@ -1616,6 +1645,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn set_pause_authority(env: Env, new_authority: Address) {
+        bump(&env);
         let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
             Some(a) => a,
             None => panic_with_error!(&env, OracleError::NotInitialized),
@@ -1637,6 +1667,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn get_pause_authority(env: Env) -> Address {
+        bump(&env);
         let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
             Some(a) => a,
             None => panic_with_error!(&env, OracleError::NotInitialized),
@@ -1648,6 +1679,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn get_admin(env: Env) -> Address {
+        bump(&env);
         match env.storage().instance().get(&DataKey::Admin) {
             Some(a) => a,
             None => panic_with_error!(&env, OracleError::NotInitialized),
@@ -1655,14 +1687,17 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn get_source(env: Env, source_id: Symbol) -> Option<OracleSource> {
+        bump(&env);
         env.storage().instance().get(&DataKey::Source(source_id))
     }
 
     fn get_sleeve_config(env: Env, sleeve_id: Symbol) -> Option<SleeveOracleConfig> {
+        bump(&env);
         env.storage().instance().get(&DataKey::SleeveConfig(sleeve_id))
     }
 
     fn get_sleeve_sources(env: Env, sleeve_id: Symbol) -> Vec<Symbol> {
+        bump(&env);
         env.storage()
             .instance()
             .get(&DataKey::SleeveSources(sleeve_id))
@@ -1670,6 +1705,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn activate_source(env: Env, source_id: Symbol) {
+        bump(&env);
         let pending: PendingSource = env.storage().instance().get(&DataKey::PendingSource(source_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingSourceChange));
         if env.ledger().timestamp() < pending.effective_at {
@@ -1691,6 +1727,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn cancel_source_change(env: Env, source_id: Symbol) {
+        bump(&env);
         admin_of(&env).require_auth();
         let pending: PendingSource = env.storage().instance().get(&DataKey::PendingSource(source_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingSourceChange));
@@ -1699,6 +1736,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn deactivate_source(env: Env, source_id: Symbol) {
+        bump(&env);
         admin_of(&env).require_auth();
         let mut source: OracleSource = env.storage().instance().get(&DataKey::Source(source_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, OracleError::AssetNotFound));
@@ -1708,6 +1746,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn register_reflector_source(env: Env, source: OracleSource, config: ReflectorConfig) {
+        bump(&env);
         admin_of(&env).require_auth();
         validate_source(&env, &source);
         let id = source.source_id.clone();
@@ -1756,6 +1795,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn pull_price(env: Env, source_id: Symbol) -> Option<SourcedPrice> {
+        bump(&env);
         let source: OracleSource = env.storage().instance().get(&DataKey::Source(source_id.clone()))?;
         match live_price_of(&env, &source_id, &source) {
             Live::Valid(price, timestamp) => Some(SourcedPrice { price, timestamp, source: source_id }),
@@ -1764,10 +1804,12 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn get_pull_feed(env: Env, source_id: Symbol) -> Option<PullFeed> {
+        bump(&env);
         env.storage().instance().get(&DataKey::PullFeed(source_id))
     }
 
     fn register_redstone_source(env: Env, source: OracleSource, config: RedStoneConfig) {
+        bump(&env);
         admin_of(&env).require_auth();
         validate_source(&env, &source);
         let id = source.source_id.clone();
@@ -1792,10 +1834,12 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn get_redstone_feed(env: Env, source_id: Symbol) -> Option<RedStoneConfig> {
+        bump(&env);
         env.storage().instance().get(&DataKey::RedStoneFeed(source_id))
     }
 
     fn activate_sleeve_config(env: Env, sleeve_id: Symbol) {
+        bump(&env);
         let pending: PendingSleeveConfig = env.storage().instance().get(&DataKey::PendingSleeveConfig(sleeve_id.clone()))
             .unwrap_or_else(|| panic_with_error!(&env, OracleError::NoPendingSourceChange));
         if env.ledger().timestamp() < pending.effective_at {
@@ -1806,6 +1850,7 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn cancel_sleeve_config(env: Env, sleeve_id: Symbol) {
+        bump(&env);
         admin_of(&env).require_auth();
         if !env.storage().instance().has(&DataKey::PendingSleeveConfig(sleeve_id.clone())) {
             panic_with_error!(&env, OracleError::NoPendingSourceChange);
@@ -1814,14 +1859,17 @@ impl NavOracleTrait for NavOracle {
     }
 
     fn get_pending_sleeve_config(env: Env, sleeve_id: Symbol) -> Option<PendingSleeveConfig> {
+        bump(&env);
         env.storage().instance().get(&DataKey::PendingSleeveConfig(sleeve_id))
     }
 
     fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource> {
+        bump(&env);
         env.storage().instance().get(&DataKey::PendingSource(source_id))
     }
 
     fn get_sources(env: Env) -> Vec<OracleSource> {
+        bump(&env);
         let mut sources: Vec<OracleSource> = Vec::new(&env);
         let assets: Vec<Address> = env.storage().instance().get(&DataKey::AllAssets).unwrap_or_else(|| Vec::new(&env));
         for asset in assets.iter() {
