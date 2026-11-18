@@ -321,10 +321,11 @@ fn p3_admin_alone_cannot_replace_a_signed_policy() {
     }]);
     s.policy.update_policy(&s.vault_id, &amended, &1500, &10_000, &10_000, &50, &500, &targets);
     assert_eq!(s.env.auths()[0].0, owner);
-    // Audit P4: the amendment applies only after the notice period.
-    s.env.ledger().set_timestamp(T0 + constella_policy::PROTOCOL_MIN_NOTICE_SECONDS);
-    s.policy.activate_policy_update(&s.vault_id);
+    // Decision D-L: raising the cash floor only reduces risk, so the owner's
+    // re-signed amendment applies at once (looser terms wait 48 h: policy tests).
     assert_eq!(s.policy.get_policy_hash(&s.vault_id), amended);
+    assert_eq!(s.policy.get_policy_config(&s.vault_id).unwrap().min_liquidity_sleeve_bps, 1500);
+    assert!(s.policy.get_pending_policy_update(&s.vault_id).is_none());
 }
 
 // ---------------------------------------------------------------------------

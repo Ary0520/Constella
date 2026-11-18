@@ -1644,13 +1644,14 @@ mod p3 {
         }
         assert_eq!(policy.get_policy_config(&ctx.vault).unwrap().min_liquidity_sleeve_bps, 1000);
 
-        assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1500));
+        // A LOOSER floor (D-L: tightening would apply at once) - waits.
+        assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 800));
         assert_eq!(ctx.env.auths()[0].0, ctx.owner);
         // Audit P4: amendments apply only after the notice period.
         ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
         PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
         let cfg = policy.get_policy_config(&ctx.vault).unwrap();
-        assert_eq!((cfg.version, cfg.min_liquidity_sleeve_bps), (2, 1500));
+        assert_eq!((cfg.version, cfg.min_liquidity_sleeve_bps), (2, 800));
         assert_eq!(cfg.policy_hash, sample_hash(&ctx.env, 0x33));
     }
 
@@ -1664,13 +1665,13 @@ mod p3 {
         let before = policy.get_policy_config(&ctx.vault).unwrap().terms_hash;
         assert_eq!(before, expected);
 
-        assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 1500));
+        assert!(try_amend(&ctx, &ctx.owner, &sample_hash(&ctx.env, 0x33), 800)); // looser: waits (D-L)
         // Audit P4: amendments apply only after the notice period.
         ctx.env.ledger().set_timestamp(ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
         PolicyContractClient::new(&ctx.env, &ctx.policy_address).activate_policy_update(&ctx.vault);
         let after = policy.get_policy_config(&ctx.vault).unwrap().terms_hash;
         assert_ne!(after, before);
-        assert_eq!(after, compute_terms_hash(&ctx.env, &ctx.registry_address, 1500, 2500, 3000, 50, 500, &sleeves));
+        assert_eq!(after, compute_terms_hash(&ctx.env, &ctx.registry_address, 800, 2500, 3000, 50, 500, &sleeves));
     }
 
     #[test]
@@ -2054,9 +2055,10 @@ mod p4 {
     fn new_proposal_replaces_pending_and_restarts_clock() {
         let ctx = setup_test_context();
         let policy = registered(&ctx);
-        propose(&ctx, &policy, 0x02, 1500);
+        // Looser floors (D-L: a tightening would apply at once).
+        propose(&ctx, &policy, 0x02, 900);
         warp(&ctx, 24 * H);
-        propose(&ctx, &policy, 0x03, 2000);
+        propose(&ctx, &policy, 0x03, 800);
         warp(&ctx, 24 * H); // 48h after the FIRST proposal
         assert_eq!(policy.try_activate_policy_update(&ctx.vault).map(|_| ()), code(PolicyError::NoticeNotElapsed));
         warp(&ctx, 24 * H); // 48h after the replacement
@@ -2199,7 +2201,7 @@ fn golden_events_policy() {
     g.capture(env, "set_notice_period");
     p.cancel_policy_update(&ctx.vault);
     g.capture(env, "cancel_policy_update");
-    p.update_policy(&ctx.vault, &sample_hash(env, 3), &1500, &10000, &10000, &50, &500, &sleeves);
+    p.update_policy(&ctx.vault, &sample_hash(env, 3), &900, &10000, &10000, &50, &500, &sleeves); // looser: waits (D-L)
     env.ledger().set_timestamp(now + 72 * 3600);
     p.activate_policy_update(&ctx.vault);
     g.capture(env, "activate_policy_update");
@@ -2658,12 +2660,18 @@ mod dl {
 
     #[test]
     fn looser_or_mixed_limits_wait_the_full_notice() {
+        // Each case also tightens the issuer cap (3000 -> 2900), so the one
+        // looser term is the ONLY reason it must wait.
         let e = setup();
-        assert_eq!(amend(&e, 1000, 2600, 3000, 50, 500, base(&e.ctx.env)), (false, true), "looser single-asset cap");
+        assert_eq!(amend(&e, 1000, 2600, 2900, 50, 500, base(&e.ctx.env)), (false, true), "looser single-asset cap");
         let m = setup();
         assert_eq!(amend(&m, 2000, 2500, 3100, 50, 500, base(&m.ctx.env)), (false, true), "tighter floor but looser issuer cap");
         let b = setup();
-        assert_eq!(amend(&b, 1000, 2500, 3000, 50, 400, base(&b.ctx.env)), (false, true), "any band change waits");
+        assert_eq!(amend(&b, 1000, 2500, 2900, 50, 400, base(&b.ctx.env)), (false, true), "any band change waits");
+        let f = setup();
+        assert_eq!(amend(&f, 800, 2500, 2900, 50, 500, base(&f.ctx.env)), (false, true), "lower cash floor");
+        let l = setup();
+        assert_eq!(amend(&l, 1000, 2500, 2900, 60, 500, base(&l.ctx.env)), (false, true), "looser slippage");
     }
 
     #[test]
@@ -2689,7 +2697,8 @@ mod dl {
         for (why, sleeves) in cases {
             let t = setup();
             let s = sleeves(&t.ctx.env);
-            assert_eq!(amend(&t, 1000, 2500, 3000, 50, 500, s), (false, true), "{why}");
+            // With a genuine tightening alongside (issuer cap 2900): still waits.
+            assert_eq!(amend(&t, 1000, 2500, 2900, 50, 500, s), (false, true), "{why}");
         }
     }
 

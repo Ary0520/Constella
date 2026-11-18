@@ -388,6 +388,42 @@ fn renew(env: &Env, vault: &Address) {
     }
 }
 
+/// Decision D-L: true only if every term is at least as safe as today AND
+/// something actually changes toward safety. Conservative by construction:
+/// anything not listed as safer (band changes, new assets, changed types)
+/// takes the full notice.
+#[allow(clippy::too_many_arguments)]
+fn is_risk_reducing(env: &Env, cur: &PolicyConfig, cur_sleeves: &Vec<SleeveTarget>, floor: u32, single: u32, issuer: u32,
+                    slip: u32, band: u32, new_sleeves: &Vec<SleeveTarget>) -> bool {
+    if floor < cur.min_liquidity_sleeve_bps || single > cur.max_single_asset_bps || issuer > cur.max_issuer_bps
+        || slip > cur.max_slippage_bps || band != cur.rebalance_band_bps {
+        return false;
+    }
+    let mut changed = floor != cur.min_liquidity_sleeve_bps || single != cur.max_single_asset_bps
+        || issuer != cur.max_issuer_bps || slip != cur.max_slippage_bps;
+    for n in new_sleeves.iter() {
+        let Some(o) = cur_sleeves.iter().find(|o| o.asset_id == n.asset_id) else { return false }; // new asset
+        if o.sleeve_type != n.sleeve_type {
+            return false;
+        }
+        let ok = if is_numeraire_sleeve(env, &n.sleeve_type) {
+            // More vault currency is safer: nothing may go down.
+            n.target_weight_bps >= o.target_weight_bps && n.min_band_bps >= o.min_band_bps && n.max_band_bps >= o.max_band_bps
+        } else {
+            // Less of a risk asset is safer: nothing may go up.
+            n.target_weight_bps <= o.target_weight_bps && n.min_band_bps <= o.min_band_bps && n.max_band_bps <= o.max_band_bps
+        };
+        if !ok {
+            return false;
+        }
+        changed |= n != o;
+    }
+    // Removing a (non-numeraire) asset reduces risk; the numeraire cannot be
+    // removed (checked before this). Remaining risk-asset removals count as change.
+    changed |= cur_sleeves.len() != new_sleeves.len();
+    changed
+}
+
 #[contract]
 pub struct PolicyContract;
 
@@ -763,6 +799,27 @@ impl PolicyContractTrait for PolicyContract {
             rebalance_band_bps,
             &new_sleeves,
         );
+
+        // Decision D-L: a strictly risk-reducing amendment applies at once (a
+        // crisis needs no shortcut around the notice) and cancels any pending
+        // amendment, so an older, looser one can never land on top of it.
+        if is_risk_reducing(&env, &config, &current, min_liquidity_sleeve_bps, max_single_asset_bps, max_issuer_bps,
+                            max_slippage_bps, rebalance_band_bps, &new_sleeves) {
+            env.storage().persistent().remove(&DataKey::PendingUpdate(vault.clone()));
+            let mut config = config;
+            config.policy_hash = new_hash.clone();
+            config.version += 1;
+            config.min_liquidity_sleeve_bps = min_liquidity_sleeve_bps;
+            config.max_single_asset_bps = max_single_asset_bps;
+            config.max_issuer_bps = max_issuer_bps;
+            config.max_slippage_bps = max_slippage_bps;
+            config.terms_hash = terms_hash.clone();
+            env.storage().persistent().set(&DataKey::PolicyConfig(vault.clone()), &config);
+            env.storage().persistent().set(&DataKey::SleeveTargets(vault.clone()), &new_sleeves);
+            renew(&env, &vault);
+            PolicyUpdated { vault, new_hash, version: config.version, terms_hash }.publish(&env);
+            return;
+        }
 
         // Audit P4: schedule, do not apply. Holders keep the current terms for
         // the full notice period and can exit before the change lands.
