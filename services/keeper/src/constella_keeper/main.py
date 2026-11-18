@@ -31,7 +31,9 @@ from stellar_sdk import scval, xdr
 
 from constella_keeper.chain import (Chain, ChainError, code_key, data_key, enum_key, instance_key, proposal_scval,
                                     scalar_addr)
-from constella_keeper.planner import PlanError, plan
+from constella_keeper.planner import PlanError, plan, plan_raise_cash
+
+EXCEEDS_REDEMPTION_CAPACITY = "Error(Contract, #8)"
 
 
 def log(**kw) -> None:
@@ -113,9 +115,18 @@ def settle_claims(chain: Chain, vault: str, state: Dict, dry_run: bool) -> list:
         if dry_run:
             still.append([holder, asset]); out.append({"claim": holder, "asset": asset, "action": "dry-run"}); continue
         try:
-            res = chain.submit(vault, "settle_claim", scval.to_address(holder), scval.to_address(asset))
+            try:
+                res = chain.submit(vault, "settle_claim", scval.to_address(holder), scval.to_address(asset))
+            except ChainError as e:
+                if EXCEEDS_REDEMPTION_CAPACITY not in str(e):
+                    raise
+                # A5: not enough cash - raise exactly what is missing through a
+                # policy-validated rebalance, then settle.
+                raised = raise_cash_for_claim(chain, vault, asset, owed)
+                out.append({"claim": holder, "asset": asset, "action": "raised-cash", **raised})
+                res = chain.submit(vault, "settle_claim", scval.to_address(holder), scval.to_address(asset))
             out.append({"claim": holder, "asset": asset, "action": "settled", **res})
-        except ChainError as e:  # still unpriced or not enough cash yet: retry next tick
+        except (ChainError, PlanError) as e:  # still unpriced or no cash can be raised yet: retry next tick
             still.append([holder, asset])
             out.append({"claim": holder, "asset": asset, "action": "pending", "reason": str(e)[:200]})
     vs["claims"] = still
@@ -155,6 +166,25 @@ def renew_storage(chain: Chain, vaults, state: Dict, min_days: int, extend_days:
     return result
 
 
+def raise_cash_for_claim(chain: Chain, vault: str, asset: str, owed: int) -> Dict:
+    st = chain.vault_state(vault)
+    by = {s.address: s for s in st["sleeves"]}
+    claim_asset, hub = by.get(asset), next(s for s in st["sleeves"] if s.is_cash)
+    if claim_asset is None or claim_asset.price is None:
+        raise PlanError("claim asset not priced")
+    # Settlement pays units x conservative price; 1 % headroom for price moves.
+    owed_value = owed * claim_asset.price // 10 ** claim_asset.decimals
+    need = owed_value * 101 // 100 - hub.held
+    router = st["router"]
+    p = plan_raise_cash(st["sleeves"], st["scale"], st["max_slippage_bps"],
+                        lambda a, b, amt: chain.soroswap_quote(router, a, b, amt), need, prefer=asset)
+    prop = proposal_scval(vault, st["policy_hash"], p, chain.ledger_time() + 300, chain.keeper)
+    verdict = chain.validate(st["policy"], vault, prop)
+    if not verdict["is_valid"]:
+        raise PlanError(f"policy rejected raising cash: code {verdict['code']} {verdict['message']}")
+    return {"raised_at_least": need, **chain.submit(vault, "rebalance", prop)}
+
+
 def tick(chain: Chain, vaults, state: Dict, dry_run: bool, deadline_s: int,
          ttl_min_days: int = 20, ttl_extend_days: int = 30) -> None:
     for v in vaults:
@@ -184,6 +214,14 @@ def cli() -> None:
     dry = env.get("KEEPER_DRY_RUN") == "1"
     deadline_s = int(env.get("KEEPER_DEADLINE_SECONDS", "300"))
     interval = int(env.get("KEEPER_INTERVAL_SECONDS", "300"))
+    # A5: one keeper process per key on a host (two would race on the account
+    # sequence). Across hosts: run exactly one keeper per key.
+    import fcntl
+    lock = open(env.get("KEEPER_LOCK_FILE", state_file + ".lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit("another keeper process holds the lock")
     log(action="start", keeper=chain.keeper, vaults=vaults, dry_run=dry)
     while True:
         state = load_state(state_file)

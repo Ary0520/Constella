@@ -116,3 +116,27 @@ def test_an_unpriced_sleeve_blocks_the_plan_even_if_it_would_not_trade():
          Sleeve("X", "CX", 1000, 200, 2_000 * ONE, ONE, False)]
     with pytest.raises(PlanError, match="EURC has no valid oracle price"):
         plan(s, ONE, 200, 50, lambda a, b, amt: amt)
+
+
+def test_raising_cash_sells_the_claim_asset_first_and_covers_the_need():
+    from constella_keeper.planner import plan_raise_cash
+    s = [usdc(100 * ONE, target=3000), eurc(700 * ONE, target=7000)]
+    need = 400 * ONE
+    p = plan_raise_cash(s, ONE, 50, fair, need, prefer=EURC)
+    assert [(o.asset_in, o.asset_out) for o in p.operations] == [(EURC, USDC)]
+    assert sum(o.min_amount_out for o in p.operations) >= need
+    assert all(policy_accepts(o, s, 50) for o in p.operations)
+    # ... and only just: one unit less would not cover it at the minimum.
+    op = p.operations[0]
+    smaller = min_out_for(s[1], s[0], op.amount_in - 1, 50)
+    assert smaller < need
+
+
+def test_raising_cash_refuses_what_cannot_be_raised_or_an_off_oracle_pool():
+    from constella_keeper.planner import plan_raise_cash
+    s = [usdc(100 * ONE, target=3000), eurc(10 * ONE, target=7000)]
+    with pytest.raises(PlanError, match="cannot raise"):
+        plan_raise_cash(s, ONE, 50, fair, 400 * ONE, prefer=EURC)
+    s = [usdc(100 * ONE, target=3000), eurc(700 * ONE, target=7000)]
+    with pytest.raises(PlanError, match="below the oracle minimum"):
+        plan_raise_cash(s, ONE, 50, lambda a, b, amt: fair(a, b, amt) * 98 // 100, 400 * ONE, prefer=EURC)

@@ -5,6 +5,8 @@
 #      'numeraire' / 15 % EURC) -> the keeper rebalances through Soroswap,
 #      validated by the signed policy, and the vault lands in its bands;
 #   2. a second run does nothing (in band);
+#   2b. a cash-light vault: a frozen-sleeve claim larger than the cash -> the keeper raises cash
+#      (policy-validated rebalance), then settles;
 #   3. a whale moves the pool off the oracle price, new deposit -> the keeper
 #      refuses to trade (nothing sent);
 #   4. a key that is not the vault's keeper does nothing;
@@ -87,9 +89,9 @@ ROUTER=$(deploy_wasm /swasm/soroswap_router_mainnet.wasm)
 invoke admin --id $ROUTER -- initialize --factory $FACTORY
 trust() { cli tx new change-trust --source "$1" --line "$2:$ISSUER" >/dev/null 2>"$WORK/err" || fail "trustline $1 $2: $(tail -3 "$WORK/err")"; }
 trust lp USDC; trust lp EURC; trust user USDC
-invoke issuer --id $USDC -- mint --to $LP --amount 20000000000000
-invoke issuer --id $EURC -- mint --to $LP --amount 10000000000000
-invoke lp --id $ROUTER -- add_liquidity --token_a $USDC --token_b $EURC --amount_a_desired 10800000000000 --amount_b_desired 10000000000000 --amount_a_min 0 --amount_b_min 0 --to $LP --deadline 4102444800
+invoke issuer --id $USDC -- mint --to $LP --amount 200000000000000
+invoke issuer --id $EURC -- mint --to $LP --amount 100000000000000
+invoke lp --id $ROUTER -- add_liquidity --token_a $USDC --token_b $EURC --amount_a_desired 108000000000000 --amount_b_desired 100000000000000 --amount_a_min 0 --amount_b_min 0 --to $LP --deadline 4102444800
 
 # Cash Reserve policy (D-A): USDC = vault currency ('numeraire'), 85 / 15, real caps.
 invoke admin --id $VAULT -- bind_policy --owner $ADMIN --policy_hash $(printf 'c%.0s' $(seq 1 64)) --min_liquidity_sleeve_bps 1000 --max_single_asset_bps 2500 --max_issuer_bps 3000 --max_slippage_bps 50 --rebalance_band_bps 200 \
@@ -118,8 +120,32 @@ python3 -c "e=int('$E'.strip('\"')); v=e*1.08/(e*1.08+(100000000000-1500*10**7))
 echo "--- 2. in band -> nothing"; out=$(keeper "$KS"); echo "$out"
 echo "$out" | grep -q '"action": "none"' || fail "expected no action"
 
+echo "--- 2b. cash-light vault: a claim larger than the cash -> keeper raises cash, then settles (A5)"
+VAULT2=$(deploy_wasm /wasm/constella_vault_strategy.wasm -- --config "{\"admin\":\"$ADMIN\",\"pause_authority\":\"$ADMIN\",\"numeraire\":\"$USDC\",\"policy_contract\":\"$POLICY\",\"oracle_contract\":\"$ORACLE\",\"registry_contract\":\"$REGISTRY\",\"treasury\":\"$ADMIN\",\"performance_fee_bps\":1000,\"tvl_cap\":\"10000000000000\",\"per_user_cap\":\"1000000000000\"}" --name "Constella Euro Tilt" --symbol CET --decimals 7)
+invoke admin --id $VAULT2 -- bind_policy --owner $ADMIN --policy_hash $(printf 'd%.0s' $(seq 1 64)) --min_liquidity_sleeve_bps 1000 --max_single_asset_bps 10000 --max_issuer_bps 10000 --max_slippage_bps 50 --rebalance_band_bps 200 \
+  --sleeves '[{"asset_id":"USDC","target_weight_bps":3000,"min_band_bps":0,"max_band_bps":10000,"sleeve_type":"numeraire"},{"asset_id":"EURC","target_weight_bps":7000,"min_band_bps":0,"max_band_bps":10000,"sleeve_type":"cash"}]'
+invoke admin --id $VAULT2 -- set_sleeves --sleeves "[{\"asset_id\":\"USDC\",\"contract_address\":\"$USDC\",\"target_weight_bps\":3000,\"band_bps\":200,\"current_balance\":\"0\",\"sleeve_type\":0,\"liquidity_tier\":0},{\"asset_id\":\"EURC\",\"contract_address\":\"$EURC\",\"target_weight_bps\":7000,\"band_bps\":200,\"current_balance\":\"0\",\"sleeve_type\":2,\"liquidity_tier\":0}]"
+invoke admin --id $VAULT2 -- set_keeper --keeper $KEEPER
+invoke admin --id $VAULT2 -- propose_router --route 1 --router $ROUTER
+invoke issuer --id $USDC -- mint --to $USER --amount 100000000000
+invoke user --id $VAULT2 -- deposit --assets 100000000000 --receiver $USER --from $USER --operator $USER
+keeper2() { docker run --rm --network $NET -v "$ROOT/services/keeper:/svc" -v "$WORK:/work" -w /svc \
+  -e CONSTELLA_RPC_URL=$RPC -e "CONSTELLA_NETWORK_PASSPHRASE=$PASS" -e KEEPER_SECRET="$KS" -e KEEPER_VAULTS=$VAULT2 \
+  -e KEEPER_ONCE=1 -e KEEPER_STATE_FILE=/work/keeper2_state.json $PY_IMAGE \
+  sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; constella-keeper' 2>&1 | grep '"vault"'; }
+out=$(keeper2); echo "$out"; echo "$out" | grep -q '"action": "rebalanced"' || fail "vault2 not rebalanced to 30/70"
+invoke admin --id $ORACLE -- trigger_circuit_breaker --caller $ADMIN --sleeve_id CASH --reason E2E2
+S2=$(view --id $VAULT2 -- balance --id $USER | tr -d '"')
+invoke user --id $VAULT2 -- redeem_frozen --shares $((S2 / 2)) --receiver $USER --owner $USER --operator $USER
+invoke admin --id $ORACLE -- clear_circuit_breaker --sleeve_id CASH
+OWED2=$(view --id $VAULT2 -- get_claim --holder $USER --asset $EURC | tr -d '"'); echo "claim: $OWED2 EURC units; vault cash before: $(view --id $USDC -- balance --id $VAULT2)"
+out=$(keeper2); echo "$out"
+echo "$out" | grep -q '"action": "raised-cash"' || fail "keeper did not raise cash for the claim"
+echo "$out" | grep -q '"action": "settled"' || fail "claim not settled after raising cash"
+[ "$(view --id $VAULT2 -- get_claim --holder $USER --asset $EURC | tr -d '"')" = "0" ] || fail "vault2 claim still open"
+
 echo "--- 3. pool pushed off the oracle, new deposit -> refused"
-invoke lp --id $ROUTER -- swap_exact_tokens_for_tokens --amount_in 3000000000000 --amount_out_min 0 --path "[\"$USDC\",\"$EURC\"]" --to $LP --deadline 4102444800
+invoke lp --id $ROUTER -- swap_exact_tokens_for_tokens --amount_in 30000000000000 --amount_out_min 0 --path "[\"$USDC\",\"$EURC\"]" --to $LP --deadline 4102444800
 invoke user --id $VAULT -- deposit --assets 100000000000 --receiver $USER --from $USER --operator $USER
 before=$(eurc_held); out=$(keeper "$KS"); echo "$out"
 echo "$out" | grep -q '"action": "refused"' || fail "expected a refusal"
@@ -176,12 +202,13 @@ watchdog() { docker run --rm --network $NET -v "$ROOT/services/watchdog:/svc" -v
   $PY_IMAGE sh -c 'pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; constella-watchdog' 2>&1 | grep '"action"'; }
 out=$(watchdog); echo "$out"
 echo "$out" | grep -q '"failing": 2' || fail "expected exactly 2 failing checks (paused vault, low keeper balance)"
-sleep 2; mails=$(docker logs $SINK 2>&1)
-echo "$mails" | grep -q "Subject: \[Constella local\] ALERT: vault .* is PAUSED" || fail "no paused-vault alert email"
-echo "$mails" | grep -q "Subject: \[Constella local\] ALERT: keeper balance" || fail "no low-balance alert email"
+# The sink prints asynchronously: poll its log (up to 30 s) instead of a fixed wait.
+mail_seen() { for i in $(seq 1 30); do docker logs $SINK 2>&1 | grep -q "$1" && return 0; sleep 1; done; return 1; }
+mail_seen "Subject: \[Constella local\] ALERT: vault .* is PAUSED" || fail "no paused-vault alert email"
+mail_seen "Subject: \[Constella local\] ALERT: keeper balance" || fail "no low-balance alert email"
 invoke admin --id $VAULT -- unpause
 out=$(watchdog); echo "$out"
-sleep 2; docker logs $SINK 2>&1 | grep -q "Subject: \[Constella local\] RESOLVED: vault .* is running" || fail "no RESOLVED email"
+mail_seen "Subject: \[Constella local\] RESOLVED: vault .* is running" || fail "no RESOLVED email"
 out=$(watchdog); echo "$out" | grep -q '"notices": 0' || fail "a healthy re-check must not email again"
 docker rm -f $SINK >/dev/null 2>&1 || true
 echo "WATCHDOG PASS"

@@ -186,3 +186,52 @@ def plan(sleeves: List[Sleeve], scale: int, default_band_bps: int, max_slippage_
         return None
     ids = [s.asset_id for s in sleeves]
     return Plan(ops, list(zip(ids, to_bps([after[i] for i in ids]))), drift)
+
+
+def plan_raise_cash(sleeves: List[Sleeve], scale: int, max_slippage_bps: int, quote: Quote, need: int,
+                    prefer: Optional[str] = None) -> Plan:
+    """A proposal that turns non-cash holdings into at least `need` units of
+    the vault currency (audit A5: claims are paid in cash). Sells `prefer`
+    (the claim's own asset) first, then the largest holdings; every leg's
+    minimum is policy-exact, and the sum of the minimums covers `need`."""
+    cash = [s for s in sleeves if s.is_cash]
+    if len(cash) != 1:
+        raise PlanError("exactly one cash (vault currency) sleeve is required")
+    hub = cash[0]
+    if need <= 0:
+        raise PlanError("nothing to raise")
+    order = sorted((s for s in sleeves if not s.is_cash and s.held > 0),
+                   key=lambda s: (s.address != prefer, -value(s, scale)))
+    ops: List[Trade] = []
+    after = {s.asset_id: value(s, scale) for s in sleeves}
+    raised = 0
+    keep = 10000 - max_slippage_bps
+    for s in order:
+        if raised >= need:
+            break
+        if s.price is None or s.price <= 0:
+            continue
+        remaining = need - raised
+        # Units whose policy minimum covers `remaining`: value_in * keep >= remaining.
+        # The SMALLEST number of units whose policy minimum covers `remaining`
+        # (estimate, then exact adjustment), capped at what is held.
+        units = max(1, -(-remaining * 10000 * 10 ** s.decimals // (keep * s.price)))
+        while units > 1 and min_out_for(s, hub, units - 1, max_slippage_bps) >= remaining:
+            units -= 1
+        while min_out_for(s, hub, units, max_slippage_bps) < remaining and units < s.held:
+            units += 1
+        units = min(units, s.held)
+        min_out = min_out_for(s, hub, units, max_slippage_bps)
+        if not s.is_blend:
+            q = quote(s.address, hub.address, units)
+            if q < min_out:
+                raise PlanError(f"{s.asset_id}->{hub.asset_id}: pool quote {q} is below the oracle minimum {min_out}")
+        ops.append(Trade(s.address, hub.address, units, min_out, ROUTE_BLEND if s.is_blend else ROUTE_SOROSWAP))
+        out_value = units * s.price // 10 ** s.decimals
+        after[s.asset_id] -= out_value
+        after[hub.asset_id] += out_value
+        raised += min_out
+    if raised < need:
+        raise PlanError(f"cannot raise {need}: only {raised} available from priced holdings")
+    ids = [s.asset_id for s in sleeves]
+    return Plan(ops, list(zip(ids, to_bps([max(after[i], 0) for i in ids]))))
