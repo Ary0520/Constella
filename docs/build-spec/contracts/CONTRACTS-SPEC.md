@@ -92,6 +92,10 @@ fn validate_rebalance(env: Env, vault: Address, proposal: RebalanceProposal) -> 
 // Audit W1b: checks ACTUAL holdings, (registry asset_id, value in numéraire) per sleeve, against
 // every band, the single-asset and issuer caps and the cash floor. Exact (no rounding), read-only.
 fn validate_holdings(env: Env, vault: Address, holdings: Vec<(Symbol, i128)>) -> ValidationResult
+// Decision D-L (resolves P5): update_policy APPLIES AT ONCE (and cancels any pending amendment) only if
+// the amendment strictly reduces risk: floor >=, single/issuer caps <=, slippage <=, band unchanged, no new
+// or retyped asset, risk sleeves only lower target/bands, the numeraire sleeve only raises them, and
+// something changes. Everything else is scheduled for the full notice (>= 48 h). No short-notice mode.
 // Decision D-A / A1b: the signed sleeve with sleeve_type "numeraire" (exact spelling; at most one;
 // an active registry cash asset; fixed at binding, cannot change by amendment) is the vault currency:
 // counted as cash for the floor, EXEMPT from max_single_asset_bps and max_issuer_bps in both checks.
