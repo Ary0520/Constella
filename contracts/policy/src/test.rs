@@ -2609,3 +2609,105 @@ mod a1_rent {
         });
     }
 }
+
+// ---------------------------------------------------------------------------
+// Decision D-L (resolves P5): no short-notice mode for anyone. A strictly
+// risk-REDUCING amendment applies immediately (and cancels any pending one);
+// anything else - looser, mixed, new assets, changed types or bands - waits
+// the full notice. Owner auth is required either way.
+// ---------------------------------------------------------------------------
+mod dl {
+    use super::*;
+
+    fn st(env: &Env, id: &str, target: u32, lo: u32, hi: u32, kind: &str) -> SleeveTarget {
+        SleeveTarget { asset_id: Symbol::new(env, id), target_weight_bps: target, min_band_bps: lo, max_band_bps: hi,
+            sleeve_type: Symbol::new(env, kind) }
+    }
+
+    /// USDC numeraire 85 % [80,90], EURC 10 % [5,15], BENJI 5 % [0,10].
+    fn base(env: &Env) -> Vec<SleeveTarget> {
+        vec![env, st(env, "CIRCLE_USDC", 8500, 8000, 9000, "numeraire"), st(env, "CIRCLE_EURC", 1000, 500, 1500, "cash"),
+            st(env, "FRANKLIN_BENJI", 500, 0, 1000, "usd_gov_fund")]
+    }
+
+    struct T { ctx: TestContext, vault: Address }
+
+    fn setup() -> T {
+        let ctx = setup_test_context();
+        let vault = Address::generate(&ctx.env);
+        PolicyContractClient::new(&ctx.env, &ctx.policy_address).register_policy(&vault, &ctx.owner, &sample_hash(&ctx.env, 0xd0),
+            &ctx.registry_address, &1000, &2500, &3000, &50, &500, &base(&ctx.env));
+        T { ctx, vault }
+    }
+
+    /// (applied immediately?, pending?) after amending with these terms.
+    fn amend(t: &T, floor: u32, single: u32, issuer: u32, slip: u32, band: u32, sleeves: Vec<SleeveTarget>) -> (bool, bool) {
+        let p = PolicyContractClient::new(&t.ctx.env, &t.ctx.policy_address);
+        let before = p.get_policy_config(&t.vault).unwrap().version;
+        p.update_policy(&t.vault, &sample_hash(&t.ctx.env, 0xd1), &floor, &single, &issuer, &slip, &band, &sleeves);
+        (p.get_policy_config(&t.vault).unwrap().version > before, p.get_pending_policy_update(&t.vault).is_some())
+    }
+
+    #[test]
+    fn tighter_limits_apply_at_once() {
+        let t = setup();
+        assert_eq!(amend(&t, 1500, 2000, 2500, 30, 500, base(&t.ctx.env)), (true, false));
+        let c = PolicyContractClient::new(&t.ctx.env, &t.ctx.policy_address).get_policy_config(&t.vault).unwrap();
+        assert_eq!((c.min_liquidity_sleeve_bps, c.max_single_asset_bps, c.max_issuer_bps, c.max_slippage_bps), (1500, 2000, 2500, 30));
+    }
+
+    #[test]
+    fn looser_or_mixed_limits_wait_the_full_notice() {
+        let e = setup();
+        assert_eq!(amend(&e, 1000, 2600, 3000, 50, 500, base(&e.ctx.env)), (false, true), "looser single-asset cap");
+        let m = setup();
+        assert_eq!(amend(&m, 2000, 2500, 3100, 50, 500, base(&m.ctx.env)), (false, true), "tighter floor but looser issuer cap");
+        let b = setup();
+        assert_eq!(amend(&b, 1000, 2500, 3000, 50, 400, base(&b.ctx.env)), (false, true), "any band change waits");
+    }
+
+    #[test]
+    fn de_risking_the_sleeves_applies_at_once() {
+        let t = setup();
+        let env = &t.ctx.env;
+        // Drop BENJI, cut EURC; the vault currency takes the weight.
+        let safer = vec![env, st(env, "CIRCLE_USDC", 9500, 9000, 10000, "numeraire"), st(env, "CIRCLE_EURC", 500, 0, 1000, "cash")];
+        assert_eq!(amend(&t, 1000, 2500, 3000, 50, 500, safer.clone()), (true, false));
+        assert_eq!(PolicyContractClient::new(env, &t.ctx.policy_address).get_sleeve_targets(&t.vault), safer);
+    }
+
+    #[test]
+    fn adding_raising_or_retyping_a_risk_asset_waits() {
+        type Make = fn(&Env) -> Vec<SleeveTarget>;
+        let cases: [(&str, Make); 5] = [
+            ("raise BENJI", |e: &Env| vec![e, st(e, "CIRCLE_USDC", 8000, 7500, 9000, "numeraire"), st(e, "CIRCLE_EURC", 1000, 500, 1500, "cash"), st(e, "FRANKLIN_BENJI", 1000, 0, 1500, "usd_gov_fund")]),
+            ("new asset", |e: &Env| vec![e, st(e, "CIRCLE_USDC", 8500, 8000, 9000, "numeraire"), st(e, "CIRCLE_EURC", 1000, 500, 1500, "cash"), st(e, "FRANKLIN_BENJI", 0, 0, 0, "usd_gov_fund"), st(e, "SPIKO_EUSTBL", 500, 0, 1000, "eur_sovereign")]),
+            ("retype EURC", |e: &Env| vec![e, st(e, "CIRCLE_USDC", 8500, 8000, 9000, "numeraire"), st(e, "CIRCLE_EURC", 1000, 500, 1500, "eur_sovereign"), st(e, "FRANKLIN_BENJI", 500, 0, 1000, "usd_gov_fund")]),
+            ("less cash allowed", |e: &Env| vec![e, st(e, "CIRCLE_USDC", 8500, 8000, 8900, "numeraire"), st(e, "CIRCLE_EURC", 1000, 500, 1500, "cash"), st(e, "FRANKLIN_BENJI", 500, 0, 1000, "usd_gov_fund")]),
+            ("raise a risk floor", |e: &Env| vec![e, st(e, "CIRCLE_USDC", 8500, 8000, 9000, "numeraire"), st(e, "CIRCLE_EURC", 1000, 500, 1500, "cash"), st(e, "FRANKLIN_BENJI", 500, 200, 1000, "usd_gov_fund")]),
+        ];
+        for (why, sleeves) in cases {
+            let t = setup();
+            let s = sleeves(&t.ctx.env);
+            assert_eq!(amend(&t, 1000, 2500, 3000, 50, 500, s), (false, true), "{why}");
+        }
+    }
+
+    #[test]
+    fn an_immediate_tightening_cancels_a_pending_loosening() {
+        let t = setup();
+        assert_eq!(amend(&t, 1000, 2600, 3000, 50, 500, base(&t.ctx.env)), (false, true));
+        assert_eq!(amend(&t, 1200, 2500, 3000, 50, 500, base(&t.ctx.env)), (true, false));
+        let p = PolicyContractClient::new(&t.ctx.env, &t.ctx.policy_address);
+        t.ctx.env.ledger().set_timestamp(t.ctx.env.ledger().timestamp() + PROTOCOL_MIN_NOTICE_SECONDS);
+        assert!(p.try_activate_policy_update(&t.vault).is_err(), "the old loosening cannot land later");
+        assert_eq!(p.get_policy_config(&t.vault).unwrap().max_single_asset_bps, 2500);
+    }
+
+    #[test]
+    fn identical_terms_change_nothing_immediately_only_by_notice() {
+        // Same limits and sleeves with a new hash is not "risk-reducing": it waits.
+        let t = setup();
+        assert_eq!(amend(&t, 1000, 2500, 3000, 50, 500, base(&t.ctx.env)), (false, true));
+    }
+}
