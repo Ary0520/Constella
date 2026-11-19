@@ -18,7 +18,8 @@ Configuration (environment only - the secret is never logged):
   ACCOUNT_FACTORY_ID (enables /accounts, audit A2), ACCOUNTS_PER_IP_PER_DAY (3),
   ACCOUNTS_PER_DAY (200), ACCOUNT_MAX_FEE_STROOPS (30_000_000: an account
   deployment pays its storage rent), RELAYER_TRUST_PROXY=1 (use X-Forwarded-For's first
-  address as the client; only behind your own proxy).
+  address as the client; only behind your own proxy), RELAYER_CORS_ORIGIN
+  (unset = no CORS headers; set to one browser origin, e.g. the sandbox).
 """
 from __future__ import annotations
 
@@ -51,7 +52,7 @@ def parse_allowed(spec: str) -> dict[str, frozenset[str]]:
 
 
 def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimiter | None = None,
-                 trust_proxy: bool = False):
+                 trust_proxy: bool = False, cors_origin: str | None = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "constella-relayer"
 
@@ -62,9 +63,15 @@ def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimi
             data = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
+            if cors_origin:  # opt-in, one origin (e.g. the local sandbox console)
+                self.send_header("Access-Control-Allow-Origin", cors_origin)
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
+
+        def do_OPTIONS(self):
+            self._reply(204, {})
 
         def do_GET(self):
             if self.path == "/health":
@@ -125,7 +132,7 @@ def cli() -> None:
     sys.stderr.write(f"constella-relayer pool of {len(relayer.keypairs)} on {host}:{port}\n")
     factory = env.get("ACCOUNT_FACTORY_ID") or None
     limiter = RateLimiter(int(env.get("ACCOUNTS_PER_IP_PER_DAY", "3")), int(env.get("ACCOUNTS_PER_DAY", "200")))
-    handler = make_handler(relayer, factory, limiter, env.get("RELAYER_TRUST_PROXY") == "1")
+    handler = make_handler(relayer, factory, limiter, env.get("RELAYER_TRUST_PROXY") == "1", env.get("RELAYER_CORS_ORIGIN") or None)
     ThreadingHTTPServer((host, port), handler).serve_forever()
 
 
