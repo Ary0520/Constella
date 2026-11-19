@@ -5,7 +5,7 @@
  * keys from config.json (local network only).
  */
 import { Address, Keypair, nativeToScVal, Operation, rpc, scValToNative, TransactionBuilder, xdr } from "@stellar/stellar-sdk";
-import { attachSignature, getAssertion, signingInput } from "./passkey";
+import { Assertion, attachSignature, getAssertion, signingInput } from "./passkey";
 
 const X = xdr as any;
 
@@ -72,7 +72,8 @@ export class Chain {
 
   /** Zero-XLM user call: relayer prepares the auth entries, the PASSKEY signs
    * them in this browser, the relayer pays and submits. */
-  async sponsored(account: Passkey, contract: string, fn: string, args: xdr.ScVal[]): Promise<any> {
+  async sponsored(account: Passkey, contract: string, fn: string, args: xdr.ScVal[],
+                  assert: (credentialId: string, challenge: Uint8Array) => Promise<Assertion> = getAssertion): Promise<any> {
     const func = funcB64(contract, fn, args);
     const { auth, latest_ledger } = await this.relayer("/prepare", { func });
     const rule = Number(await this.view(account.address, "get_owner_rule"));
@@ -81,7 +82,7 @@ export class Chain {
     for (const entryXdr of auth) {
       const input = signingInput(entryXdr, validUntil, this.cfg.network.passphrase, rule);
       if (input.account !== account.address) { signed.push(entryXdr); continue; }
-      const assertion = await getAssertion(account.credentialId, input.challenge);
+      const assertion = await assert(account.credentialId, input.challenge);
       signed.push(attachSignature(input, this.cfg.contracts.verifier, account.publicKey, assertion));
     }
     return this.relayer("/submit", { func, auth: signed });

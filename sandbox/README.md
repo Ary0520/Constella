@@ -17,6 +17,9 @@ history), passkey account created by the relayer (zero XLM), deposit / redeem si
 browser and paid by the relayer, AI thesis -> signed policy (+ exact on-chain terms), frozen asset -> claim ->
 keeper settles, Collateral Passport share price, admin pause.
 
+`npm run test:stack` runs the console's own code against the live stack (software passkey in place of the
+browser): account, sponsored deposit, keeper rebalance, frozen claim settled, Collateral Passport, thesis API.
+
 Passkeys need a browser with a platform authenticator (Touch ID / Windows Hello / phone / security key);
 `localhost` counts as a secure context. The signer (`src/passkey.ts`) is byte-identical to the relayer's
 network-proven Python signer (`npm test`, vectors in `test/`). Demo/admin buttons use the throwaway local keys
