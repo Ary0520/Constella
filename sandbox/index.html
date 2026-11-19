@@ -16,11 +16,15 @@
     button { margin: 2px 4px 2px 0; } input, textarea, select { margin: 2px 4px 2px 0; }
     textarea { width: 100%; height: 70px; } .mono { font-family: ui-monospace, monospace; font-size: .8rem; word-break: break-all; }
     #log { max-height: 220px; }
+    #status { position: sticky; top: 0; z-index: 1; padding: 8px 12px; margin: 8px 0; border-radius: 6px; font-weight: 600; }
+    #status.busy { background: #cfe2ff; color: #052c65; } #status.ok { background: #d1e7dd; color: #0a3622; }
+    #status.err { background: #f8d7da; color: #58151c; }
   </style>
 </head>
 <body>
   <h1>Constella sandbox</h1>
   <p class="warn">Throwaway feature console for the LOCAL network only - not the product UI. Delete <code>sandbox/</code> to remove it.</p>
+  <div id="status" class="ok">Ready.</div>
   <div id="app">Loading <code>/config.json</code> (run <code>localnet/up.sh</code> first)...</div>
   <section><h2>Activity log</h2><pre id="log"></pre></section>
   <script type="module" src="/src/main.ts"></script>

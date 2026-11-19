@@ -20,6 +20,12 @@ keeper settles, Collateral Passport share price, admin pause.
 `npm run test:stack` runs the console's own code against the live stack (software passkey in place of the
 browser): account, sponsored deposit, keeper rebalance, frozen claim settled, Collateral Passport, thesis API.
 
+`npm run test:browser` (after `npx playwright install chromium`) clicks through the page in headless Chromium
+with a virtual WebAuthn authenticator: interrupted setup -> Finish setup, faucet, passkey-signed deposit, keeper.
+
+If an action seems to do nothing, read the status bar at the top (every result and error appears there).
+No wallet extension is involved: the passkey is the account and the relayer pays the fees.
+
 Passkeys need a browser with a platform authenticator (Touch ID / Windows Hello / phone / security key);
 `localhost` counts as a secure context. The signer (`src/passkey.ts`) is byte-identical to the relayer's
 network-proven Python signer (`npm test`, vectors in `test/`). Demo/admin buttons use the throwaway local keys

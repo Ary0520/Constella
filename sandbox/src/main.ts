@@ -24,14 +24,29 @@ function log(msg: string, data?: unknown) {
   $("log").textContent = line + "\n" + $("log").textContent;
 }
 
+// Visible status bar: every action's progress and result (the activity log
+// at the bottom was too easy to miss - first real-browser test).
+function status(text: string, kind: "busy" | "ok" | "err") {
+  const el = $("status");
+  el.textContent = text;
+  el.className = kind;
+}
+
 async function act(label: string, fn: () => Promise<unknown>) {
   log(`${label}...`);
+  status(`${label}... (a passkey prompt may appear; the relayer then needs a few seconds)`, "busy");
   try {
     const out = await fn();
     log(`${label}: OK`, out);
+    // Refresh BEFORE reporting done; the RPC may still serve the previous
+    // ledger for a moment after confirmation, so refresh once more shortly.
     await refresh();
+    status(`${label}: done`, "ok");
+    setTimeout(() => void refresh(), 3_000);
   } catch (e: any) {
-    log(`${label}: FAILED - ${e?.message ?? e}`);
+    const msg = e?.message ?? String(e);
+    log(`${label}: FAILED - ${msg}`);
+    status(`${label} failed: ${msg}`, "err");
   }
 }
 
@@ -130,14 +145,26 @@ function layout() {
 function need(): Passkey {
   const a = loadAccount();
   if (!a) throw new Error("create a passkey account first");
+  if (!a.address) throw new Error("account setup is unfinished - click 'Create passkey account' to finish it");
   return a;
 }
 
 async function createAccount() {
+  const existing = loadAccount();
+  if (existing && !existing.address) return finishSetup(existing);
   const pk = await createPasskey(`constella-${Date.now()}`);
-  const hex = Array.from(pk.publicKey, (b) => b.toString(16).padStart(2, "0")).join("");
+  // Save the passkey BEFORE asking the relayer: if the page reloads or the
+  // request is interrupted, "Finish setup" retries (creation is idempotent:
+  // the address is derived from the key). First real-browser test lost it.
+  const pending: Passkey = { credentialId: pk.id, publicKey: pk.publicKey, address: "" };
+  saveAccount(pending);
+  return finishSetup(pending);
+}
+
+async function finishSetup(a: Passkey) {
+  const hex = Array.from(a.publicKey, (b) => b.toString(16).padStart(2, "0")).join("");
   const out = await chain.relayer("/accounts", { owner_key: hex });
-  saveAccount({ credentialId: pk.id, publicKey: pk.publicKey, address: out.account });
+  saveAccount({ ...a, address: out.account });
   return out;
 }
 
@@ -190,7 +217,10 @@ async function refresh() {
       <table><tr><th>sleeve</th><th>target</th><th>held (units)</th><th>contract</th></tr>${rows}</table>`;
 
     const a = loadAccount();
-    if (a) {
+    if (a && !a.address) {
+      $("acct").innerHTML = `<b>Passkey saved, account setup unfinished.</b> Click "Create passkey account" to finish (no new passkey is created).`;
+      $("claims").textContent = "";
+    } else if (a) {
       const [usdc, shares, claim] = await Promise.all([
         chain.view(cfg.assets.USDC, "balance", [sv.addr(a.address)]), chain.view(c.vault, "balance", [sv.addr(a.address)]),
         chain.view(c.vault, "get_claim", [sv.addr(a.address), sv.addr(cfg.assets.EURC)]),
