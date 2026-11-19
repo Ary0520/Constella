@@ -2881,3 +2881,128 @@ mod a3 {
         assert_eq!(h.last().unwrap().timestamp, env.ledger().timestamp(), "oldest dropped, newest kept");
     }
 }
+
+/// Audit L1 / decision D-N - the Collateral Passport, end to end on the REAL
+/// Blend v2 pool: a Blend pool priced by the Constella collateral feed lists
+/// vault SHARES as collateral (at the vault's own recommended LTV); a
+/// depositor borrows USDC against their shares; when the vault cannot value
+/// itself the share has no price and borrowing halts; with fresh prices it
+/// resumes.
+mod collateral_passport {
+    use super::w1::*;
+    use super::*;
+    use constella_collateral_oracle::{Asset as CAsset, CollateralOracle, CollateralOracleClient};
+    use constella_testkit::blend::{self, pool::Request, BORROW, SUPPLY, SUPPLY_COLLATERAL};
+
+    fn refresh(r: &R) {
+        let env = &r.s.env;
+        let t = env.ledger().timestamp();
+        for (id, px) in [("USDC_A", ONE), ("USDC_B", ONE), ("EURC_A", ONE * 108 / 100), ("EURC_B", ONE * 108 / 100)] {
+            r.s.oracle.update_price(&Symbol::new(env, id), &px, &200_000, &t);
+        }
+    }
+
+    struct P { r: R, feed: CollateralOracleClient<'static>, b: blend::BlendEnv<'static> }
+
+    fn setup() -> P {
+        let r = super::w1::setup();
+        let env = &r.s.env;
+        // Vault 70 % USDC / 30 % EURC: its value depends on EURC's price.
+        let usdc_in = 3_000 * ONE;
+        let mut p = proposal(&r, usdc_in, quote(&r, usdc_in));
+        p.weights_after = Vec::from_array(env, [(Symbol::new(env, "USDC"), 7000u32), (Symbol::new(env, "EURC"), 3000u32)]);
+        as_keeper(&r, &p);
+        env.cost_estimate().budget().reset_unlimited();
+        r.s.vault.rebalance(&p);
+        env.mock_all_auths();
+        let admin = Address::generate(env);
+        let feed = CollateralOracleClient::new(env, &env.register(CollateralOracle, (admin, r.s.oracle.address.clone())));
+        feed.list_vault(&r.s.vault.address);
+        let b = blend::deploy(env, &r.s.usdc_admin, &feed.address); // a week passes
+        refresh(&r);
+        // List the share token at the vault's own recommended LTV.
+        let kit = r.s.vault.get_listing_kit();
+        let mut cfg = blend::default_reserve(7);
+        cfg.c_factor = kit.recommended_ltv_bps * 1_000; // bps -> 7 decimals
+        b.pool.queue_set_reserve(&r.s.vault.address, &cfg);
+        env.ledger().set_timestamp(env.ledger().timestamp() + 7 * 24 * 3600 + 1);
+        b.pool.set_reserve(&r.s.vault.address);
+        refresh(&r);
+        // A lender provides USDC to borrow.
+        let lender = Address::generate(env);
+        r.s.usdc_admin.mint(&lender, &(50_000 * ONE));
+        b.pool.submit(&lender, &lender, &lender, &Vec::from_array(env, [
+            Request { request_type: SUPPLY, address: r.s.usdc_addr.clone(), amount: 50_000 * ONE }]));
+        P { r, feed, b }
+    }
+
+    fn post_and_borrow(p: &P, shares: i128, debt: i128) -> Result<(), ()> {
+        let env = &p.r.s.env;
+        let who = &p.r.depositor;
+        let mut reqs = Vec::new(env);
+        if shares > 0 {
+            reqs.push_back(Request { request_type: SUPPLY_COLLATERAL, address: p.r.s.vault.address.clone(), amount: shares });
+        }
+        reqs.push_back(Request { request_type: BORROW, address: p.r.s.usdc_addr.clone(), amount: debt });
+        p.b.pool.try_submit(who, who, who, &reqs).map(|_| ()).map_err(|_| ())
+    }
+
+    #[test]
+    fn the_feed_quotes_shares_at_the_vaults_conservative_nav_and_assets_via_the_nav_oracle() {
+        let p = setup();
+        let share = p.feed.lastprice(&CAsset::Stellar(p.r.s.vault.address.clone())).unwrap();
+        assert_eq!(share.price, p.r.s.vault.get_nav_conservative().unwrap().price);
+        let usdc = p.feed.lastprice(&CAsset::Stellar(p.r.s.usdc_addr.clone()));
+        let direct = constella_nav_oracle::NavOracleClient::new(&p.r.s.env, &p.r.s.oracle.address)
+            .lastprice(&constella_nav_oracle::Asset::Stellar(p.r.s.usdc_addr.clone()));
+        assert_eq!(usdc.map(|x| x.price), direct.map(|x| x.price));
+        assert_eq!(p.feed.decimals(), 7);
+    }
+
+    #[test]
+    fn shares_are_collateral_on_real_blend_and_borrowing_halts_when_the_vault_cannot_value_itself() {
+        let p = setup();
+        let env = &p.r.s.env;
+        let shares = p.r.s.vault.balance(&p.r.depositor);
+        assert!(shares > 0);
+        let before = p.r.s.usdc.balance(&p.r.depositor);
+        post_and_borrow(&p, shares / 2, 1_000 * ONE).expect("borrow against vault shares");
+        assert_eq!(p.r.s.usdc.balance(&p.r.depositor), before + 1_000 * ONE);
+        assert_eq!(p.b.pool.get_positions(&p.r.depositor).collateral.len(), 1, "shares held as collateral");
+
+        // Feeds go stale (limit 1 h): the vault cannot value EURC, the share
+        // has no price, and Blend cannot lend against it.
+        env.ledger().set_timestamp(env.ledger().timestamp() + 3_601);
+        assert!(p.r.s.vault.get_nav_conservative().is_none());
+        assert!(p.feed.lastprice(&CAsset::Stellar(p.r.s.vault.address.clone())).is_none());
+        // USDC itself is still priced: the share's missing price is the ONLY cause.
+        assert!(p.feed.lastprice(&CAsset::Stellar(p.r.s.usdc_addr.clone())).is_some());
+        assert!(post_and_borrow(&p, 0, 100 * ONE).is_err(), "no price -> no lending");
+
+        // Fresh prices: lending resumes.
+        refresh(&p.r);
+        post_and_borrow(&p, 0, 100 * ONE).expect("borrowing resumes with valid prices");
+    }
+
+    #[test]
+    fn listing_is_admin_only_permanent_and_requires_a_compatible_vault() {
+        let p = setup();
+        let env = &p.r.s.env;
+        env.mock_all_auths();
+        assert_eq!(p.feed.try_list_vault(&p.r.s.vault.address).unwrap_err().unwrap(),
+            soroban_sdk::Error::from_contract_error(1), "already listed - and there is no delist");
+        // A feed over a DIFFERENT (real) NAV oracle refuses this vault.
+        let other = env.register(constella_nav_oracle::NavOracle, (Address::generate(env), p.r.s.usdc_addr.clone(), 7u32, 300u32));
+        let admin2 = Address::generate(env);
+        let feed2 = CollateralOracleClient::new(env, &env.register(CollateralOracle, (admin2.clone(), other)));
+        assert_eq!(feed2.try_list_vault(&p.r.s.vault.address).unwrap_err().unwrap(), soroban_sdk::Error::from_contract_error(2));
+        // Only the admin lists: a stranger's signature is not enough.
+        let feed3 = CollateralOracleClient::new(env, &env.register(CollateralOracle, (Address::generate(env), p.r.s.oracle.address.clone())));
+        let stranger = Address::generate(env);
+        env.mock_auths(&[MockAuth { address: &stranger, invoke: &MockAuthInvoke {
+            contract: &feed3.address, fn_name: "list_vault", args: (p.r.s.vault.address.clone(),).into_val(env), sub_invokes: &[] } }]);
+        assert!(feed3.try_list_vault(&p.r.s.vault.address).is_err());
+        assert!(!feed3.is_listed(&p.r.s.vault.address));
+        let _ = admin2;
+    }
+}

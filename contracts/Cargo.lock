@@ -305,6 +305,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "constella-collateral-oracle"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "constella-fee-sponsor"
 version = "0.1.0"
 dependencies = [
@@ -388,6 +395,7 @@ dependencies = [
 name = "constella-vault-strategy"
 version = "0.1.0"
 dependencies = [
+ "constella-collateral-oracle",
  "constella-nav-oracle",
  "constella-policy",
  "constella-registry",
