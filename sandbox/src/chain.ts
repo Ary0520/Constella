@@ -51,12 +51,19 @@ export class Chain {
   /** A demo/admin action signed by a LOCAL throwaway key. */
   async invokeAs(who: string, contract: string, fn: string, args: xdr.ScVal[] = []): Promise<string> {
     const kp = Keypair.fromSecret(this.cfg.LOCAL_ONLY_secrets[who]);
-    const src = await this.server.getAccount(kp.publicKey());
-    let tx = new TransactionBuilder(src, { fee: "1000", networkPassphrase: this.cfg.network.passphrase })
-      .addOperation(contractCall(contract, fn, args)).setTimeout(60).build();
-    tx = await this.server.prepareTransaction(tx);
-    tx.sign(kp);
-    const sent = await this.server.sendTransaction(tx);
+    // One pending transaction per account: TRY_AGAIN_LATER (e.g. two buttons
+    // at once) is retried with a fresh sequence number.
+    let sent: any;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const src = await this.server.getAccount(kp.publicKey());
+      let tx = new TransactionBuilder(src, { fee: "1000", networkPassphrase: this.cfg.network.passphrase })
+        .addOperation(contractCall(contract, fn, args)).setTimeout(60).build();
+      tx = await this.server.prepareTransaction(tx);
+      tx.sign(kp);
+      sent = await this.server.sendTransaction(tx);
+      if (sent.status !== "TRY_AGAIN_LATER") break;
+      await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+    }
     if (sent.status !== "PENDING" && sent.status !== "DUPLICATE") throw new Error(`${fn}: ${sent.status}`);
     const res: any = await this.server.pollTransaction(sent.hash, { attempts: 30 });
     if (res.status !== "SUCCESS") throw new Error(`${fn}: ${res.status}`);

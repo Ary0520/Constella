@@ -62,10 +62,13 @@ run("console code on the live local stack", () => {
 
   it("frozen EURC -> redeem with a claim -> prices back -> the keeper settles it", async () => {
     await chain.invokeAs("admin", c.oracle, "trigger_circuit_breaker", [sv.addr(cfg.accounts.admin), sv.sym("CASH"), sv.sym("E2E")]);
-    await chain.sponsored(acct, c.vault, "redeem_frozen", [sv.i128(50n * ONE), sv.addr(acct.address), sv.addr(acct.address), sv.addr(acct.address)], pk.assert);
-    const owed = BigInt(await chain.view(c.vault, "get_claim", [sv.addr(acct.address), sv.addr(cfg.assets.EURC)]));
-    expect(owed).toBeGreaterThan(0n);
-    await chain.invokeAs("admin", c.oracle, "clear_circuit_breaker", [sv.sym("CASH")]);
+    try {
+      await chain.sponsored(acct, c.vault, "redeem_frozen", [sv.i128(50n * ONE), sv.addr(acct.address), sv.addr(acct.address), sv.addr(acct.address)], pk.assert);
+      const owed = BigInt(await chain.view(c.vault, "get_claim", [sv.addr(acct.address), sv.addr(cfg.assets.EURC)]));
+      expect(owed).toBeGreaterThan(0n);
+    } finally {
+      await chain.invokeAs("admin", c.oracle, "clear_circuit_breaker", [sv.sym("CASH")]);
+    }
     await until("the keeper to settle the claim", () => chain.view(c.vault, "get_claim", [sv.addr(acct.address), sv.addr(cfg.assets.EURC)]),
       (v: any) => BigInt(v) === 0n);
   }, 240_000);

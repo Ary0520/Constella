@@ -43,6 +43,17 @@ const text = async (p, sel) => ((await p.textContent(sel)) || "").replace(/\s+/g
   await page.waitForTimeout(25000); // the keeper rebalances within ~20 s
   console.log("3 AFTER 25s:", await text(page, "#acct"));
   console.log("3 OVERVIEW:", (await text(page, "#overview")).slice(0, 400));
+  // 4. "Connect a Stellar wallet" opens the Stellar Wallets Kit picker.
+  await page.click("#connect");
+  await page.waitForTimeout(4000);
+  const picker = (await page.evaluate(() => {
+    const out = [];
+    const walk = (root) => { for (const el of root.querySelectorAll("*")) { if (el.shadowRoot) walk(el.shadowRoot); if (el.childElementCount === 0 && el.textContent) out.push(el.textContent.trim()); } };
+    walk(document); return out.join(" ");
+  }));
+  const listed = ["xBull", "Albedo", "LOBSTR", "Hana", "Varial", "Freighter"].filter((w) => picker.toLowerCase().includes(w.toLowerCase()));
+  console.log("4 WALLET PICKER lists:", listed.join(", "));
+  if (listed.length < 2) throw new Error("the wallet picker did not open");
   const acct = await text(page, "#acct");
   if (!/vault shares (?!0\.0000)/.test(acct)) throw new Error("deposit did not produce vault shares: " + acct);
   console.log("BROWSER E2E PASS");

@@ -10,7 +10,7 @@ x-py: &py
 services:
   node:
     image: stellar/quickstart:latest
-    command: ["--local", "--enable", "core,rpc,friendbot"]
+    command: ["--local", "--enable", "core,horizon,rpc,friendbot"]
     ports: ["8000:8000"]
   relayer:
     <<: *py

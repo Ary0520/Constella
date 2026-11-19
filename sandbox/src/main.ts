@@ -6,6 +6,7 @@
 import { xdr } from "@stellar/stellar-sdk";
 import { Chain, Config, Passkey, sv, thesis } from "./chain";
 import { createPasskey } from "./passkey";
+import { addUsdcTrustline, connectWallet, friendbotFund, WalletSigner, walletInvoke, walletStatus } from "./wallet";
 
 const ONE = 10_000_000n;
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -34,7 +35,9 @@ function status(text: string, kind: "busy" | "ok" | "err") {
 
 async function act(label: string, fn: () => Promise<unknown>) {
   log(`${label}...`);
-  status(`${label}... (a passkey prompt may appear; the relayer then needs a few seconds)`, "busy");
+  status(mode() === "wallet"
+    ? `${label}... (approve it in your wallet; you pay the XLM network fee)`
+    : `${label}... (a passkey prompt may appear; the relayer then needs a few seconds)`, "busy");
   try {
     const out = await fn();
     log(`${label}: OK`, out);
@@ -53,6 +56,20 @@ async function act(label: string, fn: () => Promise<unknown>) {
 // ---------------------------------------------------------------- state
 let cfg: Config;
 let chain: Chain;
+let wallet: WalletSigner | null = null; // in memory: reconnect after a reload
+const mode = (): "passkey" | "wallet" => ((document.querySelector('input[name="who"]:checked') as HTMLInputElement)?.value as any) ?? "passkey";
+
+/** Who acts: the passkey account (relayer pays) or the wallet (user pays). */
+function actor(): { address: string; call: (fn: string, args: xdr.ScVal[]) => Promise<unknown> } {
+  if (mode() === "wallet") {
+    if (!wallet) throw new Error("connect a Stellar wallet first (section 2b)");
+    const w = wallet;
+    return { address: w.address, call: (fn, args) => walletInvoke(chain, w, cfg.contracts.vault, fn, args) };
+  }
+  const a = need();
+  return { address: a.address, call: (fn, args) => chain.sponsored(a, cfg.contracts.vault, fn, args) };
+}
+const userArgs = (amount: bigint, who: string) => [sv.i128(amount), sv.addr(who), sv.addr(who), sv.addr(who)];
 const ACCOUNT_KEY = "constella-sandbox-account";
 
 function loadAccount(): Passkey | null {
@@ -81,7 +98,17 @@ function layout() {
     <button id="faucet">Get 1,000 test USDC</button>
     <button id="forget">Forget this browser's account</button></section>
 
-  <section><h2>3. Deposit / redeem (sponsored: the relayer pays, the passkey signs)</h2>
+  <section><h2>2b. Stellar wallet (Freighter/Varial, xBull, LOBSTR, Albedo, Hana, ...)</h2>
+    <p>A classic Stellar account: you sign in your wallet and pay the XLM network fee yourself. Same vault, same shares.</p>
+    <button id="connect">Connect a Stellar wallet</button>
+    <button id="wfund">Fund with friendbot (local/testnet)</button>
+    <button id="wtrust">Add USDC trustline</button>
+    <button id="wfaucet">Get 1,000 test USDC</button>
+    <div id="wallet">not connected</div></section>
+
+  <section><h2>3. Deposit / redeem</h2>
+    Sign in with: <label><input type="radio" name="who" value="passkey" checked/> passkey (relayer pays, zero XLM)</label>
+    <label><input type="radio" name="who" value="wallet"/> Stellar wallet (you pay the XLM fee)</label><br/>
     USDC <input id="dep" value="100" size="8"/> <button id="deposit">Deposit</button>
     shares <input id="red" value="10" size="8"/> <button id="redeem">Redeem</button>
     <p>The keeper rebalances to the signed targets within ~20 s (watch the overview).</p></section>
@@ -117,17 +144,20 @@ function layout() {
   });
   $("forget").onclick = () => { try { localStorage.removeItem(ACCOUNT_KEY); } catch { /* */ } refresh(); };
   $("deposit").onclick = () => act("deposit", () => {
-    const a = need(); const amt = toUnits($<HTMLInputElement>("dep").value);
-    return chain.sponsored(a, cfg.contracts.vault, "deposit", [sv.i128(amt), sv.addr(a.address), sv.addr(a.address), sv.addr(a.address)]);
+    const u = actor(); return u.call("deposit", userArgs(toUnits($<HTMLInputElement>("dep").value), u.address));
   });
   $("redeem").onclick = () => act("redeem", () => {
-    const a = need(); const sh = toUnits($<HTMLInputElement>("red").value);
-    return chain.sponsored(a, cfg.contracts.vault, "redeem", [sv.i128(sh), sv.addr(a.address), sv.addr(a.address), sv.addr(a.address)]);
+    const u = actor(); return u.call("redeem", userArgs(toUnits($<HTMLInputElement>("red").value), u.address));
   });
   $("redeemFrozen").onclick = () => act("redeem while frozen", () => {
-    const a = need(); const sh = toUnits($<HTMLInputElement>("fz").value);
-    return chain.sponsored(a, cfg.contracts.vault, "redeem_frozen", [sv.i128(sh), sv.addr(a.address), sv.addr(a.address), sv.addr(a.address)]);
+    const u = actor(); return u.call("redeem_frozen", userArgs(toUnits($<HTMLInputElement>("fz").value), u.address));
   });
+  $("connect").onclick = () => act("connect wallet", async () => { wallet = await connectWallet(cfg.network.passphrase); return wallet.address; });
+  const needWallet = () => { if (!wallet) throw new Error("connect a Stellar wallet first"); return wallet; };
+  $("wfund").onclick = () => act("friendbot", () => friendbotFund(chain, needWallet().address));
+  $("wtrust").onclick = () => act("add USDC trustline", () => addUsdcTrustline(chain, needWallet()));
+  $("wfaucet").onclick = () => act("faucet (wallet)", () =>
+    chain.invokeAs("issuer", cfg.assets.USDC, "mint", [sv.addr(needWallet().address), sv.i128(1_000n * ONE)]));
   $("freeze").onclick = () => act("freeze EURC", () =>
     chain.invokeAs("admin", cfg.contracts.oracle, "trigger_circuit_breaker", [sv.addr(cfg.accounts.admin), sv.sym("CASH"), sv.sym("SANDBOX")]));
   $("unfreeze").onclick = () => act("restore prices", () =>
@@ -230,6 +260,15 @@ async function refresh() {
     } else {
       $("acct").textContent = "no account in this browser yet";
       $("claims").textContent = "";
+    }
+    if (wallet) {
+      const ws = await walletStatus(chain, wallet.address);
+      const shares = ws.exists ? await chain.view(c.vault, "balance", [sv.addr(wallet.address)]) : 0;
+      const claim = ws.exists ? await chain.view(c.vault, "get_claim", [sv.addr(wallet.address), sv.addr(cfg.assets.EURC)]) : 0;
+      const todo = !ws.exists ? "Next: fund the account (friendbot)." : !ws.hasTrustline ? "Next: add the USDC trustline." : ws.usdc === 0n ? "Next: get test USDC." : "Ready.";
+      $("wallet").innerHTML = `<div class="mono">${wallet.label} ${wallet.address}</div>
+        <div>account ${ws.exists ? "exists" : "NOT FUNDED"} · XLM ${fmt(ws.xlm)} · USDC trustline ${ws.hasTrustline ? "yes" : "NO"} · USDC ${fmt(ws.usdc)}
+        · vault shares ${fmt(shares)} · open EURC claim ${fmt(claim)}</div><b>${todo}</b>`;
     }
     const share = await chain.view(c.collateral_oracle, "lastprice", [xdr.ScVal.scvVec([sv.sym("Stellar"), sv.addr(c.vault)])]);
     $("cp").innerHTML = `share price served to lenders: <b>${share ? fmt(share.price) : "NONE - the vault cannot value itself, lending halts"}</b>

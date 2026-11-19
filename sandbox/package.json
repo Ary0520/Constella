@@ -8,15 +8,16 @@
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
     "test": "vitest run",
-    "test:stack": "SANDBOX_E2E=1 vitest run test/stack.e2e.test.ts",
+    "test:stack": "SANDBOX_E2E=1 vitest run --no-file-parallelism test/stack.e2e.test.ts test/wallet.e2e.test.ts",
     "test:browser": "node e2e/browser.cjs"
   },
   "dependencies": {
+    "@creit.tech/stellar-wallets-kit": "^2.8.0",
     "@stellar/stellar-sdk": "17.4.0"
   },
   "devDependencies": {
-    "playwright": "1.55.0",
     "@types/node": "^22.20.5",
+    "playwright": "1.55.0",
     "typescript": "5.8.3",
     "vite": "6.4.1",
     "vitest": "3.2.7"
