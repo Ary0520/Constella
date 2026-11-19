@@ -24,7 +24,10 @@ export function struct(fields: Record<string, xdr.ScVal>): xdr.ScVal {
 }
 
 const u32Vec = (ids: number[]) => xdr.ScVal.scvVec(ids.map((i) => xdr.ScVal.scvU32(i)));
-const bytes = (b: Uint8Array) => xdr.ScVal.scvBytes(Buffer.from(b));
+const bytes = (b: Uint8Array) => xdr.ScVal.scvBytes(b as any);
+// No Node Buffer in the browser bundle (Vite does not polyfill it).
+const toHex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const fromHex = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
 
 export function authDigest(account: string, payload: Uint8Array, ruleIds: number[]): Uint8Array {
   const pre = struct({
@@ -75,12 +78,12 @@ export function signingInput(entryXdr: string, validUntil: number, passphrase: s
 export function derToLowS(der: Uint8Array): Uint8Array {
   let i = 2;
   const read = () => { if (der[i++] !== 0x02) throw new Error("bad DER"); const len = der[i++]; const v = der.slice(i, i + len); i += len; return v; };
-  const toBig = (b: Uint8Array) => BigInt("0x" + Buffer.from(b).toString("hex"));
+  const toBig = (b: Uint8Array) => BigInt("0x" + toHex(b));
   const r = toBig(read());
   let s = toBig(read());
   if (s > P256_N / 2n) s = P256_N - s;
   const hex = (n: bigint) => n.toString(16).padStart(64, "0");
-  return new Uint8Array(Buffer.from(hex(r) + hex(s), "hex"));
+  return fromHex(hex(r) + hex(s));
 }
 
 export interface Assertion { authenticatorData: Uint8Array; clientDataJSON: Uint8Array; signature: Uint8Array /* DER */ }
