@@ -19,7 +19,10 @@ Configuration (environment only - the secret is never logged):
   ACCOUNTS_PER_DAY (200), ACCOUNT_MAX_FEE_STROOPS (30_000_000: an account
   deployment pays its storage rent), RELAYER_TRUST_PROXY=1 (use X-Forwarded-For's first
   address as the client; only behind your own proxy), RELAYER_CORS_ORIGIN
-  (unset = no CORS headers; set to one browser origin, e.g. the sandbox).
+  (unset = no CORS headers; set to one browser origin, e.g. the sandbox),
+  FAUCET_SECRET + FAUCET_ASSET (enables POST /faucet {"address"} on TEST
+  networks only; FAUCET_AMOUNT 1_000_000_000 = 100 units, per address 1/day,
+  per IP 3/day, 200/day total).
 """
 from __future__ import annotations
 
@@ -32,6 +35,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from stellar_sdk import Keypair, SorobanServer
 
 from .accounts import RateLimiter, parse_owner_key
+from .faucet import Faucet, parse_address
 from .gateway import Rejected
 from .relayer import Relayer
 
@@ -52,7 +56,7 @@ def parse_allowed(spec: str) -> dict[str, frozenset[str]]:
 
 
 def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimiter | None = None,
-                 trust_proxy: bool = False, cors_origin: str | None = None):
+                 trust_proxy: bool = False, cors_origin: str | None = None, faucet: "Faucet | None" = None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "constella-relayer"
 
@@ -75,7 +79,7 @@ def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimi
 
         def do_GET(self):
             if self.path == "/health":
-                self._reply(200, {"ok": True, "relayers": [k.public_key for k in relayer.keypairs]})
+                self._reply(200, {"ok": True, "relayers": [k.public_key for k in relayer.keypairs], "faucet": faucet is not None})
             else:
                 self._reply(404, {"error": "NOT_FOUND"})
 
@@ -97,6 +101,11 @@ def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimi
                     return self._reply(200, relayer.prepare(body.get("func")))
                 if self.path == "/submit":
                     return self._reply(200, asdict(relayer.submit(body.get("func"), body.get("auth"))))
+                if self.path == "/faucet" and faucet:
+                    client = self.client_address[0]
+                    if trust_proxy and self.headers.get("X-Forwarded-For"):
+                        client = self.headers["X-Forwarded-For"].split(",")[0].strip()
+                    return self._reply(200, faucet.send(parse_address(body.get("address")), client))
                 if self.path == "/accounts" and factory and limiter:
                     key = parse_owner_key(body.get("owner_key"))
                     client = self.client_address[0]
@@ -132,7 +141,13 @@ def cli() -> None:
     sys.stderr.write(f"constella-relayer pool of {len(relayer.keypairs)} on {host}:{port}\n")
     factory = env.get("ACCOUNT_FACTORY_ID") or None
     limiter = RateLimiter(int(env.get("ACCOUNTS_PER_IP_PER_DAY", "3")), int(env.get("ACCOUNTS_PER_DAY", "200")))
-    handler = make_handler(relayer, factory, limiter, env.get("RELAYER_TRUST_PROXY") == "1", env.get("RELAYER_CORS_ORIGIN") or None)
+    faucet = None
+    if env.get("FAUCET_SECRET"):  # test networks only (the Faucet refuses others)
+        faucet = Faucet(relayer.server, env["CONSTELLA_NETWORK_PASSPHRASE"], env["FAUCET_SECRET"], env["FAUCET_ASSET"],
+                        int(env.get("FAUCET_AMOUNT", "1000000000")),
+                        RateLimiter(int(env.get("FAUCET_PER_ADDRESS_PER_DAY", "1")), int(env.get("FAUCET_PER_DAY", "200"))),
+                        RateLimiter(int(env.get("FAUCET_PER_IP_PER_DAY", "3")), int(env.get("FAUCET_PER_DAY", "200"))))
+    handler = make_handler(relayer, factory, limiter, env.get("RELAYER_TRUST_PROXY") == "1", env.get("RELAYER_CORS_ORIGIN") or None, faucet)
     ThreadingHTTPServer((host, port), handler).serve_forever()
 
 
