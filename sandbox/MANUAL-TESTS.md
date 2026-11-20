@@ -81,6 +81,26 @@ version). Then select **Constella local** as the active network. xBull also supp
 | C3 | **Unpause vault** | Overview "running"; deposits work again |
 | C4 | **List factory vaults** | "none yet" (factory vaults are created later in the product) |
 
+## E. Edge cases and refusals
+
+| # | Step | Expected |
+|---|---|---|
+| E1 | Deposit **more USDC than you hold** (e.g. 999999) | Status bar shows a failure; balances unchanged |
+| E2 | Deposit **0** or a negative amount | Failure; nothing changes |
+| E3 | Redeem **more shares than you hold** | Failure; nothing changes |
+| E4 | With **no account and no wallet**, click Deposit | Status: "create a passkey account first" (passkey mode) or "connect a Stellar wallet first" (wallet mode) |
+| E5 | Wallet mode, skip the trustline (fresh wallet), then Get test USDC | Failure (a classic account cannot hold USDC without a trustline) |
+| E6 | Passkey: start a deposit, then **cancel** the passkey prompt | Status shows a failure; nothing is charged, nothing changes |
+| E7 | Two different browsers (or a private window) | Each has its own passkey account; balances are separate |
+
+## S. Services working together (optional, terminal)
+
+| # | Step | Expected |
+|---|---|---|
+| S1 | `docker compose -f localnet/docker-compose.yml logs -f keeper` during P5/W6 | A `"rebalanced"` line after a deposit; `"settled"` after F4 |
+| S2 | `docker compose -f localnet/docker-compose.yml logs mailsink` after C2 (pause) | An email `ALERT: vault ... is PAUSED`; after C3 a `RESOLVED` email (within ~30 s) |
+| S3 | `curl localhost:8787/health` and `curl localhost:8790/health` | `{"ok": true, ...}` from both |
+
 ## Finish
 
 `localnet/down.sh` stops everything and forgets the local chain (the next `up.sh` starts fresh: create a
