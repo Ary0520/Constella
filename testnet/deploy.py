@@ -48,7 +48,7 @@ def main() -> None:
     W = lambda n: ROOT / f"contracts/target/wasm32v1-none/release/constella_{n}.wasm"
     h = state.setdefault("wasm_hashes", {})
     for n in ["registry", "nav_oracle", "policy", "vault_strategy", "webauthn_verifier", "smart_account", "fee_sponsor",
-              "account_factory", "vault_factory", "collateral_oracle"]:
+              "account_factory", "vault_factory", "collateral_oracle", "device_registry"]:
         if n not in h:
             h[n] = net.upload(admin, W(n)).hex(); save(); log("uploaded", n)
     H = lambda n: bytes.fromhex(h[n])
@@ -107,8 +107,13 @@ def main() -> None:
     verifier = once("verifier", lambda: net.deploy(admin, H("webauthn_verifier")))
     account_factory = once("account_factory", lambda: net.deploy(admin, H("account_factory"), [A(admin.public_key), A(verifier), scval.to_bytes(H("smart_account"))]))
     sponsor = once("fee_sponsor", lambda: net.deploy(admin, H("fee_sponsor"), [A(admin.public_key), U32(30), U32(200), scval.to_uint64(2_000 * ONE)]))
+    registry_dev = once("device_registry", lambda: net.deploy(admin, H("device_registry"), [A(account_factory), A(verifier)]))
+    if not state.get("device_registry_whitelisted"):
+        if state.get("sponsor_configured"):
+            net.invoke(admin, sponsor, "whitelist_contract", [A(registry_dev)])
+        state["device_registry_whitelisted"] = True; save()
     if not state.get("sponsor_configured"):
-        for target in (vault, account_factory):
+        for target in (vault, account_factory, registry_dev):
             net.invoke(admin, sponsor, "whitelist_contract", [A(target)])
         for r in ("relayer1", "relayer2"):
             net.invoke(admin, sponsor, "add_relayer", [A(keys[r].public_key)])

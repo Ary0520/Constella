@@ -122,7 +122,12 @@ function layout() {
     <button id="signin">Sign in with an existing passkey</button>
     <button id="createTest">Create a test passkey (in this browser - local testing only)</button>
     <button id="faucet">Get 1,000 test USDC</button>
-    <button id="forget">Start over with a new passkey</button></section>
+    <button id="forget">Start over with a new passkey</button>
+    <h3>Your devices</h3>
+    <div id="devices"></div>
+    <button id="addDevice">Add another device (phone, laptop, ...)</button>
+    <div id="pairBox"></div>
+    <div id="joinBox"></div></section>
 
   <section><h2>2b. Stellar wallet (Freighter/Varial, xBull, LOBSTR, Albedo, Hana, ...)</h2>
     <p>A classic Stellar account: you sign in your wallet and pay the XLM network fee yourself. Same vault, same shares.</p>
@@ -166,6 +171,9 @@ function layout() {
   $("create").onclick = () => act("create passkey account", () => createAccount("platform"));
   $("createPhone").onclick = () => act("create passkey account", () => createAccount("cross-platform"));
   $("signin").onclick = () => act("sign in with an existing passkey", signIn);
+  $("addDevice").onclick = () => act("add another device", addDevice);
+  const pairCode = new URLSearchParams(location.search).get("pair");
+  if (pairCode) showJoin(pairCode);
   $("createTest").onclick = () => act("create test passkey account", async () => {
     if (loadAccount()) throw new Error("this browser already has an account - use 'Start over with a new passkey' first");
     const t = await createTestPasskey();
@@ -255,6 +263,11 @@ async function signIn() {
     throw new Error(`this device returned no passkey for ${location.hostname} (${e?.name ?? e}). If you created one on a phone, open this page ON that phone and use "Sign in", or create a new one with "use THIS device".`);
   }
   for (const pk of found.candidates) {
+    const dev = cfg.contracts.device_registry ? await chain.view(cfg.contracts.device_registry, "device_of", [sv.bytes(pk)]) : null;
+    if (dev) {
+      saveAccount({ credentialId: found.id, publicKey: pk, address: String(dev.account), ruleId: Number(dev.rule_id), attachment: "existing" });
+      return { signed_in: String(dev.account), as_device: dev.name };
+    }
     const acct = await chain.view(cfg.contracts.account_factory, "account_of", [sv.bytes(pk)]);
     if (acct) {
       const address = typeof acct === "string" ? acct : String(acct);
@@ -273,6 +286,63 @@ async function signIn() {
   const pending: Passkey = { credentialId: found.id, publicKey: key, address: "", attachment: "existing" };
   saveAccount(pending);
   return finishSetup(pending);
+}
+
+// ------------------------------------------------ one account, several devices
+/** On the EXISTING device: open a pairing code, wait for the new device,
+ * show the shared check code, and approve with this device's passkey. */
+async function addDevice() {
+  const a = need();
+  if (a.ruleId !== undefined) throw new Error("only the first device of this account can add devices (security: a lost extra device cannot add others)");
+  if (!cfg.contracts.device_registry) throw new Error("this deployment has no device registry");
+  const { code } = await chain.relayer("/pair/start", { account: a.address });
+  const link = `${location.origin}${location.pathname}?pair=${code}`;
+  $("pairBox").innerHTML = `<p><b>On your other device</b>, open this link (send it to yourself, e.g. by message):<br>
+    <span class="mono">${link}</span><br>or open the site there and add <span class="mono">?pair=${code}</span>. Waiting for it (10 minutes)...</p>`;
+  for (let i = 0; i < 300; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const st = await chain.relayer("/pair/status", { code });
+    if (st.device_key) {
+      $("pairBox").innerHTML = `<p><b>"${st.name}" wants to join this account.</b> Check code: <b class="mono">${st.check}</b> - it must match the code on the other device.</p>
+        <button id="approveDevice">Approve this device</button> <button id="rejectDevice">Not my device</button>`;
+      const ok = await new Promise<boolean>((res) => { $("approveDevice").onclick = () => res(true); $("rejectDevice").onclick = () => res(false); });
+      if (!ok) { $("pairBox").textContent = "Rejected - nothing was added."; return "rejected"; }
+      status("approving the device (your passkey prompt)...", "busy");
+      const key = Uint8Array.from(st.device_key.match(/../g).map((h: string) => parseInt(h, 16)));
+      const out = await chain.sponsored(a, cfg.contracts.device_registry, "add_device", [sv.addr(a.address), sv.bytes(key), sv.str(st.name)]);
+      $("pairBox").textContent = `"${st.name}" added. It can now use this account on its own.`;
+      return out;
+    }
+  }
+  throw new Error("pairing expired - start again");
+}
+
+/** On the NEW device (opened with ?pair=CODE): create a passkey here, send
+ * its public key, show the check code, and sign in once approved. */
+function showJoin(code: string) {
+  $("joinBox").innerHTML = `<h3>Join an existing account</h3>
+    <p>Your other device asked to add this one. Create a passkey on THIS device, then approve it on the other device.</p>
+    <button id="joinBtn">Create a passkey on this device and join</button> <span id="joinInfo"></span>`;
+  $("joinBtn").onclick = () => act("join account", async () => {
+    if (loadAccount()?.address) throw new Error("this browser already has an account - use 'Start over with a new passkey' first");
+    const pk = await createPasskey(`constella-device-${Date.now()}`, "platform");
+    const keyHex = Array.from(pk.publicKey, (b) => b.toString(16).padStart(2, "0")).join("");
+    const name = /Android|iPhone|iPad/i.test(navigator.userAgent) ? "phone" : "computer";
+    const j = await chain.relayer("/pair/join", { code, device_key: keyHex, name });
+    $("joinInfo").innerHTML = `Check code <b class="mono">${j.check}</b> - approve it on your other device. Waiting...`;
+    for (let i = 0; i < 300; i++) {
+      await new Promise((r) => setTimeout(r, 3000));
+      const dev = await chain.view(cfg.contracts.device_registry, "device_of", [sv.bytes(pk.publicKey)]);
+      if (dev) {
+        saveAccount({ credentialId: pk.id, publicKey: pk.publicKey, address: String(dev.account), ruleId: Number(dev.rule_id),
+                      attachment: pk.attachment, transports: pk.transports });
+        history.replaceState(null, "", location.pathname);
+        $("joinBox").innerHTML = "<p><b>This device now uses your account.</b></p>";
+        return { joined: String(dev.account) };
+      }
+    }
+    throw new Error("not approved within the time limit");
+  });
 }
 
 async function finishSetup(a: Passkey) {
@@ -342,6 +412,11 @@ async function refresh() {
       const where = a.testKey ? "this browser (TEST passkey - local testing only, no prompt)" : a.attachment === "existing" ? "the device you signed in with" : a.attachment === "platform" ? "this device (Windows Hello / Touch ID)" : a.attachment === "cross-platform" ? "a phone or security key" : "unknown (created before this was recorded)";
       $("acct").innerHTML = `<div class="mono">account ${a.address}</div><div>USDC ${fmt(usdc)} · vault shares ${fmt(shares)} · XLM: none needed</div>
         <div>passkey stored on: <b>${where}</b>${a.transports?.length ? ` (${a.transports.join(", ")})` : ""} - signing needs that same passkey</div>`;
+      if (cfg.contracts.device_registry) {
+        const devs = await chain.view(cfg.contracts.device_registry, "devices_of", [sv.addr(a.address)]).catch(() => []);
+        $("devices").innerHTML = `this device: <b>${a.ruleId === undefined ? "first device (can add others)" : `added device (rule ${a.ruleId})`}</b>`
+          + (devs.length ? `<br>added devices: ${devs.map((d: any) => `${d.name} (rule ${d.rule_id})`).join(", ")}` : "<br>no other devices yet");
+      }
       $("claims").innerHTML = `open EURC claim for this account: <b>${fmt(claim)}</b> units ${BigInt(claim) > 0n ? "(the keeper settles it once EURC is priced again)" : ""}`;
     } else {
       $("acct").textContent = "no account in this browser yet";

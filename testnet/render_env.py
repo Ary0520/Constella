@@ -20,7 +20,8 @@ env = {
     "CONSTELLA_NETWORK": "testnet",
     # relayer (+ testnet faucet)
     "RELAYER_SECRETS": f'{k["relayer1"]},{k["relayer2"]}', "SPONSOR_CONTRACT_ID": ct["fee_sponsor"],
-    "SPONSOR_ALLOWED": f'{ct["vault"]}:deposit,redeem,withdraw,redeem_frozen', "ACCOUNT_FACTORY_ID": ct["account_factory"],
+    "SPONSOR_ALLOWED": f'{ct["vault"]}:deposit,redeem,withdraw,redeem_frozen;{ct["device_registry"]}:add_device',
+    "ACCOUNT_FACTORY_ID": ct["account_factory"],
     "RELAYER_HOST": "127.0.0.1", "RELAYER_PORT": "8787", "RELAYER_TRUST_PROXY": "1", "RELAYER_CORS_ORIGIN": origin,
     "ACCOUNTS_PER_IP_PER_DAY": "3", "ACCOUNTS_PER_DAY": "200",
     "FAUCET_SECRET": k["lp"], "FAUCET_ASSET": c["assets"]["USDC"], "FAUCET_AMOUNT": "1000000000",

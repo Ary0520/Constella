@@ -88,7 +88,7 @@ export class Chain {
                       : getAssertion(id, ch, account.transports ?? [])): Promise<any> {
     const func = funcB64(contract, fn, args);
     const { auth, latest_ledger } = await this.relayer("/prepare", { func });
-    const rule = Number(await this.view(account.address, "get_owner_rule"));
+    const rule = account.ruleId ?? Number(await this.view(account.address, "get_owner_rule"));
     const validUntil = latest_ledger + 60;
     const signed: string[] = [];
     for (const entryXdr of auth) {
@@ -103,7 +103,10 @@ export class Chain {
 
 export interface Passkey { credentialId: string; publicKey: Uint8Array; address: string; attachment?: string; transports?: string[];
   /** LOCAL testing only: an in-browser test passkey's private key. */
-  testKey?: JsonWebKey }
+  testKey?: JsonWebKey;
+  /** An ADDED device signs under its own rule (DeviceRegistry); the first
+   * device signs under the account's owner rule. */
+  ruleId?: number }
 
 function contractCall(contract: string, fn: string, args: xdr.ScVal[]) {
   // The same host function the relayer receives.

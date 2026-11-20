@@ -140,7 +140,7 @@ def main() -> None:
     # Registry, NAV oracle (two independent EURC feeders), policy.
     h = {n: net.upload(admin, W(n)) for n in ["registry", "nav_oracle", "policy", "vault_strategy", "webauthn_verifier",
                                                "smart_account", "fee_sponsor", "account_factory", "vault_factory",
-                                               "collateral_oracle"]}
+                                               "collateral_oracle", "device_registry"]}
     registry = net.deploy(admin, h["registry"], [A(admin.public_key)])
     for aid, addr, srcs in [("USDC", usdc, ["USDC_BASE"]), ("EURC", eurc, ["EURC_A", "EURC_B"])]:
         net.invoke(admin, registry, "add_asset", [struct({
@@ -195,7 +195,8 @@ def main() -> None:
     verifier = net.deploy(admin, h["webauthn_verifier"])
     account_factory = net.deploy(admin, h["account_factory"], [A(admin.public_key), A(verifier), scval.to_bytes(h["smart_account"])])
     sponsor = net.deploy(admin, h["fee_sponsor"], [A(admin.public_key), U32(30), U32(200), scval.to_uint64(5_000 * ONE)])
-    for target in (vault, account_factory):
+    device_registry = net.deploy(admin, h["device_registry"], [A(account_factory), A(verifier)])
+    for target in (vault, account_factory, device_registry):
         net.invoke(admin, sponsor, "whitelist_contract", [A(target)])
     for r in ("relayer1", "relayer2"):
         net.invoke(admin, sponsor, "add_relayer", [A(keys[r].public_key)])
@@ -210,7 +211,8 @@ def main() -> None:
         "assets": {"USDC": usdc, "EURC": eurc, "issuer": issuer.public_key},
         "contracts": {"registry": registry, "oracle": oracle, "policy": policy, "vault": vault, "soroswap_router": router,
                       "soroswap_factory": factory, "verifier": verifier, "account_factory": account_factory,
-                      "fee_sponsor": sponsor, "vault_factory": vault_factory, "collateral_oracle": collateral},
+                      "fee_sponsor": sponsor, "vault_factory": vault_factory, "collateral_oracle": collateral,
+                      "device_registry": device_registry},
         "wasm_hashes": {k: v.hex() for k, v in h.items()},
         "accounts": {k: kp.public_key for k, kp in keys.items()},
         "LOCAL_ONLY_secrets": {k: kp.secret for k, kp in keys.items()},

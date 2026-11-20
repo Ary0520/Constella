@@ -12,7 +12,8 @@ env = {
     "CONSTELLA_NETWORK_PASSPHRASE": c["network"]["passphrase"],
     # relayer (F1 / D-I / A2)
     "RELAYER_SECRETS": f'{sec["relayer1"]},{sec["relayer2"]}', "SPONSOR_CONTRACT_ID": ct["fee_sponsor"],
-    "SPONSOR_ALLOWED": f'{ct["vault"]}:deposit,redeem,withdraw,redeem_frozen', "ACCOUNT_FACTORY_ID": ct["account_factory"],
+    "SPONSOR_ALLOWED": f'{ct["vault"]}:deposit,redeem,withdraw,redeem_frozen;{ct["device_registry"]}:add_device',
+    "ACCOUNT_FACTORY_ID": ct["account_factory"],
     "RELAYER_HOST": "0.0.0.0", "RELAYER_PORT": "8787", "RELAYER_CORS_ORIGIN": "http://localhost:5173",
     "ACCOUNTS_PER_IP_PER_DAY": "50",
     # The local quickstart network charges ~35x testnet resource fees once its
