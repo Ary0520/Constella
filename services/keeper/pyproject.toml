@@ -1,0 +1,24 @@
+[project]
+name = "constella-keeper"
+version = "0.1.0"
+description = "Constella keeper: brings vaults back to their signed targets with policy-validated rebalances, and settles queued frozen-sleeve claims."
+requires-python = ">=3.11"
+dependencies = [
+    "stellar-sdk==17.0.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest==8.3.3"]
+
+[project.scripts]
+constella-keeper = "constella_keeper.main:cli"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

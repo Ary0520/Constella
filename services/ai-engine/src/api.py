@@ -1,0 +1,203 @@
+"""
+HTTP API for the thesis engine (used by the sandbox console and, later, the
+real frontend). stdlib only.
+
+  POST /thesis   {"text", "jurisdiction", "investor_class", "use_llm"?}
+       -> draft, allocation, simulation, explanation (+ optional AI summary),
+          canonical policy + hash, and the exact on-chain bind_policy terms.
+          422 {"error": "INFEASIBLE", "reasons", "nearest"?} when the rules
+          cannot all hold (the optimizer fails closed).
+  GET  /registry?jurisdiction=..&investor_class=..  -> assets + why not eligible
+  GET  /yields   -> live rates read from the chain
+  GET  /health
+
+Config (env): CONSTELLA_RPC_URL, CONSTELLA_NETWORK_PASSPHRASE, REGISTRY_ID,
+ORACLE_ID, READ_SOURCE (any existing account, for simulations), API_HOST
+(127.0.0.1), API_PORT (8790), API_CORS_ORIGIN (http://localhost:5173),
+LLM_ENABLED=1 to allow "use_llm" (then OPENROUTER_API_KEY and
+LLM_RUN_BUDGET_USD, default 0.05 for the whole process).
+"""
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Callable, Dict, Optional
+from urllib.parse import parse_qs, urlparse
+
+from src.explainer import generate_explanation
+from src.optimizer import InfeasibleAllocation, optimize_portfolio
+from src.parser import parse_thesis
+from src.retriever import AssetRegistry, retrieve_candidates
+from src.signer import assemble_canonical_policy, compute_policy_hash
+from src.simulator import simulate_portfolio
+
+MAX_BODY = 16 * 1024
+DEFAULT_SLIPPAGE_BPS = 50
+DEFAULT_REBALANCE_BAND_BPS = 200
+
+
+def bind_terms(draft, canonical, numeraire: str) -> Dict:
+    """The on-chain bind_policy arguments matching the signed policy."""
+    sleeves = []
+    for s in canonical.sleeves:
+        kind = "numeraire" if s.asset_id == numeraire else s.sleeve_type
+        sleeves.append({"asset_id": s.asset_id, "target_weight_bps": s.target_weight_bps,
+                        "min_band_bps": max(0, s.target_weight_bps - s.band_bps),
+                        "max_band_bps": min(10_000, s.target_weight_bps + s.band_bps), "sleeve_type": kind})
+    return {"min_liquidity_sleeve_bps": round(draft.min_liquidity_sleeve * 10_000),
+            "max_single_asset_bps": round(draft.max_single_asset_weight * 10_000),
+            "max_issuer_bps": round(draft.max_issuer_weight * 10_000),
+            "max_slippage_bps": DEFAULT_SLIPPAGE_BPS, "rebalance_band_bps": DEFAULT_REBALANCE_BAND_BPS,
+            "sleeves": sleeves}
+
+
+class Engine:
+    def __init__(self, load_registry: Callable[[], AssetRegistry], llm_factory: Optional[Callable] = None,
+                 live_yields: Optional[Callable] = None, cache_seconds: float = 60.0):
+        self.load_registry, self.llm_factory, self.live_yields = load_registry, llm_factory, live_yields
+        self.cache_seconds = cache_seconds
+        self._reg, self._at = None, 0.0
+
+    def registry(self) -> AssetRegistry:
+        if self._reg is None or time.time() - self._at > self.cache_seconds:
+            reg = self.load_registry()
+            if self.live_yields:
+                try:
+                    reg.apply_yields(self.live_yields(reg.list_assets()))
+                except Exception as e:  # no live rate = unknown, never a guess
+                    sys.stderr.write(f"live yields unavailable: {type(e).__name__}\n")
+            self._reg, self._at = reg, time.time()
+        return self._reg
+
+    def thesis(self, body: Dict) -> tuple[int, Dict]:
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 4000:
+            return 400, {"error": "INVALID_TEXT", "detail": "1-4000 characters"}
+        jur = str(body.get("jurisdiction", "")).strip()
+        cls = str(body.get("investor_class", "retail")).strip()
+        if not jur:
+            return 400, {"error": "JURISDICTION_REQUIRED", "detail": "from onboarding, never from the text"}
+        source, ai_note = "rules", None
+        if body.get("use_llm") and self.llm_factory:
+            from src.thesis_llm import parse_thesis_llm
+            draft, source = parse_thesis_llm(text, self.llm_factory(), jurisdiction=jur, investor_class=cls)
+        else:
+            draft = parse_thesis(text, jurisdiction=jur, investor_class=cls)
+            if body.get("use_llm"):
+                ai_note = "AI reading is disabled on this server; used the rule-based parser."
+        reg = self.registry()
+        cands = retrieve_candidates(draft, reg)
+        try:
+            opt = optimize_portfolio(draft, cands)
+        except InfeasibleAllocation as e:
+            return 422, {"error": "INFEASIBLE", "reasons": e.reasons, "relaxed": e.relaxed,
+                         "nearest": e.nearest.model_dump() if e.nearest else None, "draft": draft.model_dump()}
+        except ValueError as e:
+            return 422, {"error": "INFEASIBLE", "reasons": [str(e)], "draft": draft.model_dump()}
+        sim = simulate_portfolio(opt.weights, cands, draft)
+        exp = generate_explanation(text, draft, opt, cands)
+        summary = None
+        if body.get("use_llm") and self.llm_factory:
+            from src.thesis_llm import explain_llm
+            summary, ai_note = explain_llm(draft, opt, exp, cands, self.llm_factory())
+        canonical = assemble_canonical_policy(draft, opt, cands)
+        hex_hash, _ = compute_policy_hash(canonical)
+        return 200, {
+            "parse_source": source, "ai_note": ai_note, "draft": draft.model_dump(), "allocation": opt.model_dump(),
+            "simulation": sim.model_dump(), "explanation": exp.model_dump(), "ai_summary": summary,
+            "policy": json.loads(canonical.model_dump_json()), "policy_hash": hex_hash,
+            "bind_policy": bind_terms(draft, canonical, opt.numeraire),
+            "ineligible": reg.eligibility(jur, cls),
+        }
+
+
+def make_handler(engine: Engine, cors_origin: str):
+    class Handler(BaseHTTPRequestHandler):
+        server_version = "constella-thesis-api"
+
+        def log_message(self, fmt, *args):  # never log request bodies (theses are private)
+            sys.stderr.write("%s %s\n" % (self.address_string(), fmt % args))
+
+        def _reply(self, status: int, body: Dict) -> None:
+            data = json.dumps(body, default=str).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", cors_origin)
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_OPTIONS(self):
+            self._reply(204, {})
+
+        def do_GET(self):
+            url = urlparse(self.path)
+            try:
+                if url.path == "/health":
+                    return self._reply(200, {"ok": True, "llm": engine.llm_factory is not None})
+                if url.path == "/registry":
+                    q = parse_qs(url.query)
+                    reg = engine.registry()
+                    out = {"assets": [a.model_dump() for a in reg.list_assets()]}
+                    if q.get("jurisdiction"):
+                        out["ineligible"] = reg.eligibility(q["jurisdiction"][0], q.get("investor_class", ["retail"])[0])
+                    return self._reply(200, out)
+                if url.path == "/yields":
+                    reg = engine.registry()
+                    return self._reply(200, {a.asset_id: a.current_yield_pct for a in reg.list_assets() if a.current_yield_pct > 0})
+                return self._reply(404, {"error": "NOT_FOUND"})
+            except Exception as e:
+                sys.stderr.write(f"internal error: {type(e).__name__}: {e}\n")
+                return self._reply(500, {"error": "INTERNAL", "detail": type(e).__name__})
+
+        def do_POST(self):
+            if urlparse(self.path).path != "/thesis":
+                return self._reply(404, {"error": "NOT_FOUND"})
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                n = -1
+            if n <= 0 or n > MAX_BODY:
+                return self._reply(400, {"error": "INVALID_PARAMS", "detail": "body size"})
+            try:
+                body = json.loads(self.rfile.read(n))
+                assert isinstance(body, dict)
+            except Exception:
+                return self._reply(400, {"error": "INVALID_PARAMS", "detail": "JSON object expected"})
+            try:
+                status, out = engine.thesis(body)
+                return self._reply(status, out)
+            except ValueError as e:  # e.g. unknown investor class
+                return self._reply(400, {"error": "INVALID_PARAMS", "detail": str(e)[:200]})
+            except Exception as e:
+                sys.stderr.write(f"internal error: {type(e).__name__}: {e}\n")
+                return self._reply(500, {"error": "INTERNAL", "detail": type(e).__name__})
+
+    return Handler
+
+
+def cli() -> None:
+    env = os.environ
+    rpc, pas, src = env["CONSTELLA_RPC_URL"], env["CONSTELLA_NETWORK_PASSPHRASE"], env["READ_SOURCE"]
+    load = lambda: AssetRegistry.from_chain(rpc, pas, env["REGISTRY_ID"], src)
+    yields = None
+    if env.get("ORACLE_ID"):
+        from src.yields import live_lending_yields
+        yields = lambda cands: live_lending_yields(rpc, pas, src, env["ORACLE_ID"], cands)
+    llm = None
+    if env.get("LLM_ENABLED") == "1":
+        from src.llm import OpenRouterClient, SpendGuard
+        guard = SpendGuard(float(env.get("LLM_RUN_BUDGET_USD", "0.05")))  # shared by every request
+        llm = lambda: OpenRouterClient(guard)
+    engine = Engine(load, llm, yields)
+    host, port = env.get("API_HOST", "127.0.0.1"), int(env.get("API_PORT", "8790"))
+    sys.stderr.write(f"constella thesis API on {host}:{port} (LLM {'on' if llm else 'off'})\n")
+    ThreadingHTTPServer((host, port), make_handler(engine, env.get("API_CORS_ORIGIN", "http://localhost:5173"))).serve_forever()
+
+
+if __name__ == "__main__":
+    cli()

@@ -40,6 +40,45 @@ The fix is not complex: never price from a single thin source, enforce multi-sou
 
 This means collateral NAV is always conservative (protects lenders). Deposit NAV is fair (protects depositors from being diluted).
 
+### Who can move a price (audit O7a, 15 Nov 2026)
+- Each pushed source has its own **feeder** key, and only that key can call `update_price` for the source. The admin cannot write prices.
+- **Delayed changes:** any change to the sources of an asset that already has a valid price waits **48 hours**, publicly (`SOURCE_CHANGE_PROPOSED`). This covers adding a source and changing an existing one (feeder rotation, looser staleness or depth limits). Anyone may activate the change after the delay; the admin may cancel it.
+- Bootstrapping an asset that has no price yet is immediate, because nothing can consume a price that does not exist.
+- Registration never sets a price: activating a change to an existing source keeps its price, timestamp and depth.
+- `deactivate_source` is immediate (it can only halt pricing).
+- Verified provider facts for the pull sources (Reflector, RedStone) are in `references/ORACLE-SOURCES.md`.
+
+### Constella feeder service (audit O7d)
+- `services/feeder` pushes Constella-derived prices with each source's own feeder key.
+- **`ECB_EURC`:** EURC in USDC = ECB EUR/USD reference rate (Circle par redemption), timestamped at the ECB concertation (14:15 Europe/Berlin). Staleness limit 5 days (weekends and holidays).
+- **Gates:** sanity band, 500 bps jump guard (refuse and alert), ordering, idempotence.
+- **Independence:** this is a fundamental value, independent of market feeds, so a stablecoin depeg trips the cross-source deviation breaker.
+
+### Reflector pull sources (audit O7b, `1e2c5ff`)
+- `register_reflector_source(source, ReflectorConfig { contract, asset, quote, rounds })`: the source's price is read live from a Reflector Pulse feed. It goes through the same immediate-or-48 h rule as pushed sources and cannot be pushed into.
+- **Rounds:** the median of the newest `rounds` records (3–20). Fewer real records (gaps) mean the source is invalid. Staleness is measured on the **oldest** round used.
+- **Conversion** (rounding down):
+  - `InBase`, for a feed whose base is our numéraire (e.g. Reflector pubnet, base USDC): `median × 10^ours / 10^feed_decimals`.
+  - `ViaUsdc(key)`, for USD-based feeds (Reflector CEX/DEX, FX): `median(asset) × 10^ours / median(USDC)`, using the same feed's USDC key. USD is never assumed to equal USDC, and the cross rate is as stale as its stalest leg.
+  - Overflow invalidates the source; it never wraps.
+- **Validated at registration against the live feed:** decimals, quoted asset, base or USDC key, round bounds. A depth floor must be 0, because Reflector carries no depth.
+- **Thin markets:** Reflector's pubnet feed is an SDEX/AMM VWAP. Use it only alongside an independent source; the cross-source deviation breaker then fails closed on manipulation (YieldBlox lesson, `references/ORACLE-SOURCES.md` §5).
+- **Operations:** Reflector assets expire unless renewed with XRF, and an expired asset reads as invalid. Monitor and fund every key used.
+
+### RedStone pull sources (audit O7c, `d8ed508`)
+- `register_redstone_source(source, RedStoneConfig { adapter, feed_id, usdc_feed_id })`: the price is read live through `read_price_data_for_feed`.
+- **Conversion:** `price(asset) × 10^ours / price(USDC)` using the same adapter's USDC feed (8 decimals cancel), rounding down. There is no in-base mode, because RedStone is USD-based.
+- **Timestamp:** the **older signing time** (`package_timestamp` ms → s). The source is invalid if a leg is future-dated or older than the source's own staleness limit; RedStone itself keeps serving data for 30 h.
+- **Registration:** both feeds must be readable now. RedStone's EURC/USD id is `"EUROC"`.
+- **Observed adapter behaviour:** signatures are verified **per feed**. A feed without 3 valid signer signatures is silently not stored while the rest of the write succeeds, so a successful `write_prices` does not mean every feed updated. The stale feed then reads as invalid here.
+
+### Per-asset evaluation (audit O6, 15 Nov 2026)
+- Every rule below is evaluated **per asset**, among that asset's own sources. A sleeve may hold several assets at different prices (USDC and EURC in cash; BENJI and USDY in USD gov funds), and comparing them would be meaningless.
+- The **sleeve** is the configuration and pause domain: deviation threshold, minimum valid sources, and the pause flag / `NAV_PAUSE` event.
+- An asset belongs to exactly one sleeve, and a source ID cannot be re-registered for another asset or sleeve (`AssetSleeveMismatch`).
+- Per-asset reads: `asset_price(asset)` (median, deposit/fair) and `price(asset)` (minimum, collateral).
+- Sleeve-level `get_deposit_nav` / `get_collateral_nav` return a price only for a single-asset sleeve, and return `None` otherwise. Reads never pause a sleeve because of other assets.
+
 ### Rule 4: Deviation circuit breaker
 - If two or more valid sources exist and their values differ by **>2–3%** (threshold per asset, set in registry):
   - **Deposits paused** for the affected sleeve
@@ -50,13 +89,15 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 - Unaffected sleeves continue normally
 - **Where it is detected (audit O4, 15 Nov 2026):** the deviation check runs inside every price write (`update_price`, `register_source`), so the pause and its `NAV_PAUSE` event persist in that successful transaction. Reads re-check as defence in depth, but a pause first seen inside a caller that reverts would be rolled back — so writes are the authoritative trigger. Staleness and insufficient sources (Rule 5) are evaluated live on every read and are not latched.
 
+- **Limits (audit O5, decision D-G, `ae8e790`):** `deviation_threshold_bps` may never exceed **500** (5 %). Defaults are **200** for stablecoins and cash and **300** for tokenized money-market funds. Loosening a sleeve (a wider threshold or fewer required sources) waits **48 h** (`SLEEVE_CONFIG_PROPOSED`; anyone activates, the admin can cancel). Tightening is immediate.
+
 ### Rule 5: Staleness limits and hard stop
 - Every source has a **staleness limit** (time since last update, defined per-source in registry)
 - Sources beyond staleness limit are treated as invalid (same as unavailable)
 - **Timestamp integrity (audit O2, 15 Nov 2026):** a price stamped later than the current ledger time is rejected on write and treated as invalid if found in storage (otherwise it would never go stale); a feed update older than the stored one is rejected (prevents replaying an old-but-fresh price over newer data)
 - **No sleeve may be configured below 2 sources** — `configure_sleeve` rejects `min_valid_sources < 2` (`MIN_VALID_SOURCES_FLOOR`, audit O3)
 - If **fewer than 2 valid sources** remain for a sleeve:
-  - **Hard stop**: deposits, redemptions, and rebalancing for that sleeve are halted
+  - **Hard stop**: deposits, redemptions, and rebalancing for that sleeve are halted. In the vault, a holder can still exit through `redeem_frozen` (audit V6): the priced part in cash now, the frozen units as a claim settled at the conservative price once the sleeve has a valid price again
   - Operators alerted
   - The sleeve stays halted until valid sources are restored
   - Remaining sleeves continue normally
@@ -72,7 +113,7 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 | Yield-bearing dollar (YLDS) | Figure's NAV feed | — | — |
 | USDC | Reflector · RedStone | On-chain (SDEX/Soroswap if deep) | — |
 | EURC | Reflector · RedStone | On-chain (if deep) | — |
-| Lending tokens (Blend) | Blend contract rate | — | — |
+| Lending positions (Blend v2) | **Derived (D-H):** underlying price (its own 2+ sources, or the base) × the pool's live `b_rate` | — (b_rate is Blend's own accounting, not a market price) | None: no price → hard stop |
 | XLM | Reflector · RedStone | CoinGecko (if implemented) | — |
 
 **Sources used:**
@@ -94,23 +135,26 @@ This means collateral NAV is always conservative (protects lenders). Deposit NAV
 ```
 
 - **On-chain providers** (Reflector, RedStone, Blend) are read directly by the oracle contract; no one pushes these prices.
+- **Blend positions (decision D-H, 16 Nov 2026, `ebdeaca` + `1fefc22`):** `register_blend_position(pool, underlying)` (admin; validated against the live pool; immutable; only pools of the official factory set once via `set_blend_factory`). Price per bToken = underlying median (for `asset_price`) or minimum (for `collateral_price` / SEP-40 `lastprice`) × `b_rate` / 1e12, with the underlying's timestamp. Rule 5's "2+ sources" applies to the underlying's market price; `b_rate` is not a market price and has no second source — it rises only by interest accrual and falls only on bad-debt write-off (ORACLE-SOURCES §4). Any pool failure or `b_rate ≤ 0` → `None`. Not yet: SEP-40 `prices()` history for positions (no snapshots are written for them).
 - **Issuer NAVs** originate off-chain and are carried in by a Constella feeder service signing with a dedicated key per source — never the admin key. Where an issuer signs its NAV, the contract verifies that signature.
 - **Current state (15 Nov 2026):** the safety rules are implemented and tested, but every source is written via admin-only `update_price`. Tracked as audit O7.
 
 ## SEP-40 Compatible Interface
 
-The vault publishes its NAV through a SEP-40 compatible interface so lenders can integrate using the standard Stellar oracle pattern:
+The oracle implements the exact SEP-40 interface (audit W5). It is verified against `sep-40-oracle` 1.4.0, which Blend v2 uses, and against Reflector's conventions:
 
 ```rust
-// SEP-40 compatible
-fn price(asset: Address) -> Option<PriceData>
-fn prices(assets: Vec<Address>, records: u32) -> Option<Vec<Option<PriceData>>>
-fn lastprice(asset: Address) -> Option<PriceData>
-fn resolution() -> u32  // in seconds
-fn base() -> Address    // numéraire asset
-fn decimals() -> u32
-fn assets() -> Vec<Address>
+enum Asset { Stellar(Address), Other(Symbol) }
+struct PriceData { price: i128, timestamp: u64 }   // exactly these two fields
+fn base() -> Asset; fn assets() -> Vec<Asset>; fn decimals() -> u32; fn resolution() -> u32 /* seconds */
+fn lastprice(asset: Asset) -> Option<PriceData>    // live conservative price; None if no valid price
+fn price(asset: Asset, timestamp: u64) -> Option<PriceData>       // history, floored to the grid
+fn prices(asset: Asset, records: u32) -> Option<Vec<PriceData>>   // newest first, 1..=20
 ```
+
+**Blend v2** calls only `lastprice(Asset::Stellar(token))` and `decimals()`. It rejects `None` (by aborting: `unwrap_optimized`), prices ≤ 0, and prices older than 24 h (`InvalidPrice` 1210). Constella returns `None` earlier, as soon as a source passes its own staleness limit, so Blend halts instead of lending against stale data.
+
+**Vault share tokens are not quoted yet** (audit L1); see `SEPS.md`.
 
 **Lender recommended config (in listing_kit):**
 - Use `collateral_nav()` for position sizing — not `price()`
@@ -165,7 +209,7 @@ Before any NAV oracle code ships to testnet:
 - [ ] Staleness limit configurable per-source (not hardcoded)
 - [ ] Circuit breaker emits on-chain events
 - [ ] Hard stop (< 2 valid sources) tested end-to-end
-- [ ] SEP-40 interface implemented and tested
+- [x] SEP-40 interface implemented and tested (W5; and against the **real Blend v2 pool WASM** (D-H): Blend lends against Constella's minimum price and refuses once Constella's feed is stale)
 - [ ] Collateral Passport view functions return valid data
 - [ ] Lender listing kit documents our oracle configuration
 - [ ] Independent review of oracle design before mainnet

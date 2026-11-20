@@ -1,9 +1,27 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, panic_with_error, Address, Env, Symbol,
-    Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, Address,
+    Env, Symbol, Vec,
 };
+
+/// An asset was added to (or updated in) the closed universe.
+/// Topics: [ASSET_ADDED, asset_id]. Data: contract address.
+#[contractevent(topics = ["ASSET_ADDED"], data_format = "single-value")]
+pub struct AssetAdded {
+    #[topic]
+    pub asset_id: Symbol,
+    pub contract_address: Address,
+}
+
+/// An asset was deactivated.
+/// Topics: [ASSET_DEACTIVATED, asset_id]. Data: contract address.
+#[contractevent(topics = ["ASSET_DEACTIVATED"], data_format = "single-value")]
+pub struct AssetDeactivated {
+    #[topic]
+    pub asset_id: Symbol,
+    pub contract_address: Address,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -82,6 +100,13 @@ pub trait AssetRegistryTrait {
     fn get_admin(env: Env) -> Address;
 }
 
+/// A1 (storage rent): every call in a transaction renews the instance for
+/// 30 days (reads in simulations persist nothing; the keeper's extend job
+/// covers idle periods).
+fn bump(env: &Env) {
+    env.storage().instance().extend_ttl(29 * 17_280, 30 * 17_280);
+}
+
 #[contract]
 pub struct AssetRegistry;
 
@@ -90,6 +115,7 @@ impl AssetRegistry {
     /// Runs atomically as part of deployment, so no one can claim an
     /// uninitialized registry (audit M3). There is no `initialize` entrypoint.
     pub fn __constructor(env: Env, admin: Address) {
+        bump(&env);
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 }
@@ -98,6 +124,7 @@ impl AssetRegistry {
 impl AssetRegistryTrait for AssetRegistry {
 
     fn add_asset(env: Env, entry: AssetEntry) {
+        bump(&env);
         let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
             Some(admin) => admin,
             None => panic_with_error!(&env, RegistryError::NotInitialized),
@@ -158,13 +185,15 @@ impl AssetRegistryTrait for AssetRegistry {
             &entry.asset_id,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "ASSET_ADDED"), entry.asset_id.clone()),
-            entry.contract_address.clone(),
-        );
+        AssetAdded {
+            asset_id: entry.asset_id.clone(),
+            contract_address: entry.contract_address.clone(),
+        }
+        .publish(&env);
     }
 
     fn deactivate_asset(env: Env, asset_id: Symbol) {
+        bump(&env);
         let admin: Address = match env.storage().instance().get(&DataKey::Admin) {
             Some(admin) => admin,
             None => panic_with_error!(&env, RegistryError::NotInitialized),
@@ -185,17 +214,20 @@ impl AssetRegistryTrait for AssetRegistry {
             .instance()
             .set(&DataKey::Asset(asset_id.clone()), &entry);
 
-        env.events().publish(
-            (Symbol::new(&env, "ASSET_DEACTIVATED"), asset_id.clone()),
-            entry.contract_address.clone(),
-        );
+        AssetDeactivated {
+            asset_id: asset_id.clone(),
+            contract_address: entry.contract_address.clone(),
+        }
+        .publish(&env);
     }
 
     fn get_asset(env: Env, asset_id: Symbol) -> Option<AssetEntry> {
+        bump(&env);
         env.storage().instance().get(&DataKey::Asset(asset_id))
     }
 
     fn get_asset_by_address(env: Env, contract_address: Address) -> Option<AssetEntry> {
+        bump(&env);
         let asset_id: Symbol = env
             .storage()
             .instance()
@@ -204,6 +236,7 @@ impl AssetRegistryTrait for AssetRegistry {
     }
 
     fn is_registered(env: Env, contract_address: Address) -> bool {
+        bump(&env);
         match Self::get_asset_by_address(env, contract_address) {
             Some(entry) => entry.is_active,
             None => false,
@@ -211,6 +244,7 @@ impl AssetRegistryTrait for AssetRegistry {
     }
 
     fn list_assets(env: Env) -> Vec<AssetEntry> {
+        bump(&env);
         let symbols: Vec<Symbol> = env
             .storage()
             .instance()
@@ -227,6 +261,7 @@ impl AssetRegistryTrait for AssetRegistry {
     }
 
     fn get_admin(env: Env) -> Address {
+        bump(&env);
         match env.storage().instance().get(&DataKey::Admin) {
             Some(admin) => admin,
             None => panic_with_error!(&env, RegistryError::NotInitialized),

@@ -1,10 +1,33 @@
 #![cfg(test)]
 
+extern crate std;
+
 use super::*;
 use soroban_sdk::{
     testutils::{Address as _, Ledger as _},
-    Address, Env,
+    Address, Env, Symbol,
 };
+
+/// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
+/// `(contract, topics, data)` tuples these assertions use - the same mapping
+/// the SDK applies in its own `PartialEq` for `ContractEvents` (W4.1).
+fn all_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, TryFromVal};
+    let mut out = soroban_sdk::Vec::new(env);
+    for e in env.events().all().events() {
+        let Some(id) = e.contract_id.clone() else { continue };
+        let addr = soroban_sdk::Address::try_from_val(env, &xdr::ScAddress::Contract(id)).unwrap();
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let mut topics = soroban_sdk::Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(soroban_sdk::Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((addr, topics, soroban_sdk::Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
 
 #[test]
 fn test_t52_sponsorship_whitelist() {
@@ -85,21 +108,23 @@ fn test_t53_sponsorship_rate_limits() {
         client.try_validate_sponsorship(&user, &vault_contract, &1000),
         Ok(Ok(()))
     );
-    client.record_sponsored_op(&user, &vault_contract, &1000);
+    let relayer = Address::generate(&env);
+    client.add_relayer(&relayer);
+    client.record_sponsored_op(&relayer, &user, &vault_contract, &1000);
 
     // Operation 2 (same hour)
     assert_eq!(
         client.try_validate_sponsorship(&user, &vault_contract, &1000),
         Ok(Ok(()))
     );
-    client.record_sponsored_op(&user, &vault_contract, &1000);
+    client.record_sponsored_op(&relayer, &user, &vault_contract, &1000);
 
     // Operation 3 (same hour)
     assert_eq!(
         client.try_validate_sponsorship(&user, &vault_contract, &1000),
         Ok(Ok(()))
     );
-    client.record_sponsored_op(&user, &vault_contract, &1000);
+    client.record_sponsored_op(&relayer, &user, &vault_contract, &1000);
 
     // Check user stats: hourly_ops == 3, daily_ops == 3
     let stats = client.get_user_stats(&user);
@@ -118,14 +143,14 @@ fn test_t53_sponsorship_rate_limits() {
         client.try_validate_sponsorship(&user, &vault_contract, &1000),
         Ok(Ok(()))
     );
-    client.record_sponsored_op(&user, &vault_contract, &1000);
+    client.record_sponsored_op(&relayer, &user, &vault_contract, &1000);
 
     // Operation 5 succeeds in the new hour! (Daily ops now reaches 5)
     assert_eq!(
         client.try_validate_sponsorship(&user, &vault_contract, &1000),
         Ok(Ok(()))
     );
-    client.record_sponsored_op(&user, &vault_contract, &1000);
+    client.record_sponsored_op(&relayer, &user, &vault_contract, &1000);
 
     // Daily limit reached (5 ops/day). 6th operation fails with DailyLimitExceeded!
     let daily_breach = client.try_validate_sponsorship(&user, &vault_contract, &1000);
@@ -171,7 +196,9 @@ fn test_t54_sponsorship_daily_budget() {
         client.try_validate_sponsorship(&user_1, &vault_contract, &30_000),
         Ok(Ok(()))
     );
-    client.record_sponsored_op(&user_1, &vault_contract, &30_000);
+    let relayer = Address::generate(&env);
+    client.add_relayer(&relayer);
+    client.record_sponsored_op(&relayer, &user_1, &vault_contract, &30_000);
 
     let global_stats = client.get_global_stats();
     assert_eq!(global_stats.total_ops_today, 1);
@@ -186,7 +213,7 @@ fn test_t54_sponsorship_daily_budget() {
         client.try_validate_sponsorship(&user_2, &vault_contract, &20_000),
         Ok(Ok(()))
     );
-    client.record_sponsored_op(&user_2, &vault_contract, &20_000);
+    client.record_sponsored_op(&relayer, &user_2, &vault_contract, &20_000);
 
     // Budget now completely saturated (50,000 / 50,000). Even 1 stroop rejected!
     let saturated_breach = client.try_validate_sponsorship(&user_1, &vault_contract, &1);
@@ -202,7 +229,7 @@ fn test_t54_sponsorship_daily_budget() {
     assert_eq!(paused_res, Err(Ok(SponsorError::SponsorPaused)));
 
     // Recording sponsored op when paused rejected
-    let paused_rec = client.try_record_sponsored_op(&user_1, &vault_contract, &100);
+    let paused_rec = client.try_record_sponsored_op(&relayer, &user_1, &vault_contract, &100);
     assert_eq!(paused_rec, Err(Ok(SponsorError::SponsorPaused)));
 
     // Unpause
@@ -299,7 +326,7 @@ fn m3_fresh_sponsor_cannot_be_claimed_by_a_stranger() {
 // -------------------------------------------------------------------------
 #[test]
 fn m2_every_sponsor_event_follows_rule_8() {
-    use soroban_sdk::testutils::{Address as _, Events};
+    use soroban_sdk::testutils::Address as _;
     use soroban_sdk::{FromVal, Symbol, SymbolStr, TryFromVal};
     let env = Env::default();
     env.mock_all_auths();
@@ -308,7 +335,7 @@ fn m2_every_sponsor_event_follows_rule_8() {
     let client = FeeSponsorContractClient::new(&env, &id);
     let check = |env: &Env| -> usize {
         let mut n = 0;
-        for (c, topics, _) in env.events().all().iter() {
+        for (c, topics, _) in all_events(env).iter() {
             if c != id { continue; }
             let sym = Symbol::try_from_val(env, &topics.get(0).unwrap()).unwrap();
             let s = SymbolStr::from_val(env, &sym.to_symbol_val());
@@ -323,11 +350,202 @@ fn m2_every_sponsor_event_follows_rule_8() {
     let user = Address::generate(&env);
     let mut n = 0;
     client.whitelist_contract(&vault); n += check(&env);
-    client.record_sponsored_op(&user, &vault, &100); n += check(&env);
+    let relayer = Address::generate(&env);
+    client.add_relayer(&relayer);
+    client.record_sponsored_op(&relayer, &user, &vault, &100); n += check(&env);
     client.set_limits(&20, &60, &2_000_000); n += check(&env);
     client.pause(); n += check(&env);
     client.unpause(); n += check(&env);
     client.remove_contract(&vault); n += check(&env);
     client.set_admin(&Address::generate(&env)); n += check(&env);
     assert!(n >= 7, "saw {n} events");
+}
+
+// -------------------------------------------------------------------------
+// Audit W4.1b (2026-11-15): golden event encodings.
+// -------------------------------------------------------------------------
+/// Golden event recorder (audit W4.1b). Captures the exact XDR of every event
+/// the contract under test emits during a scenario and compares it with the
+/// committed `golden/events.txt`, so the `Events::publish` -> `#[contractevent]`
+/// migration is proven byte-for-byte. Regenerate ONLY deliberately with
+/// `UPDATE_GOLDEN=1 cargo test golden_events`.
+struct GoldenEvents {
+    contract: soroban_sdk::Address,
+    lines: std::vec::Vec<std::string::String>,
+    names: std::collections::BTreeSet<std::string::String>,
+}
+
+impl GoldenEvents {
+    fn new(contract: &soroban_sdk::Address) -> Self {
+        Self { contract: contract.clone(), lines: std::vec::Vec::new(), names: Default::default() }
+    }
+
+    fn capture(&mut self, env: &soroban_sdk::Env, step: &str) {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, Limits, ScVal, WriteXdr};
+        for e in env.events().all().filter_by_contract(&self.contract).events() {
+            let ContractEventBody::V0(body) = &e.body;
+            let name = match body.topics.first() {
+                Some(ScVal::Symbol(s)) => std::string::String::from_utf8_lossy(s.0.as_slice()).into_owned(),
+                _ => std::string::String::from("?"),
+            };
+            let b64 = e.body.to_xdr_base64(Limits::none()).unwrap();
+            self.lines.push(std::format!("{step} | {name} | {b64}"));
+            self.names.insert(name);
+        }
+    }
+
+    fn finish(self, expected_names: &[&str]) {
+        for n in expected_names {
+            assert!(self.names.contains(*n), "scenario never emitted `{n}`; coverage incomplete");
+        }
+        let dir = std::format!("{}/golden", env!("CARGO_MANIFEST_DIR"));
+        let path = std::format!("{dir}/events.txt");
+        let text = self.lines.join("\n") + "\n";
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing golden file {path}"));
+            assert_eq!(expected.replace("\r\n", "\n"), text, "event encoding changed vs {path}");
+        }
+    }
+}
+
+#[test]
+fn golden_events_fee_sponsor() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000u64));
+    let mut g = GoldenEvents::new(&id);
+    g.capture(&env, "constructor");
+    let client = FeeSponsorContractClient::new(&env, &id);
+    let vault = Address::generate(&env);
+    let user = Address::generate(&env);
+    client.whitelist_contract(&vault); g.capture(&env, "whitelist_contract");
+    let relayer = Address::generate(&env);
+    client.add_relayer(&relayer); g.capture(&env, "add_relayer");
+    client.record_sponsored_op(&relayer, &user, &vault, &100); g.capture(&env, "record_sponsored_op");
+    client.set_limits(&20, &60, &2_000_000); g.capture(&env, "set_limits");
+    client.pause(); g.capture(&env, "pause");
+    client.unpause(); g.capture(&env, "unpause");
+    client.remove_relayer(&relayer); g.capture(&env, "remove_relayer");
+    client.remove_contract(&vault); g.capture(&env, "remove_contract");
+    client.set_admin(&Address::generate(&env)); g.capture(&env, "set_admin");
+    g.finish(&["SPONSOR_INITIALIZED", "CONTRACT_WHITELISTED", "RELAYER_ADDED", "RELAYER_REMOVED", "SPONSORED_OP", "LIMITS_UPDATED",
+        "SPONSOR_PAUSED", "SPONSOR_UNPAUSED", "CONTRACT_UNWHITELISTED", "SPONSOR_ADMIN_TRANSFERRED"]);
+}
+
+/// Audit F1a: per-user quota state must not live in instance storage. The
+/// instance entry is loaded by every call and is size-capped, so growing it
+/// per user would eventually brick the sponsor for everyone (same class as
+/// vault audit W2). Each user's stats belong in their own persistent entry.
+#[test]
+fn f1a_instance_storage_does_not_grow_with_the_number_of_users() {
+    use soroban_sdk::testutils::storage::{Instance as _, Persistent as _};
+    let env = Env::default();
+    env.mock_all_auths();
+    env.ledger().set_timestamp(1_731_600_000);
+    let admin = Address::generate(&env);
+    let id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &id);
+    let vault = Address::generate(&env);
+    client.whitelist_contract(&vault);
+    let first = Address::generate(&env);
+    let relayer = Address::generate(&env);
+    client.add_relayer(&relayer);
+    client.record_sponsored_op(&relayer, &first, &vault, &1_000);
+    let instance_len = || env.as_contract(&id, || env.storage().instance().all().len());
+    let baseline = instance_len();
+    for _ in 0..20 {
+        client.record_sponsored_op(&relayer, &Address::generate(&env), &vault, &1_000);
+    }
+    assert_eq!(instance_len(), baseline, "per-user stats leaked into instance storage");
+    assert!(env.as_contract(&id, || env.storage().instance().get_ttl()) > 0);
+    let persisted = env.as_contract(&id, || env.storage().persistent().all().len());
+    assert!(persisted >= 21, "each user's stats must be their own persistent entry");
+}
+
+/// Audit F1b: only the designated relayer records sponsored operations; the
+/// relayer key cannot reconfigure anything; only the admin designates it.
+#[test]
+fn f1b_only_pool_relayers_record_and_they_cannot_reconfigure() {
+    use soroban_sdk::testutils::{MockAuth, MockAuthInvoke};
+    use soroban_sdk::IntoVal;
+    let env = Env::default();
+    env.ledger().set_timestamp(1_731_600_000);
+    let admin = Address::generate(&env);
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let id = env.register(FeeSponsorContract, (admin.clone(), 10u32, 50u32, 1_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &id);
+    let vault = Address::generate(&env);
+    let user = Address::generate(&env);
+    let as_ = |who: &Address, f: &'static str, args: soroban_sdk::Vec<soroban_sdk::Val>| {
+        env.mock_auths(&[MockAuth { address: who, invoke: &MockAuthInvoke { contract: &id, fn_name: f, args, sub_invokes: &[] } }]);
+    };
+    let rec = |r: &Address| (r.clone(), user.clone(), vault.clone(), 100u64).into_val(&env);
+    as_(&admin, "whitelist_contract", (vault.clone(),).into_val(&env));
+    client.whitelist_contract(&vault);
+    // Nobody can record before a relayer is added.
+    as_(&r1, "record_sponsored_op", rec(&r1));
+    assert_eq!(client.try_record_sponsored_op(&r1, &user, &vault, &100), Err(Ok(SponsorError::RelayerNotSet)));
+    // Only the admin manages the pool.
+    as_(&r1, "add_relayer", (r1.clone(),).into_val(&env));
+    assert!(client.try_add_relayer(&r1).is_err());
+    for r in [&r1, &r2] {
+        as_(&admin, "add_relayer", (r.clone(),).into_val(&env));
+        client.add_relayer(r);
+    }
+    as_(&admin, "add_relayer", (r1.clone(),).into_val(&env));
+    assert_eq!(client.try_add_relayer(&r1), Err(Ok(SponsorError::RelayerExists)));
+    assert_eq!(client.get_relayers(), soroban_sdk::vec![&env, r1.clone(), r2.clone()]);
+    // Both pool members record; each must sign for itself.
+    for r in [&r1, &r2] {
+        as_(r, "record_sponsored_op", rec(r));
+        client.record_sponsored_op(r, &user, &vault, &100);
+    }
+    assert_eq!(client.get_user_stats(&user).daily_ops, 2);
+    as_(&r1, "record_sponsored_op", rec(&r2));
+    assert!(client.try_record_sponsored_op(&r2, &user, &vault, &100).is_err(), "r1 cannot sign as r2");
+    // The admin is not a relayer; a stranger is not either, even signing.
+    let stranger = Address::generate(&env);
+    as_(&stranger, "record_sponsored_op", rec(&stranger));
+    assert_eq!(client.try_record_sponsored_op(&stranger, &user, &vault, &100), Err(Ok(SponsorError::NotARelayer)));
+    as_(&admin, "record_sponsored_op", rec(&admin));
+    assert_eq!(client.try_record_sponsored_op(&admin, &user, &vault, &100), Err(Ok(SponsorError::NotARelayer)));
+    // A removed (rotated / compromised) key stops working at once.
+    as_(&admin, "remove_relayer", (r2.clone(),).into_val(&env));
+    client.remove_relayer(&r2);
+    as_(&r2, "record_sponsored_op", rec(&r2));
+    assert_eq!(client.try_record_sponsored_op(&r2, &user, &vault, &100), Err(Ok(SponsorError::NotARelayer)));
+    as_(&admin, "remove_relayer", (r2.clone(),).into_val(&env));
+    assert_eq!(client.try_remove_relayer(&r2), Err(Ok(SponsorError::NotARelayer)));
+    // A relayer key cannot loosen anything.
+    as_(&r1, "set_limits", (1_000u32, 5_000u32, 1_000_000_000u64).into_val(&env));
+    assert!(client.try_set_limits(&1_000, &5_000, &1_000_000_000).is_err());
+    as_(&admin, "pause", ().into_val(&env));
+    client.pause();
+    as_(&r1, "unpause", ().into_val(&env));
+    assert!(client.try_unpause().is_err());
+    as_(&r1, "whitelist_contract", (user.clone(),).into_val(&env));
+    assert!(client.try_whitelist_contract(&user).is_err());
+    as_(&r1, "add_relayer", (stranger.clone(),).into_val(&env));
+    assert!(client.try_add_relayer(&stranger).is_err());
+}
+
+/// Decision D-I: the pool is bounded (it lives in instance storage).
+#[test]
+fn f1c_the_relayer_pool_is_bounded() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let id = env.register(FeeSponsorContract, (Address::generate(&env), 10u32, 50u32, 1_000_000u64));
+    let client = FeeSponsorContractClient::new(&env, &id);
+    for _ in 0..MAX_RELAYERS {
+        client.add_relayer(&Address::generate(&env));
+    }
+    assert_eq!(client.try_add_relayer(&Address::generate(&env)), Err(Ok(SponsorError::TooManyRelayers)));
+    assert_eq!(client.get_relayers().len(), MAX_RELAYERS);
 }

@@ -88,6 +88,17 @@ pub struct RedemptionCapacity {
 
 ---
 
+## Implementation status (2026-11-19, decision D-N)
+
+Built and proven on the **real Blend v2 pool** (`contracts/collateral-oracle`, `c59d5de`):
+
+- **Why a separate feed:** a lender's pool asks one SEP-40 oracle for every price. The share price comes from the vault, and the vault asks the NAV oracle for asset prices, so answering share prices from the NAV oracle itself would be oracle -> vault -> oracle - contract re-entry, which Soroban forbids. The Collateral Passport feed forwards ordinary assets to the NAV oracle and asks the vault for share prices.
+- **Price:** the vault's **conservative NAV per share** (`get_nav_conservative`: minimum of each asset's valid sources; holdings are the lower of booked and real, so a donation cannot inflate it), converted into the feed's base when the vault's currency differs.
+- **Halt-on-invalid:** when the vault cannot value itself, the share has **no price**; a Blend pool then cannot lend against it (and cannot liquidate on a guess). Tested: stale feeds -> no share price while USDC is still priced -> borrowing refused; fresh prices -> borrowing resumes.
+- **Listing:** admin-only, checked (same NAV oracle, same decimals), and **permanent** - a delisting would strip the price from every open loan, so the vault's own validity is the only switch.
+- **LTV:** the pool lists the share at the vault's `get_listing_kit().recommended_ltv_bps`.
+- **Not served:** historical share prices (`price(asset, t)` -> None; lenders read `lastprice`).
+
 ## 3. On-Chain Soroban Interface
 
 ```rust

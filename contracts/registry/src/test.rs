@@ -4,9 +4,30 @@ extern crate std;
 
 use super::*;
 use soroban_sdk::{
-    testutils::{Address as _, Events},
+    testutils::Address as _,
     vec, Address, Env, Symbol,
 };
+
+/// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
+/// `(contract, topics, data)` tuples these assertions use - the same mapping
+/// the SDK applies in its own `PartialEq` for `ContractEvents` (W4.1).
+fn all_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, TryFromVal};
+    let mut out = soroban_sdk::Vec::new(env);
+    for e in env.events().all().events() {
+        let Some(id) = e.contract_id.clone() else { continue };
+        let addr = soroban_sdk::Address::try_from_val(env, &xdr::ScAddress::Contract(id)).unwrap();
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let mut topics = soroban_sdk::Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(soroban_sdk::Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((addr, topics, soroban_sdk::Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
 
 /// Issuer per REGISTRY.md (USDC and EURC are both Circle).
 fn issuer_of(asset_id: &str) -> &'static str {
@@ -344,7 +365,7 @@ fn test_t25_event_emissions_verification() {
 
     use soroban_sdk::TryFromVal;
 
-    let events = env.events().all();
+    let events = all_events(&env);
     assert!(!events.is_empty());
 
     let asset_added_sym = Symbol::new(&env, "ASSET_ADDED");
@@ -369,7 +390,7 @@ fn test_t25_event_emissions_verification() {
     // Deactivate asset emits ASSET_DEACTIVATED
     client.deactivate_asset(&Symbol::new(&env, "USDC"));
 
-    let events = env.events().all();
+    let events = all_events(&env);
     let asset_deactivated_sym = Symbol::new(&env, "ASSET_DEACTIVATED");
 
     let mut found_deactivated = false;
@@ -414,4 +435,88 @@ mod p2 {
         );
         assert!(client.get_asset(&Symbol::new(&env, "MYSTERY")).is_none());
     }
+}
+
+// -------------------------------------------------------------------------
+// Audit W4.1b (2026-11-15): golden event encodings.
+// -------------------------------------------------------------------------
+/// Golden event recorder (audit W4.1b). Captures the exact XDR of every event
+/// the contract under test emits during a scenario and compares it with the
+/// committed `golden/events.txt`, so the `Events::publish` -> `#[contractevent]`
+/// migration is proven byte-for-byte. Regenerate ONLY deliberately with
+/// `UPDATE_GOLDEN=1 cargo test golden_events`.
+struct GoldenEvents {
+    contract: soroban_sdk::Address,
+    lines: std::vec::Vec<std::string::String>,
+    names: std::collections::BTreeSet<std::string::String>,
+}
+
+impl GoldenEvents {
+    fn new(contract: &soroban_sdk::Address) -> Self {
+        Self { contract: contract.clone(), lines: std::vec::Vec::new(), names: Default::default() }
+    }
+
+    fn capture(&mut self, env: &soroban_sdk::Env, step: &str) {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, Limits, ScVal, WriteXdr};
+        for e in env.events().all().filter_by_contract(&self.contract).events() {
+            let ContractEventBody::V0(body) = &e.body;
+            let name = match body.topics.first() {
+                Some(ScVal::Symbol(s)) => std::string::String::from_utf8_lossy(s.0.as_slice()).into_owned(),
+                _ => std::string::String::from("?"),
+            };
+            let b64 = e.body.to_xdr_base64(Limits::none()).unwrap();
+            self.lines.push(std::format!("{step} | {name} | {b64}"));
+            self.names.insert(name);
+        }
+    }
+
+    fn finish(self, expected_names: &[&str]) {
+        for n in expected_names {
+            assert!(self.names.contains(*n), "scenario never emitted `{n}`; coverage incomplete");
+        }
+        let dir = std::format!("{}/golden", env!("CARGO_MANIFEST_DIR"));
+        let path = std::format!("{dir}/events.txt");
+        let text = self.lines.join("\n") + "\n";
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing golden file {path}"));
+            assert_eq!(expected.replace("\r\n", "\n"), text, "event encoding changed vs {path}");
+        }
+    }
+}
+
+#[test]
+fn golden_events_registry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let admin = Address::generate(&env);
+    let id = env.register(AssetRegistry, (admin.clone(),));
+    let client = AssetRegistryClient::new(&env, &id);
+    let mut g = GoldenEvents::new(&id);
+    let usdc = Address::generate(&env);
+    client.add_asset(&create_sample_entry(&env, &usdc, "USDC", SleeveType::Cash, 0, "PYTH_USDC"));
+    g.capture(&env, "add_asset");
+    client.deactivate_asset(&Symbol::new(&env, "USDC"));
+    g.capture(&env, "deactivate_asset");
+    g.finish(&["ASSET_ADDED", "ASSET_DEACTIVATED"]);
+}
+
+/// A1 (storage rent): every call in a transaction renews the registry's
+/// instance for 30 days, so assets in regular use never archive.
+#[test]
+fn a1_regular_use_keeps_the_registry_live() {
+    use soroban_sdk::testutils::{storage::Instance as _, Ledger};
+    let env = Env::default();
+    let admin = Address::generate(&env);
+    let id = env.register(AssetRegistry, (admin,));
+    let client = AssetRegistryClient::new(&env, &id);
+    for _ in 0..12 {
+        env.ledger().with_mut(|l| { l.sequence_number += 30 * 17_280; l.timestamp += 30 * 86_400; });
+        let _ = client.list_assets();
+    }
+    env.as_contract(&id, || assert!(env.storage().instance().get_ttl() >= 29 * 17_280));
 }

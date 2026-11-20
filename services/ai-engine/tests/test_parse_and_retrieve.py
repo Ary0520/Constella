@@ -3,6 +3,7 @@ TDD Test Suite for Slice 1: Thesis Engine Parse & Retrieve
 These tests define the behavioral contract BEFORE implementation code is written.
 """
 
+from tests.fixtures import fixture_registry
 import pytest
 from pydantic import ValidationError
 
@@ -40,7 +41,7 @@ def test_t01_standard_treasury_runway_parsing():
     assert policy.investor_class == "professional"
 
     # Verify retrieval against registered assets
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     candidate_ids = [c.asset_id for c in candidates]
@@ -62,7 +63,7 @@ def test_t02_closed_universe_blocks_hallucinated_assets():
     thesis = "Put 50% in TSLA stock and 50% in Bitcoin on Stellar."
     policy = parse_thesis(thesis, jurisdiction="US", investor_class="retail")
 
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     candidate_ids = [c.asset_id for c in candidates]
@@ -86,13 +87,12 @@ def test_t03_retail_investor_eligibility_gating():
     thesis = "Invest 100% in high yield equities and tech funds."
     policy = parse_thesis(thesis, jurisdiction="US", investor_class="retail")
 
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     for c in candidates:
-        # No asset requiring professional or institutional status should be returned to US retail
-        assert c.requires_professional is False, f"Unauthorized asset {c.asset_id} leaked to retail"
-        assert c.requires_institutional is False, f"Institutional asset {c.asset_id} leaked to retail"
+        # D-B: retail users get permissionless assets only.
+        assert c.permissionless, f"Gated asset {c.asset_id} leaked to retail"
         assert "US" not in c.blocked_jurisdictions
 
 

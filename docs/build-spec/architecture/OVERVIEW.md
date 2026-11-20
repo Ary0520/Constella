@@ -189,7 +189,7 @@
 
 | Layer | Primary Tech |
 |---|---|
-| Smart contracts | Rust · Soroban SDK 28.x · OpenZeppelin stellar-contracts v0.8.0 |
+| Smart contracts | Rust · Soroban SDK 28.0.0 (in use since audit W4.1) · OpenZeppelin stellar-contracts v0.8.0 (W4.2) · built with stellar-cli v25.2.0+ |
 | Frontend | TypeScript · React/Next.js · Stellar Wallets Kit |
 | AI engine | Python · LangChain · PyPortfolioOpt · pgvector |
 | Data | PostgreSQL · Galexie · Stellar RPC |

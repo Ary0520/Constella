@@ -1,6 +1,7 @@
 # Target directories
 target/
-Cargo.lock
+# Cargo.lock is committed: contracts are deployed binaries, so release builds
+# must resolve exactly the audited dependency versions (use --locked).
 
 # Python
 __pycache__/

@@ -1,67 +1,151 @@
+//! Constella passkey smart account on the OpenZeppelin smart-account framework
+//! (audit W4.3b; `stellar-accounts` 0.8.0).
+//!
+//! Authorization is context-centric: every operation the account authorizes
+//! (`auth_contexts`) must be matched, by an ID the signer chooses and signs,
+//! to a stored context rule that scopes what its signers may do:
+//!
+//! * **Owner rule** (installed by the constructor): `Default` scope, the
+//!   owner's passkey. Full control. It can never be removed, never expire and
+//!   never lose its last signer.
+//! * **Recovery rule** (added by the owner): scoped to `CallContract(self)` -
+//!   the account's own management functions only - with M-of-N backup /
+//!   guardian passkeys under the threshold policy. Guardians can only
+//!   *propose* a new owner key; it takes effect after a 48-hour delay unless
+//!   the owner cancels (decision D-F, audit S4). They can NOT authorize
+//!   transfers, deposits, any other contract call, or any other management
+//!   call: only the owner rule may manage the account.
+//!
+//! Passkeys are `Signer::External(webauthn_verifier, public_key)`; each one
+//! signs a WebAuthn assertion over SHA-256(account, signature_payload,
+//! context_rule_ids), so the chosen rules are part of what the user approves.
+//!
+//! There is deliberately no `execute` entry point: a self-scoped recovery rule
+//! must not become a path to arbitrary calls.
 #![no_std]
 
 use soroban_sdk::{
-    auth::{Context, CustomAccountInterface},
-    contract, contracterror, contractimpl, contracttype,
+    auth::{Context, ContractContext, CustomAccountInterface},
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype,
     crypto::Hash,
-    BytesN, Env, String, Symbol, Vec,
+    panic_with_error, vec, Address, Bytes, BytesN, Env, Map, String, Symbol, Val, Vec,
 };
+use stellar_accounts::smart_account::{
+    self as oz, AuthDigestPreimage, AuthPayload, ContextRule, ContextRuleType, Signer, SmartAccount, SmartAccountError,
+};
+
+// Constella's own event (Rule 8 name), byte-identical to the pre-W4.3b
+// encoding. Rule / signer / policy management events are emitted by the
+// OpenZeppelin library itself (context_rule_added, signer_registered, ...).
+#[contractevent(topics = ["ACCOUNT_INITIALIZED"], data_format = "single-value")]
+pub struct AccountInitialized {
+    #[topic]
+    pub account: Address,
+    pub public_key: BytesN<65>,
+}
+
+/// Guardians proposed `new_owner`; executable at `executable_at` (audit S4).
+#[contractevent(topics = ["RECOVERY_PROPOSED"], data_format = "vec")]
+pub struct RecoveryProposed {
+    #[topic]
+    pub account: Address,
+    pub new_owner: Signer,
+    pub executable_at: u64,
+}
+
+#[contractevent(topics = ["RECOVERY_CANCELLED"], data_format = "single-value")]
+pub struct RecoveryCancelled {
+    #[topic]
+    pub account: Address,
+    pub new_owner: Signer,
+}
+
+#[contractevent(topics = ["RECOVERY_EXECUTED"], data_format = "single-value")]
+pub struct RecoveryExecuted {
+    #[topic]
+    pub account: Address,
+    pub new_owner: Signer,
+}
+
+/// Delay before a guardian-proposed recovery can take effect (decision D-F):
+/// 48 h, the same window as the vault upgrade timelock and the policy
+/// amendment notice period.
+pub const RECOVERY_DELAY_SECONDS: u64 = 48 * 3600;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRecovery {
+    pub new_owner: Signer,
+    pub executable_at: u64,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum AccError {
-    AlreadyInitialized = 1,
-    NotInitialized = 2,
-    Unauthorized = 3,
-    InvalidSignature = 4,
-    ThresholdNotMet = 5,
-    SignerNotFound = 6,
-    SignerAlreadyExists = 7,
-    InvalidThreshold = 8,
-    CannotRemoveBelowThreshold = 9,
-    DuplicateSigner = 10,
-    InvalidSignerWeight = 11,
+    /// The owner key is not a 65-byte uncompressed SEC-1 P-256 point.
+    InvalidPublicKey = 1,
+    /// The owner rule cannot be removed or given an expiry (anti-bricking).
+    OwnerRuleProtected = 2,
+    /// The owner rule must keep at least one signer (anti-bricking).
+    OwnerRuleNeedsSigner = 3,
+    /// A threshold policy on the rule would require more signers than remain.
+    ThresholdUnreachable = 4,
+    /// Only the owner rule may authorize account management; other rules may
+    /// only propose a recovery (audit S4).
+    ManagementRequiresOwner = 5,
+    /// No recovery is pending.
+    NoPendingRecovery = 6,
+    /// The 48-hour recovery delay has not elapsed.
+    RecoveryNotReady = 7,
+    /// The proposed key already belongs to the owner rule.
+    AlreadyOwner = 8,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[contracttype]
-#[repr(u32)]
-pub enum SignerRole {
-    Owner = 0,
-    Backup = 1,
-    Guardian = 2,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct Signer {
-    pub public_key: BytesN<65>,
-    pub weight: u32,
-    pub role: SignerRole,
-    pub name: String,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct PasskeySignature {
-    pub public_key: BytesN<65>,
-    pub signature: BytesN<64>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct PasskeyAuth {
-    pub signatures: Vec<PasskeySignature>,
-}
-
 #[derive(Clone)]
-#[contracttype]
 pub enum DataKey {
-    Initialized,
-    Threshold,
-    Signer(BytesN<65>),
-    SignerKeys,
+    OwnerRule,
+    PendingRecovery,
+}
+
+/// Read-only view implemented by `constella-threshold-policy`; used to keep a
+/// governed rule's signer count >= its threshold.
+#[contractclient(name = "ThresholdQueryClient")]
+pub trait ThresholdQuery {
+    fn get_threshold(e: Env, context_rule_id: u32, smart_account: Address) -> u32;
+}
+
+fn owner_rule_id(e: &Env) -> u32 {
+    e.storage().instance().get(&DataKey::OwnerRule).unwrap_or_else(|| panic_with_error!(e, SmartAccountError::ContextRuleNotFound))
+}
+
+fn validate_owner_key(e: &Env, key: &Bytes) -> BytesN<65> {
+    if key.len() < 65 {
+        panic_with_error!(e, AccError::InvalidPublicKey);
+    }
+    let pk = match BytesN::<65>::try_from(key.slice(0..65)) {
+        Ok(pk) => pk,
+        Err(_) => panic_with_error!(e, AccError::InvalidPublicKey),
+    };
+    let a = pk.to_array();
+    if a[0] != 0x04 || a[1..].iter().all(|&b| b == 0) {
+        panic_with_error!(e, AccError::InvalidPublicKey);
+    }
+    pk
+}
+
+/// OZ warns that a threshold policy is not told about signer changes; refuse
+/// any change that would make a governed rule impossible to satisfy.
+fn check_thresholds_reachable(e: &Env, rule: &ContextRule) {
+    let account = e.current_contract_address();
+    for policy in rule.policies.iter() {
+        if let Ok(Ok(threshold)) = ThresholdQueryClient::new(e, &policy).try_get_threshold(&rule.id, &account) {
+            if threshold > rule.signers.len() {
+                panic_with_error!(e, AccError::ThresholdUnreachable);
+            }
+        }
+    }
 }
 
 #[contract]
@@ -69,397 +153,129 @@ pub struct SmartAccountContract;
 
 #[contractimpl]
 impl CustomAccountInterface for SmartAccountContract {
-    type Signature = PasskeyAuth;
-    type Error = AccError;
+    type Signature = AuthPayload;
+    type Error = SmartAccountError;
 
     fn __check_auth(
-        env: Env,
+        e: Env,
         signature_payload: Hash<32>,
-        signatures: PasskeyAuth,
-        _auth_contexts: Vec<Context>,
-    ) -> Result<(), AccError> {
-        if !env.storage().instance().has(&DataKey::Initialized) {
-            return Err(AccError::NotInitialized);
-        }
-
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1);
-
-        if signatures.signatures.is_empty() {
-            return Err(AccError::ThresholdNotMet);
-        }
-
-        let mut accumulated_weight: u32 = 0;
-        let mut seen_keys = Vec::<BytesN<65>>::new(&env);
-
-        for sig in signatures.signatures.iter() {
-            // Prevent duplicate signatures inflating weight
-            for seen in seen_keys.iter() {
-                if seen == sig.public_key {
-                    return Err(AccError::DuplicateSigner);
+        signatures: AuthPayload,
+        auth_contexts: Vec<Context>,
+    ) -> Result<(), SmartAccountError> {
+        oz::do_check_auth(&e, &signature_payload, &signatures, &auth_contexts)?;
+        // Audit S4: a call to this account's own functions authorized under
+        // any rule other than the owner rule may only propose a recovery.
+        // (do_check_auth has already checked one rule id per context.)
+        let me = e.current_contract_address();
+        let owner = owner_rule_id(&e);
+        let propose = Symbol::new(&e, "propose_recovery");
+        for (i, context) in auth_contexts.iter().enumerate() {
+            if let Context::Contract(ContractContext { contract, fn_name, .. }) = context {
+                let rule_id = signatures.context_rule_ids.get_unchecked(i as u32);
+                if contract == me && rule_id != owner && fn_name != propose {
+                    panic_with_error!(&e, AccError::ManagementRequiresOwner);
                 }
             }
-            seen_keys.push_back(sig.public_key.clone());
-
-            // Validate public key format: 65 bytes uncompressed SEC-1 begins with 0x04 and has non-zero coordinates
-            let pk_arr = sig.public_key.to_array();
-            if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
-                return Err(AccError::InvalidSignature);
-            }
-
-            // Validate raw signature: neither r nor s can be all zeros
-            let sig_arr = sig.signature.to_array();
-            let r_is_zero = sig_arr[..32].iter().all(|&b| b == 0);
-            let s_is_zero = sig_arr[32..].iter().all(|&b| b == 0);
-            if r_is_zero || s_is_zero {
-                return Err(AccError::InvalidSignature);
-            }
-
-            // Look up registered signer
-            let signer: Signer = match env
-                .storage()
-                .instance()
-                .get(&DataKey::Signer(sig.public_key.clone()))
-            {
-                Some(s) => s,
-                None => return Err(AccError::InvalidSignature),
-            };
-
-            // Cryptographic secp256r1 P-256 verification
-            env.crypto()
-                .secp256r1_verify(&sig.public_key, &signature_payload, &sig.signature);
-
-            accumulated_weight = accumulated_weight.saturating_add(signer.weight);
         }
-
-        if accumulated_weight < threshold {
-            return Err(AccError::ThresholdNotMet);
-        }
-
         Ok(())
+    }
+}
+
+#[contractimpl(contracttrait)]
+impl SmartAccount for SmartAccountContract {
+    fn remove_context_rule(e: &Env, context_rule_id: u32) {
+        e.current_contract_address().require_auth();
+        if context_rule_id == owner_rule_id(e) {
+            panic_with_error!(e, AccError::OwnerRuleProtected);
+        }
+        oz::remove_context_rule(e, context_rule_id);
+    }
+
+    fn update_context_rule_valid_until(e: &Env, context_rule_id: u32, valid_until: Option<u32>) -> ContextRule {
+        e.current_contract_address().require_auth();
+        if context_rule_id == owner_rule_id(e) && valid_until.is_some() {
+            panic_with_error!(e, AccError::OwnerRuleProtected);
+        }
+        oz::update_context_rule_valid_until(e, context_rule_id, valid_until)
+    }
+
+    fn remove_signer(e: &Env, context_rule_id: u32, signer_id: u32) {
+        e.current_contract_address().require_auth();
+        oz::remove_signer(e, context_rule_id, signer_id);
+        let rule = oz::get_context_rule(e, context_rule_id);
+        if context_rule_id == owner_rule_id(e) && rule.signers.is_empty() {
+            panic_with_error!(e, AccError::OwnerRuleNeedsSigner);
+        }
+        check_thresholds_reachable(e, &rule);
     }
 }
 
 #[contractimpl]
 impl SmartAccountContract {
-    /// Install the primary owner passkey at deployment (atomic, so no one can
-    /// claim a fresh account by installing their own key - audit M3). There is
-    /// no `initialize` entrypoint.
-    pub fn __constructor(env: Env, admin_public_key: BytesN<65>, threshold: u32, name: String) {
-        if threshold == 0 {
-            soroban_sdk::panic_with_error!(&env, AccError::InvalidThreshold);
-        }
-
-        let pk_arr = admin_public_key.to_array();
-        if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
-            soroban_sdk::panic_with_error!(&env, AccError::InvalidSignature);
-        }
-
-        // The primary owner signer is given weight equal to threshold to be immediately operational
-        let initial_weight = threshold;
-        let owner = Signer {
-            public_key: admin_public_key.clone(),
-            weight: initial_weight,
-            role: SignerRole::Owner,
-            name,
-        };
-
-        env.storage().instance().set(&DataKey::Threshold, &threshold);
-        env.storage()
-            .instance()
-            .set(&DataKey::Signer(admin_public_key.clone()), &owner);
-
-        let mut keys = Vec::new(&env);
-        keys.push_back(admin_public_key.clone());
-        env.storage().instance().set(&DataKey::SignerKeys, &keys);
-
-        env.storage().instance().set(&DataKey::Initialized, &true);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "ACCOUNT_INITIALIZED"),
-                env.current_contract_address(),
-            ),
-            admin_public_key,
-        );
-
+    /// Installs the owner rule atomically with deployment, so no one can claim
+    /// a fresh account (audit M3). `owner_key` is the passkey's 65-byte P-256
+    /// public key (optionally followed by its credential ID); `verifier` is
+    /// the shared `constella-webauthn-verifier` deployment.
+    pub fn __constructor(e: Env, verifier: Address, owner_key: Bytes, name: String) {
+        let pk = validate_owner_key(&e, &owner_key);
+        let owner = Signer::External(verifier, owner_key);
+        let rule = oz::add_context_rule(&e, &ContextRuleType::Default, &name, None, &vec![&e, owner], &Map::new(&e));
+        e.storage().instance().set(&DataKey::OwnerRule, &rule.id);
+        AccountInitialized { account: e.current_contract_address(), public_key: pk }.publish(&e);
     }
 
-    /// Add a new signer (requires self-authorization by the smart account)
-    pub fn add_signer(env: Env, signer: Signer) -> Result<(), AccError> {
-        env.current_contract_address().require_auth();
-
-        if !env.storage().instance().has(&DataKey::Initialized) {
-            return Err(AccError::NotInitialized);
-        }
-
-        if signer.weight == 0 {
-            return Err(AccError::InvalidSignerWeight);
-        }
-
-        let pk_arr = signer.public_key.to_array();
-        if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
-            return Err(AccError::InvalidSignature);
-        }
-
-        if env
-            .storage()
-            .instance()
-            .has(&DataKey::Signer(signer.public_key.clone()))
-        {
-            return Err(AccError::SignerAlreadyExists);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Signer(signer.public_key.clone()), &signer);
-
-        let mut keys: Vec<BytesN<65>> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SignerKeys)
-            .unwrap_or_else(|| Vec::new(&env));
-        keys.push_back(signer.public_key.clone());
-        env.storage().instance().set(&DataKey::SignerKeys, &keys);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "SIGNER_ADDED"),
-                env.current_contract_address(),
-            ),
-            signer.public_key,
-        );
-
-        Ok(())
+    /// ID of the protected owner rule.
+    pub fn get_owner_rule(e: Env) -> u32 {
+        owner_rule_id(&e)
     }
 
-    /// Update an existing signer's role, weight, or name (requires self-authorization; anti-bricking safety enforced)
-    pub fn update_signer(env: Env, signer: Signer) -> Result<(), AccError> {
-        env.current_contract_address().require_auth();
-
-        if !env.storage().instance().has(&DataKey::Initialized) {
-            return Err(AccError::NotInitialized);
+    /// Guardians propose a new owner key (audit S4). It can be executed after
+    /// `RECOVERY_DELAY_SECONDS`; a new proposal replaces the pending one and
+    /// restarts the clock. Authorized through `__check_auth` (recovery rule).
+    pub fn propose_recovery(e: Env, new_owner: Signer) {
+        e.current_contract_address().require_auth();
+        oz::validate_signer_key_size(&e, &new_owner);
+        if oz::get_context_rule(&e, owner_rule_id(&e)).signers.contains(&new_owner) {
+            panic_with_error!(&e, AccError::AlreadyOwner);
         }
-
-        if signer.weight == 0 {
-            return Err(AccError::InvalidSignerWeight);
-        }
-
-        let pk_arr = signer.public_key.to_array();
-        if pk_arr[0] != 0x04 || pk_arr[1..].iter().all(|&b| b == 0) {
-            return Err(AccError::InvalidSignature);
-        }
-
-        let existing: Signer = match env
-            .storage()
-            .instance()
-            .get(&DataKey::Signer(signer.public_key.clone()))
-        {
-            Some(s) => s,
-            None => return Err(AccError::SignerNotFound),
-        };
-
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1);
-
-        let keys: Vec<BytesN<65>> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SignerKeys)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut total_weight: u32 = 0;
-        for k in keys.iter() {
-            if let Some(s) = env
-                .storage()
-                .instance()
-                .get::<_, Signer>(&DataKey::Signer(k))
-            {
-                total_weight = total_weight.saturating_add(s.weight);
-            }
-        }
-
-        let new_total_weight = total_weight
-            .saturating_sub(existing.weight)
-            .saturating_add(signer.weight);
-        if new_total_weight < threshold {
-            return Err(AccError::CannotRemoveBelowThreshold);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Signer(signer.public_key.clone()), &signer);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "SIGNER_UPDATED"),
-                env.current_contract_address(),
-            ),
-            signer.public_key,
-        );
-
-        Ok(())
+        let executable_at = e.ledger().timestamp().saturating_add(RECOVERY_DELAY_SECONDS);
+        e.storage().instance().set(&DataKey::PendingRecovery, &PendingRecovery { new_owner: new_owner.clone(), executable_at });
+        RecoveryProposed { account: e.current_contract_address(), new_owner, executable_at }.publish(&e);
     }
 
-    /// Remove a signer (requires self-authorization; anti-bricking safety enforced)
-    pub fn remove_signer(env: Env, public_key: BytesN<65>) -> Result<(), AccError> {
-        env.current_contract_address().require_auth();
-
-        if !env.storage().instance().has(&DataKey::Initialized) {
-            return Err(AccError::NotInitialized);
-        }
-
-        let signer: Signer = match env
-            .storage()
-            .instance()
-            .get(&DataKey::Signer(public_key.clone()))
-        {
-            Some(s) => s,
-            None => return Err(AccError::SignerNotFound),
-        };
-
-        let threshold: u32 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(1);
-
-        let keys: Vec<BytesN<65>> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SignerKeys)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut total_weight: u32 = 0;
-        for k in keys.iter() {
-            if let Some(s) = env
-                .storage()
-                .instance()
-                .get::<_, Signer>(&DataKey::Signer(k))
-            {
-                total_weight = total_weight.saturating_add(s.weight);
-            }
-        }
-
-        // Anti-bricking check: remaining signer weight cannot fall below threshold
-        let remaining_weight = total_weight.saturating_sub(signer.weight);
-        if remaining_weight < threshold {
-            return Err(AccError::CannotRemoveBelowThreshold);
-        }
-
-        // Storage rent hygiene: completely remove zeroed / deprecated storage entry
-        env.storage()
-            .instance()
-            .remove(&DataKey::Signer(public_key.clone()));
-
-        let mut new_keys = Vec::new(&env);
-        for k in keys.iter() {
-            if k != public_key {
-                new_keys.push_back(k);
-            }
-        }
-        env.storage().instance().set(&DataKey::SignerKeys, &new_keys);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "SIGNER_REMOVED"),
-                env.current_contract_address(),
-            ),
-            public_key,
-        );
-
-        Ok(())
+    /// The owner cancels a pending recovery (owner rule only, see __check_auth).
+    pub fn cancel_recovery(e: Env) {
+        e.current_contract_address().require_auth();
+        let pending: PendingRecovery = e.storage().instance().get(&DataKey::PendingRecovery)
+            .unwrap_or_else(|| panic_with_error!(&e, AccError::NoPendingRecovery));
+        e.storage().instance().remove(&DataKey::PendingRecovery);
+        RecoveryCancelled { account: e.current_contract_address(), new_owner: pending.new_owner }.publish(&e);
     }
 
-    /// Update authentication threshold (requires self-authorization; anti-bricking safety enforced)
-    pub fn update_threshold(env: Env, new_threshold: u32) -> Result<(), AccError> {
-        env.current_contract_address().require_auth();
-
-        if !env.storage().instance().has(&DataKey::Initialized) {
-            return Err(AccError::NotInitialized);
+    /// After the delay, anyone may execute the recovery: the owner rule's
+    /// signers are replaced by the proposed key (added first, so the owner
+    /// rule is never empty). No authorization: the guardians' threshold and
+    /// the owner's 48-hour chance to cancel already happened.
+    pub fn execute_recovery(e: Env) {
+        let pending: PendingRecovery = e.storage().instance().get(&DataKey::PendingRecovery)
+            .unwrap_or_else(|| panic_with_error!(&e, AccError::NoPendingRecovery));
+        if e.ledger().timestamp() < pending.executable_at {
+            panic_with_error!(&e, AccError::RecoveryNotReady);
         }
-
-        if new_threshold == 0 {
-            return Err(AccError::InvalidThreshold);
+        let owner = owner_rule_id(&e);
+        let old_ids = oz::get_context_rule(&e, owner).signer_ids;
+        oz::add_signer(&e, owner, &pending.new_owner);
+        for id in old_ids.iter() {
+            oz::remove_signer(&e, owner, id);
         }
-
-        let keys: Vec<BytesN<65>> = env
-            .storage()
-            .instance()
-            .get(&DataKey::SignerKeys)
-            .unwrap_or_else(|| Vec::new(&env));
-
-        let mut total_weight: u32 = 0;
-        for k in keys.iter() {
-            if let Some(s) = env
-                .storage()
-                .instance()
-                .get::<_, Signer>(&DataKey::Signer(k))
-            {
-                total_weight = total_weight.saturating_add(s.weight);
-            }
-        }
-
-        if total_weight < new_threshold {
-            return Err(AccError::InvalidThreshold);
-        }
-
-        env.storage()
-            .instance()
-            .set(&DataKey::Threshold, &new_threshold);
-
-        env.events().publish(
-            (
-                Symbol::new(&env, "THRESHOLD_UPDATED"),
-                env.current_contract_address(),
-            ),
-            new_threshold,
-        );
-
-        Ok(())
+        e.storage().instance().remove(&DataKey::PendingRecovery);
+        RecoveryExecuted { account: e.current_contract_address(), new_owner: pending.new_owner }.publish(&e);
     }
 
-    /// Query the current threshold
-    pub fn get_threshold(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Threshold)
-            .unwrap_or(0)
-    }
-
-    /// Query an individual signer by public key
-    pub fn get_signer(env: Env, public_key: BytesN<65>) -> Option<Signer> {
-        env.storage().instance().get(&DataKey::Signer(public_key))
-    }
-
-    /// Query all registered signers
-    pub fn get_signers(env: Env) -> Vec<Signer> {
-        let mut signers = Vec::new(&env);
-        if let Some(keys) = env
-            .storage()
-            .instance()
-            .get::<_, Vec<BytesN<65>>>(&DataKey::SignerKeys)
-        {
-            for k in keys.iter() {
-                if let Some(s) = env
-                    .storage()
-                    .instance()
-                    .get::<_, Signer>(&DataKey::Signer(k))
-                {
-                    signers.push_back(s);
-                }
-            }
-        }
-        signers
+    pub fn get_pending_recovery(e: Env) -> Option<PendingRecovery> {
+        e.storage().instance().get(&DataKey::PendingRecovery)
     }
 }
 
 #[cfg(test)]
 mod test;
-

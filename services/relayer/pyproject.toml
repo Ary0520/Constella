@@ -1,0 +1,25 @@
+[project]
+name = "constella-relayer"
+version = "0.1.0"
+description = "Constella sponsor gateway: pays Stellar network fees for users with no XLM (passkey smart accounts), within on-chain quotas (audit F1)."
+requires-python = ">=3.11"
+dependencies = [
+    "stellar-sdk==17.0.1",
+]
+
+[project.optional-dependencies]
+# cryptography: the software passkey used by tests and the local-network e2e.
+dev = ["pytest==8.3.3", "cryptography==43.0.3"]
+
+[project.scripts]
+constella-relayer = "constella_relayer.server:cli"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

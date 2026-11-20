@@ -1,0 +1,36 @@
+# Constella LOCAL stack: `localnet/up.sh` (deploys, then starts the services).
+# Throwaway local keys only - never point this at testnet or mainnet.
+name: constella-local
+x-py: &py
+  image: python:3.12-slim
+  env_file: state/services.env
+  volumes: ["..:/repo", "./state:/state"]
+  restart: unless-stopped
+  depends_on: [node]
+services:
+  node:
+    image: stellar/quickstart:latest
+    command: ["--local", "--enable", "core,horizon,rpc,friendbot"]
+    ports: ["8000:8000"]
+  relayer:
+    <<: *py
+    working_dir: /repo/services/relayer
+    command: sh -c "pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; exec constella-relayer"
+    ports: ["8787:8787"]
+  keeper:
+    <<: *py
+    working_dir: /repo/services/keeper
+    command: sh -c "pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; exec constella-keeper"
+  watchdog:
+    <<: *py
+    working_dir: /repo/services/watchdog
+    command: sh -c "pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; exec constella-watchdog"
+  thesis-api:
+    <<: *py
+    working_dir: /repo/services/ai-engine
+    command: sh -c "pip install -q --no-cache-dir --root-user-action=ignore -e . >/dev/null 2>&1; exec python -m src.api"
+    ports: ["8790:8790"]
+  mailsink:
+    image: python:3.12-slim
+    command: sh -c "pip install -q --no-cache-dir --root-user-action=ignore aiosmtpd==1.4.6 >/dev/null 2>&1; exec python -u -m aiosmtpd -n -l 0.0.0.0:1025 -c aiosmtpd.handlers.Debugging"
+    restart: unless-stopped

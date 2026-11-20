@@ -35,7 +35,10 @@ For users who don't own XLM and don't want to think about blockchain, this is a 
 - No seed phrase, no private key management by the user
 - Social recovery: multiple authorized signers (e.g. phone + email + guardian address)
 - **Zipper (Protocol 27, CAP-71):** Authentication delegation for custom accounts — cheaper multi-signer setups with replay protection
-- Uses OpenZeppelin's smart-account framework
+- Built on OpenZeppelin `stellar-accounts` context rules (W4.3b). Passkey signatures are WebAuthn assertions, requiring user presence **and** user verification; a shared `webauthn-verifier` contract checks them.
+- **Owner rule:** the owner passkey has full control. This rule cannot be removed, cannot expire, and always keeps a signer.
+- **Recovery rule:** M-of-N guardians under the shared `threshold-policy`, scoped to the account. Guardians can only **propose** a new owner passkey. It takes effect after **48 hours**, and the current owner can cancel it during that window (decision D-F). After 48 hours anyone can execute it, so a user who lost their phone needs no extra step. Guardians can never move funds or change anything else; only the owner rule manages the account.
+- **Known limitation:** recovery protects against a **lost** passkey, not a **stolen** one. Whoever holds the owner passkey can cancel recoveries and already has full control, so a stolen owner key must be treated like a stolen card: move funds or rotate keys at once. Planned mitigations to consider: an owner-rule daily spending limit (OZ `spending_limit` policy), or a guardian-majority freeze (audit S4).
 
 **User experience:** "Create account with Face ID" → deposit → done. No XLM, no seed phrase.
 
@@ -52,6 +55,12 @@ For users who don't own XLM and don't want to think about blockchain, this is a 
 - Useful for partners who already have Stellar accounts for their users
 
 ---
+
+### Sponsored account creation (audit A2, implemented `f9694d9`, `0fbcebd`)
+
+`contracts/account-factory`: `create_account(owner_key)` is **permissionless** and deploys the audited passkey smart account with the factory's fixed WebAuthn verifier at `salt = SHA-256(owner_key)`. The address is a function of the key (`address_for`), so it can be shown before it exists, nobody can squat it, and only that key controls it; a repeat returns the existing account; `is_account` attests origin; code for future accounts changes only after 48 h.
+
+The relayer exposes `POST /accounts {"owner_key": hex}`: it builds the call itself (never client-supplied), pays through the normal sponsored path (whitelist, enforcing simulation, `record_sponsored_op` against the on-chain daily budget), and limits abuse per client IP per day (3) and globally per day (200). **Cost:** deploying an account pays its storage rent - **~1.82 XLM measured on a local network** (re-measure on testnet) - so account creation has its own fee cap (`ACCOUNT_MAX_FEE_STROOPS`, 3 XLM) separate from user calls (0.1 XLM). This is a real per-user acquisition cost.
 
 ## Fee Sponsorship Architecture
 
@@ -168,7 +177,7 @@ Using **Stellar Wallets Kit** for wallet connection:
 ## Implementation Checklist
 
 - [ ] Passkey smart account using OpenZeppelin smart-account framework
-- [ ] Fee-bump transaction sponsorship for all user vault operations
+- [x] Sponsorship of user vault operations (audit F1/S2, 16 Nov 2026): `services/relayer` — the relayer account is the transaction source and pays; passkey users sign only auth entries; quotas recorded on chain first (fee-sponsor relayer role). Proven zero-gas on a real local network. Classic-account fee-bump (CAP-15) path still to do
 - [ ] Reserve sponsorship for classic accounts (if used)
 - [ ] Sponsor account with spend limits and rate limits
 - [ ] Stellar Wallets Kit integration (upgraded to v28+)

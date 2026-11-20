@@ -2,9 +2,222 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contractclient, contracterror, contractimpl, contracttype, panic_with_error,
-    token, Address, BytesN, Env, FromVal, String, Symbol, SymbolStr, Vec,
+    auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, panic_with_error,
+    symbol_short, token, vec, Address, BytesN, Env, FromVal, IntoVal, Map, MuxedAddress, String, Symbol, SymbolStr,
+    Vec,
 };
+// Audit W2/W4.2: the share ledger (balances, allowances, total supply) uses the
+// OpenZeppelin stellar-tokens storage primitives: per-holder persistent
+// balance entries and a persistent total supply with TTL extension, and
+// temporary allowance entries whose `live_until_ledger` is validated. Only the
+// non-emitting primitives are used; events stay the golden-pinned SEP-41 shapes
+// below. SEP-41 v0.5 allows either a single-value/vec or a map data format;
+// OZ 0.8.0 emits maps, this vault emits single-value/vec - the same format as
+// the Stellar Asset Contract - and its bytes are pinned by golden/events.txt.
+use stellar_tokens::fungible::{
+    total_supply::{decrease_total_supply, increase_total_supply, total_supply as share_supply},
+    Base, INSTANCE_EXTEND_AMOUNT, INSTANCE_TTL_THRESHOLD,
+};
+// Audit W4.2b: SEP-56 asset movement and operator semantics come from the
+// OpenZeppelin vault module (`deposit_internal` / `withdraw_internal`). Its
+// single-NAV share maths is not used: deposits price at the median NAV and
+// redemptions at the conservative NAV (VAULT-DESIGN dual NAV).
+use stellar_tokens::vault::Vault as OzVault;
+
+// Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
+// Events::publish encodings; pinned by golden/events.txt). Lower-case names are
+// defined by SEP-41 (transfer, approve, mint, burn) and SEP-56 (deposit,
+// withdraw); everything else follows AGENT-RULES Rule 8.
+
+/// SEP-41: topics [transfer, from, to]; data amount.
+#[contractevent(topics = ["transfer"], data_format = "single-value")]
+pub struct Transfer {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+}
+
+/// SEP-41 (v0.5) transfer to a muxed account: topics [transfer, from, to]
+/// (`to` is the underlying address); data map {amount, to_muxed_id}.
+/// Same layout as OpenZeppelin stellar-tokens `MuxedTransfer`.
+#[contractevent(topics = ["transfer"], data_format = "map")]
+pub struct MuxedTransfer {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub to: Address,
+    pub to_muxed_id: Option<u64>,
+    pub amount: i128,
+}
+
+/// SEP-41: topics [approve, from, spender]; data [amount, live_until_ledger] (audit W6).
+#[contractevent(topics = ["approve"], data_format = "vec")]
+pub struct Approve {
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub spender: Address,
+    pub amount: i128,
+    pub live_until_ledger: u32,
+}
+
+/// SEP-41: topics [mint, to]; data amount.
+#[contractevent(topics = ["mint"], data_format = "single-value")]
+pub struct Mint {
+    #[topic]
+    pub to: Address,
+    pub amount: i128,
+}
+
+/// SEP-41: topics [burn, from]; data amount.
+#[contractevent(topics = ["burn"], data_format = "single-value")]
+pub struct Burn {
+    #[topic]
+    pub from: Address,
+    pub amount: i128,
+}
+
+/// Topics: [REBALANCE_STEP, proposer]. Data: [asset_in, asset_out, spent, received] (audit W1).
+#[contractevent(topics = ["REBALANCE_STEP"], data_format = "vec")]
+pub struct RebalanceStep {
+    #[topic]
+    pub proposer: Address,
+    pub asset_in: Address,
+    pub asset_out: Address,
+    pub spent: i128,
+    pub received: i128,
+}
+
+/// Topics: [REBALANCE_COMPLETE, proposer]. Data: number of executed steps.
+#[contractevent(topics = ["REBALANCE_COMPLETE"], data_format = "single-value")]
+pub struct RebalanceComplete {
+    #[topic]
+    pub proposer: Address,
+    pub steps: u32,
+}
+
+/// Topics: [ROUTER_PROPOSED, route]. Data: [router, effective_at].
+#[contractevent(topics = ["ROUTER_PROPOSED"], data_format = "vec")]
+pub struct RouterProposed {
+    #[topic]
+    pub route: u32,
+    pub router: Address,
+    pub effective_at: u64,
+}
+
+/// SEP-56 v0.1.2 `Deposit`: topics [deposit, operator, from, receiver]; data
+/// map {assets, shares} - the encoding of the standard's own #[contractevent]
+/// struct (default map format) and of the OpenZeppelin reference implementation.
+#[contractevent(topics = ["deposit"])]
+pub struct Deposit {
+    #[topic]
+    pub operator: Address,
+    #[topic]
+    pub from: Address,
+    #[topic]
+    pub receiver: Address,
+    pub assets: i128,
+    pub shares: i128,
+}
+
+/// SEP-56 v0.1.2 `Withdraw`: topics [withdraw, operator, receiver, owner]; data
+/// map {assets, shares} (see `Deposit`).
+#[contractevent(topics = ["withdraw"])]
+pub struct Withdraw {
+    #[topic]
+    pub operator: Address,
+    #[topic]
+    pub receiver: Address,
+    #[topic]
+    pub owner: Address,
+    pub assets: i128,
+    pub shares: i128,
+}
+
+/// Topics [FEE_ACCRUAL, treasury]; data shares minted to the treasury.
+#[contractevent(topics = ["FEE_ACCRUAL"], data_format = "single-value")]
+pub struct FeeAccrual {
+    #[topic]
+    pub treasury: Address,
+    pub shares: i128,
+}
+
+/// Topics [VAULT_INITIALIZED, admin]; data ledger timestamp.
+#[contractevent(topics = ["VAULT_INITIALIZED"], data_format = "single-value")]
+pub struct VaultInitialized {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Topics [CAPS_LOWERED, admin]; data (tvl_cap, per_user_cap).
+#[contractevent(topics = ["CAPS_LOWERED"], data_format = "vec")]
+pub struct CapsLowered {
+    #[topic]
+    pub admin: Address,
+    pub tvl_cap: i128,
+    pub per_user_cap: i128,
+}
+
+/// Topics [SLEEVES_UPDATED, admin]; data number of sleeves.
+#[contractevent(topics = ["SLEEVES_UPDATED"], data_format = "single-value")]
+pub struct SleevesUpdated {
+    #[topic]
+    pub admin: Address,
+    pub count: u32,
+}
+
+/// Topics [VAULT_PAUSED, by]; data ledger timestamp (by = pause authority or admin).
+#[contractevent(topics = ["VAULT_PAUSED"], data_format = "single-value")]
+pub struct VaultPaused {
+    #[topic]
+    pub by: Address,
+    pub timestamp: u64,
+}
+
+/// Topics [VAULT_UNPAUSED, admin]; data ledger timestamp.
+#[contractevent(topics = ["VAULT_UNPAUSED"], data_format = "single-value")]
+pub struct VaultUnpaused {
+    #[topic]
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Topics [UPGRADE_PROPOSED, admin]; data (wasm_hash, executable_at).
+#[contractevent(topics = ["UPGRADE_PROPOSED"], data_format = "vec")]
+pub struct UpgradeProposed {
+    #[topic]
+    pub admin: Address,
+    pub wasm_hash: BytesN<32>,
+    pub executable_at: u64,
+}
+
+/// Topics [UPGRADE, admin]; data wasm hash.
+#[contractevent(topics = ["UPGRADE"], data_format = "single-value")]
+pub struct Upgrade {
+    #[topic]
+    pub admin: Address,
+    pub wasm_hash: BytesN<32>,
+}
+
+/// Topics [UPGRADE_CANCELLED, admin]; data wasm hash.
+#[contractevent(topics = ["UPGRADE_CANCELLED"], data_format = "single-value")]
+pub struct UpgradeCancelled {
+    #[topic]
+    pub admin: Address,
+    pub wasm_hash: BytesN<32>,
+}
+
+/// Topics [POLICY_BOUND, owner]; data policy hash.
+#[contractevent(topics = ["POLICY_BOUND"], data_format = "single-value")]
+pub struct PolicyBound {
+    #[topic]
+    pub owner: Address,
+    pub policy_hash: BytesN<32>,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -40,6 +253,27 @@ pub enum VaultError {
     UpgradeNotReady = 21,
     /// No upgrade has been proposed.
     NoPendingUpgrade = 22,
+    /// The policy contract rejected the rebalance proposal (audit W1).
+    RebalanceRejected = 23,
+    /// No executor is configured for the proposal's trade route.
+    RouteUnavailable = 24,
+    /// A swap returned less than the proposal's min_amount_out, or spent more
+    /// than amount_in, as measured on the vault's own balances.
+    SlippageExceeded = 25,
+    /// The pending router change's 48h delay has not elapsed / none pending.
+    RouterNotReady = 26,
+    /// After the trades, the vault's actual holdings (measured balances at
+    /// per-asset median prices) breach the signed policy's bands, caps or
+    /// liquidity floor (audit W1b). The whole rebalance reverts.
+    AllocationOutOfPolicy = 27,
+    /// A sleeve's target weight differs from the signed policy's target, or
+    /// the policy does not declare the sleeve at all (audit W1b).
+    SleeveTargetMismatch = 28,
+    /// `redeem_frozen` is only for a vault with a funded sleeve that has no
+    /// valid price; otherwise use `redeem` (audit V6).
+    NoFrozenSleeve = 29,
+    /// No outstanding claim for this holder and asset (audit V6).
+    NoClaim = 30,
 }
 
 /// Timelock between proposing and executing a WASM upgrade (CONTRACTS-SPEC:
@@ -88,7 +322,10 @@ pub struct VaultConfig {
     pub oracle_contract: Address,
     pub registry_contract: Address,
     pub treasury: Address,
-    pub management_fee_bps: u32,
+    /// Decision D-D: share of PROFIT (above the per-share high-water mark)
+    /// paid to the treasury, in bps; at most MAX_PERFORMANCE_FEE_BPS. There
+    /// is no fee on principal, and never more than FEE_CAP_BPS_PER_YEAR.
+    pub performance_fee_bps: u32,
     /// Maximum total vault value in numéraire units (AGENT-RULES Rule 6;
     /// ROADMAP 3.2 mainnet beta: $1M). Can only be lowered in-place.
     pub tvl_cap: i128,
@@ -146,20 +383,8 @@ pub struct OracleSource {
     pub min_liquidity_depth_usd: i128,
     pub current_liquidity_depth_usd: i128,
     pub is_active: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct AllowanceDataKey {
-    pub from: Address,
-    pub spender: Address,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[contracttype]
-pub struct AllowanceValue {
-    pub amount: i128,
-    pub expiration_ledger: u32,
+    /// Mirror of the oracle's OracleSource (audit O7a): the source's feeder.
+    pub feeder: Address,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -169,13 +394,83 @@ pub enum DataKey {
     Name,
     Symbol,
     Decimals,
-    TotalShares,
-    Balance(Address),
-    Allowance(AllowanceDataKey),
     Sleeves,
     IsPaused,
     LastFeeAccrual,
+    /// Decision D-D: conservative NAV per share at the last fee (scale = 1.0).
+    HighWaterMark,
     PendingUpgrade,
+    /// Address allowed to submit rebalance proposals (audit W1).
+    Keeper,
+    /// Audit V6: units of a frozen sleeve's asset owed to a holder.
+    Claim(Address, Address),
+    /// Audit V6: total units of an asset reserved for claims.
+    ClaimTotal(Address),
+    /// Executor contract per trade route (u32 = TradeRoute discriminant).
+    Router(u32),
+    PendingRouter(u32),
+    /// Audit A3: daily conservative NAV points (persistent, bounded).
+    NavHistory,
+}
+
+// Rebalance proposal types - mirrors of constella-policy (keep in lockstep;
+// contracttype decoding is lenient, so a drift would not fail loudly).
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u32)]
+pub enum TradeRoute {
+    Issuer = 0,
+    Soroswap = 1,
+    Aquarius = 2,
+    Sdex = 3,
+    /// Blend v2 supply / withdraw (decision D-H), lockstep with the policy.
+    Blend = 4,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TradeOperation {
+    pub asset_in: Address,
+    pub asset_out: Address,
+    pub amount_in: i128,
+    pub min_amount_out: i128,
+    pub route: TradeRoute,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RebalanceProposal {
+    pub vault: Address,
+    pub policy_hash: BytesN<32>,
+    pub operations: Vec<TradeOperation>,
+    pub weights_after: Vec<(Symbol, u32)>,
+    pub deadline: u64,
+    pub proposer: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationResult {
+    pub is_valid: bool,
+    pub code: u32,
+    pub message: Symbol,
+}
+
+/// A router change waiting out the 48h delay.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRouter {
+    pub router: Address,
+    pub effective_at: u64,
+}
+
+/// Soroswap router (github.com/soroswap/core): the subset the vault calls.
+/// `swap_exact_tokens_for_tokens` requires `to.require_auth()` and moves
+/// `amount_in` FROM `to` into the pair with a token transfer it initiates.
+#[contractclient(name = "SoroswapRouterClient")]
+pub trait SoroswapRouterInterface {
+    fn swap_exact_tokens_for_tokens(env: Env, amount_in: i128, amount_out_min: i128, path: Vec<Address>, to: Address, deadline: u64) -> Vec<i128>;
+    fn router_pair_for(env: Env, token_a: Address, token_b: Address) -> Address;
 }
 
 // Cross-Contract Client Traits for Decoupled WASM Compilation
@@ -183,9 +478,94 @@ pub enum DataKey {
 pub trait NavOracleInterface {
     fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
     fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>;
-    fn price(env: Env, asset: Address) -> Option<PriceData>;
+    /// Median of the asset's valid sources (audit O6/W1: per-asset pricing).
+    fn asset_price(env: Env, asset: Address) -> Option<PriceData>;
+    /// Minimum of the asset's valid sources (Rule 3 collateral price).
+    fn collateral_price(env: Env, asset: Address) -> Option<PriceData>;
     fn get_source(env: Env, source_id: Symbol) -> Option<OracleSource>;
     fn get_sleeve_sources(env: Env, sleeve_id: Symbol) -> Vec<Symbol>;
+    /// Decision D-H: the Blend position priced under `pool`, if any. The
+    /// oracle only registers pools of the official Blend factory.
+    fn blend_position(env: Env, pool: Address) -> Option<BlendPositionRef>;
+}
+
+/// Mirror of `constella_nav_oracle::BlendPosition`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendPositionRef {
+    pub pool: Address,
+    pub underlying: Address,
+}
+
+/// Mirrors of Blend v2 types (blend-contracts-v2 `pool/src/storage.rs`,
+/// `pool/src/pool/{reserve,user,actions}.rs`); decoded by field name.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserveConfigRef {
+    pub index: u32,
+    pub decimals: u32,
+    pub c_factor: u32,
+    pub l_factor: u32,
+    pub util: u32,
+    pub max_util: u32,
+    pub r_base: u32,
+    pub r_one: u32,
+    pub r_two: u32,
+    pub r_three: u32,
+    pub reactivity: u32,
+    pub supply_cap: i128,
+    pub enabled: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserveDataRef {
+    pub d_rate: i128,
+    pub b_rate: i128,
+    pub ir_mod: i128,
+    pub b_supply: i128,
+    pub d_supply: i128,
+    pub backstop_credit: i128,
+    pub last_time: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendReserveRef {
+    pub asset: Address,
+    pub config: BlendReserveConfigRef,
+    pub data: BlendReserveDataRef,
+    pub scalar: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendPositionsRef {
+    pub liabilities: Map<u32, i128>,
+    pub collateral: Map<u32, i128>,
+    pub supply: Map<u32, i128>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BlendRequestRef {
+    pub request_type: u32,
+    pub address: Address,
+    pub amount: i128,
+}
+
+/// Blend v2 request types used by the vault: plain (non-collateral) supply
+/// and withdraw only - the vault never borrows, so it has no health factor
+/// and cannot be liquidated.
+const BLEND_SUPPLY: u32 = 0;
+const BLEND_WITHDRAW: u32 = 1;
+const BLEND_RATE_SCALE: i128 = 1_000_000_000_000;
+
+#[contractclient(name = "BlendPoolClient")]
+pub trait BlendPoolInterface {
+    fn get_reserve(env: Env, asset: Address) -> BlendReserveRef;
+    fn get_positions(env: Env, address: Address) -> BlendPositionsRef;
+    fn submit(env: Env, from: Address, spender: Address, to: Address, requests: Vec<BlendRequestRef>) -> BlendPositionsRef;
 }
 
 #[contracttype]
@@ -242,6 +622,9 @@ pub struct PolicySleeveTargetRef {
 #[contractclient(name = "PolicyClient")]
 pub trait PolicyInterface {
     fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfigRef>;
+    fn validate_rebalance(env: Env, vault: Address, proposal: RebalanceProposal) -> ValidationResult;
+    fn validate_holdings(env: Env, vault: Address, holdings: Vec<(Symbol, i128)>) -> ValidationResult;
+    fn get_sleeve_targets(env: Env, vault: Address) -> Vec<PolicySleeveTargetRef>;
     fn register_policy(
         env: Env,
         vault: Address,
@@ -258,10 +641,16 @@ pub trait PolicyInterface {
 }
 
 const SECONDS_PER_YEAR: u64 = 31_536_000;
+const CLAIM_TTL_THRESHOLD: u32 = 29 * 17_280;
+const CLAIM_TTL_EXTEND_TO: u32 = 30 * 17_280;
 
 fn get_config(env: &Env) -> VaultConfig {
     match env.storage().instance().get(&DataKey::Config) {
-        Some(c) => c,
+        Some(c) => {
+            // Audit W2: keep the vault's instance entry live while it is used.
+            env.storage().instance().extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_EXTEND_AMOUNT);
+            c
+        }
         None => panic_with_error!(env, VaultError::NotInitialized),
     }
 }
@@ -285,78 +674,131 @@ fn compute_sleeve_symbol(env: &Env, sleeve_type: SleeveType) -> Symbol {
     }
 }
 
-fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
-    let last_accrual: u64 = env
-        .storage()
-        .instance()
-        .get(&DataKey::LastFeeAccrual)
-        .unwrap_or(0);
+/// Management-fee shares owed right now and the accrual timestamp to store
+/// once they are minted. Pure: views use it to price pending fees exactly as
+/// the next state-changing call will mint them (SEP-56 previews).
+/// Decision D-D: at most 10 % of profit (Morpho curators charge 0-20 % of
+/// interest; many vaults charge no management fee).
+pub const MAX_PERFORMANCE_FEE_BPS: u32 = 1_000;
+/// Decision D-D: all-in ceiling - fees never exceed 0.20 % of assets per year.
+pub const FEE_CAP_BPS_PER_YEAR: i128 = 20;
+/// Fees crystallize at most once per day, so the fee does not depend on how
+/// often anyone calls `accrue_fees` (the cap slice per call would otherwise
+/// shrink with call frequency and forgive most of the profit).
+pub const FEE_CRYSTALLIZATION_SECONDS: u64 = 86_400;
+/// Audit A3: at most this many daily NAV points are kept (oldest dropped).
+pub const NAV_HISTORY_MAX: u32 = 90;
+
+/// Audit A3: one conservative NAV-per-share observation.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NavPoint {
+    pub timestamp: u64,
+    pub nav: i128,
+}
+
+/// Decision D-D: (fee shares to mint, new last-accrual time, new high-water
+/// mark). Fee = performance_fee_bps of the profit since the high-water mark,
+/// measured on the CONSERVATIVE NAV per share (a manipulated price cannot
+/// create a fee), capped at FEE_CAP_BPS_PER_YEAR of assets for the elapsed
+/// time. No fee while any funded sleeve is unpriced, below the mark, or more
+/// often than once per FEE_CRYSTALLIZATION_SECONDS. After a fee the mark is
+/// the post-fee NAV per share: profit beyond the cap is forgiven.
+fn pending_fee(env: &Env, config: &VaultConfig) -> (i128, u64, i128) {
+    let scale = share_scale(env);
+    let last: u64 = env.storage().instance().get(&DataKey::LastFeeAccrual).unwrap_or(0);
+    let hwm: i128 = env.storage().instance().get(&DataKey::HighWaterMark).unwrap_or(scale);
     let now = env.ledger().timestamp();
-    if now <= last_accrual || config.management_fee_bps == 0 {
-        return 0;
+    if now < last.saturating_add(FEE_CRYSTALLIZATION_SECONDS) {
+        return (0, last, hwm);
     }
-
-    let elapsed = now - last_accrual;
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
-
-    if total_shares == 0 {
-        env.storage().instance().set(&DataKey::LastFeeAccrual, &now);
-        return 0;
+    let supply = share_supply(env);
+    if supply <= 0 {
+        return (0, now, scale);
     }
-
-    let numerator = total_shares
-        .checked_mul(config.management_fee_bps as i128)
-        .and_then(|v| v.checked_mul(elapsed as i128));
-    let denominator = (10_000i128).checked_mul(SECONDS_PER_YEAR as i128);
-
-    let d_shares = match (numerator, denominator) {
-        (Some(num), Some(den)) if den > 0 => num / den,
-        _ => 0,
+    if config.performance_fee_bps == 0 {
+        return (0, now, hwm);
+    }
+    let total = match holdings_value(env, config, NavKind::Collateral) {
+        Ok((t, _)) => t,
+        Err(_) => return (0, now, hwm), // unpriced: no fee, and that period's cap is forfeited
     };
-
-    if d_shares > 0 {
-        let treasury_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(config.treasury.clone()))
-            .unwrap_or(0);
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(config.treasury.clone()), &(treasury_bal + d_shares));
-        let new_total_shares = total_shares + d_shares;
-        env.storage()
-            .instance()
-            .set(&DataKey::TotalShares, &new_total_shares);
-
-        if let (Some(den), Some(fee_rate)) = (
-            denominator,
-            total_shares.checked_mul(config.management_fee_bps as i128),
-        ) {
-            if fee_rate > 0 {
-                let accrued_time = (d_shares * den) / fee_rate;
-                let new_last = last_accrual + accrued_time as u64;
-                env.storage()
-                    .instance()
-                    .set(&DataKey::LastFeeAccrual, &new_last);
-            } else {
-                env.storage().instance().set(&DataKey::LastFeeAccrual, &now);
-            }
-        } else {
-            env.storage().instance().set(&DataKey::LastFeeAccrual, &now);
-        }
-
-        env.events().publish(
-            (Symbol::new(env, "FEE_ACCRUAL"), config.treasury.clone()),
-            d_shares,
-        );
-        d_shares
-    } else {
-        0
+    let nav = match total.checked_mul(scale) {
+        Some(v) => v / supply,
+        None => return (0, now, hwm),
+    };
+    if nav <= hwm {
+        return (0, now, hwm);
     }
+    let elapsed = (now - last) as i128;
+    let fee = (|| -> Option<i128> {
+        let profit = (nav - hwm).checked_mul(supply)? / scale;
+        let by_profit = profit.checked_mul(config.performance_fee_bps as i128)? / 10_000;
+        let cap = total.checked_mul(FEE_CAP_BPS_PER_YEAR)?.checked_mul(elapsed)? / (10_000 * SECONDS_PER_YEAR as i128);
+        Some(by_profit.min(cap))
+    })()
+    .unwrap_or(0);
+    if fee <= 0 || fee >= total {
+        return (0, now, hwm);
+    }
+    // Shares worth `fee` after minting: d / (supply + d) = fee / total.
+    let shares = match fee.checked_mul(supply) {
+        Some(v) => v / (total - fee),
+        None => return (0, now, hwm),
+    };
+    if shares <= 0 {
+        return (0, now, hwm);
+    }
+    let new_hwm = match total.checked_mul(scale) {
+        Some(v) => v / (supply + shares),
+        None => hwm,
+    };
+    (shares, now, new_hwm)
+}
+
+fn pending_fee_shares(env: &Env, config: &VaultConfig) -> (i128, u64) {
+    let (shares, last, _) = pending_fee(env, config);
+    (shares, last)
+}
+
+fn accrue_fees_internal(env: &Env, config: &VaultConfig) -> i128 {
+    let (d_shares, new_last, new_hwm) = pending_fee(env, config);
+    env.storage().instance().set(&DataKey::LastFeeAccrual, &new_last);
+    env.storage().instance().set(&DataKey::HighWaterMark, &new_hwm);
+    if d_shares > 0 {
+        // Audit W6: fee shares are minted like any other shares, with a SEP-41
+        // mint event, so indexers can reconstruct every balance from events.
+        mint_shares_internal(env, &config.treasury, d_shares);
+        FeeAccrual { treasury: config.treasury.clone(), shares: d_shares }.publish(env);
+    }
+    record_nav_point(env, config);
+    d_shares
+}
+
+/// Audit A3: append the conservative NAV per share (the same figure as
+/// `get_nav_conservative`) at most once per day, only while every funded
+/// sleeve is priced; keep the newest NAV_HISTORY_MAX points. Realised yield
+/// is then computed from the chain's own record.
+fn record_nav_point(env: &Env, config: &VaultConfig) {
+    let key = DataKey::NavHistory;
+    let mut h: Vec<NavPoint> = env.storage().persistent().get(&key).unwrap_or_else(|| Vec::new(env));
+    let now = env.ledger().timestamp();
+    if let Some(last) = h.last() {
+        if now < last.timestamp.saturating_add(FEE_CRYSTALLIZATION_SECONDS) {
+            return;
+        }
+    }
+    let supply = share_supply(env);
+    if supply <= 0 {
+        return;
+    }
+    let Some(nav) = compute_nav(env, config, NavKind::Collateral, supply) else { return };
+    h.push_back(NavPoint { timestamp: now, nav: nav.price });
+    while h.len() > NAV_HISTORY_MAX {
+        h.pop_front();
+    }
+    env.storage().persistent().set(&key, &h);
+    env.storage().persistent().extend_ttl(&key, CLAIM_TTL_THRESHOLD, CLAIM_TTL_EXTEND_TO);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -406,6 +848,72 @@ fn share_scale(env: &Env) -> i128 {
     10i128.pow(decimals)
 }
 
+/// Audit V6: result of a redemption while a funded sleeve has no valid price.
+/// `cash` is paid now; `claims` are (asset, units) owed in kind and settled
+/// in cash at the conservative price once the asset is priced again.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FrozenRedemption {
+    pub cash: i128,
+    pub claims: Vec<(Address, i128)>,
+}
+
+#[contractevent(topics = ["FROZEN_REDEMPTION"], data_format = "vec")]
+pub struct FrozenRedemptionExecuted {
+    #[topic]
+    pub owner: Address,
+    pub receiver: Address,
+    pub shares: i128,
+    pub cash: i128,
+}
+
+#[contractevent(topics = ["CLAIM_RECORDED"], data_format = "vec")]
+pub struct ClaimRecorded {
+    #[topic]
+    pub holder: Address,
+    #[topic]
+    pub asset: Address,
+    pub units: i128,
+}
+
+#[contractevent(topics = ["CLAIM_SETTLED"], data_format = "vec")]
+pub struct ClaimSettled {
+    #[topic]
+    pub holder: Address,
+    #[topic]
+    pub asset: Address,
+    pub units: i128,
+    pub paid: i128,
+}
+
+/// Audit V6: split `shares` of `supply` into the pro-rata value of every
+/// PRICED sleeve (conservative prices, cash at face) and pro-rata units of
+/// every funded sleeve without a valid price. Rounds down (vault's favour).
+/// Returns (cash, claims, priced_total).
+fn frozen_split(env: &Env, config: &VaultConfig, shares: i128, supply: i128) -> (i128, Vec<(Address, i128)>, i128) {
+    if supply <= 0 {
+        panic_with_error!(env, VaultError::ZeroAmount);
+    }
+    let sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(env));
+    let oracle = NavOracleClient::new(env, &config.oracle_contract);
+    let scale = share_scale(env);
+    let mut priced = 0i128;
+    let mut claims: Vec<(Address, i128)> = Vec::new(env);
+    for sleeve in sleeves.iter() {
+        match sleeve_value(env, &oracle, &sleeve, NavKind::Collateral, scale) {
+            Ok((v, _)) => priced = priced.checked_add(v).unwrap_or_else(|| panic_with_error!(env, VaultError::MathOverflow)),
+            Err(VaultError::OracleUnavailable) => {
+                let held = sleeve_holdings(env, &sleeve);
+                let units = held.checked_mul(shares).unwrap_or_else(|| panic_with_error!(env, VaultError::MathOverflow)) / supply;
+                claims.push_back((sleeve.contract_address.clone(), units));
+            }
+            Err(e) => panic_with_error!(env, e),
+        }
+    }
+    let cash = priced.checked_mul(shares).unwrap_or_else(|| panic_with_error!(env, VaultError::MathOverflow)) / supply;
+    (cash, claims, priced)
+}
+
 /// Value of one sleeve in numéraire, and the oracle timestamp used.
 ///
 /// Audit V4: this is the ONLY place a sleeve is valued. There is no par
@@ -426,10 +934,12 @@ fn sleeve_value(
     if held == 0 {
         return Ok((0, 0));
     }
-    let sym = compute_sleeve_symbol(env, sleeve.sleeve_type);
+    // Audit O6/W1: price the sleeve's own asset. Sleeve-type keys could make
+    // two assets of one type share a price; a multi-asset oracle sleeve has no
+    // sleeve-level price at all.
     let pd = match kind {
-        NavKind::Deposit => oracle.get_deposit_nav(&sym),
-        NavKind::Collateral => oracle.get_collateral_nav(&sym),
+        NavKind::Deposit => oracle.asset_price(&sleeve.contract_address),
+        NavKind::Collateral => oracle.collateral_price(&sleeve.contract_address),
     }
     .ok_or(VaultError::OracleUnavailable)?;
     if pd.price <= 0 {
@@ -437,6 +947,55 @@ fn sleeve_value(
     }
     let value = held.checked_mul(pd.price).ok_or(VaultError::MathOverflow)? / scale;
     Ok((value, pd.timestamp))
+}
+
+/// Audit W1b: the signed policy's CURRENT target for each sleeve, in sleeve
+/// order (0 for a sleeve the policy does not declare, e.g. after an
+/// amendment dropped it), or None while no policy is bound. Read live, so an
+/// activated amendment takes effect without anyone re-running set_sleeves.
+fn signed_targets(env: &Env, config: &VaultConfig, sleeves: &Vec<SleeveState>) -> Option<Vec<u32>> {
+    let policy = PolicyClient::new(env, &config.policy_contract);
+    let me = env.current_contract_address();
+    policy.get_policy_config(&me)?;
+    let targets = policy.get_sleeve_targets(&me);
+    let registry = AssetRegistryClient::new(env, &config.registry_contract);
+    let mut out = Vec::new(env);
+    for sleeve in sleeves.iter() {
+        let weight = match registry.get_asset_by_address(&sleeve.contract_address) {
+            Some(entry) => targets.iter().find(|t| t.asset_id == entry.asset_id).map(|t| t.target_weight_bps).unwrap_or(0),
+            None => 0,
+        };
+        out.push_back(weight);
+    }
+    Some(out)
+}
+
+/// Audit W1b: value every sleeve as actually held (measured balance, capped
+/// by the booked balance, at its asset's median price; cash at face value)
+/// under its registry asset ID, and require the signed policy to accept the
+/// result. A missing price stops with `OracleUnavailable` (Rule 5); a policy
+/// rejection stops with `AllocationOutOfPolicy`. Panics revert the trades.
+fn check_actual_allocation(env: &Env, config: &VaultConfig, sleeves: &Vec<SleeveState>) {
+    let oracle = NavOracleClient::new(env, &config.oracle_contract);
+    let registry = AssetRegistryClient::new(env, &config.registry_contract);
+    let scale = share_scale(env);
+    let mut holdings: Vec<(Symbol, i128)> = Vec::new(env);
+    for sleeve in sleeves.iter() {
+        let id = match registry.get_asset_by_address(&sleeve.contract_address) {
+            Some(e) if e.is_active => e.asset_id,
+            _ => panic_with_error!(env, VaultError::AssetNotRegistered),
+        };
+        let value = match sleeve_value(env, &oracle, &sleeve, NavKind::Deposit, scale) {
+            Ok((v, _)) => v,
+            Err(e) => panic_with_error!(env, e),
+        };
+        holdings.push_back((id, value));
+    }
+    let verdict = PolicyClient::new(env, &config.policy_contract)
+        .validate_holdings(&env.current_contract_address(), &holdings);
+    if !verdict.is_valid {
+        panic_with_error!(env, VaultError::AllocationOutOfPolicy);
+    }
 }
 
 /// Total value of all sleeves and the latest oracle timestamp involved.
@@ -460,13 +1019,9 @@ fn holdings_value(env: &Env, config: &VaultConfig, kind: NavKind) -> Result<(i12
     Ok((total, latest_ts))
 }
 
-fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> Option<PriceData> {
+/// NAV per share for `total_shares` outstanding shares.
+fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind, total_shares: i128) -> Option<PriceData> {
     let scale = share_scale(env);
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
     let has_sleeves = env
         .storage()
         .instance()
@@ -494,17 +1049,191 @@ fn compute_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> Option<PriceDa
     })
 }
 
-fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
-    compute_nav(env, config, NavKind::Deposit)
+/// Shares outstanding once pending management fees are minted.
+fn supply_with_pending_fees(env: &Env, config: &VaultConfig) -> Option<i128> {
+    share_supply(env).checked_add(pending_fee_shares(env, config).0)
 }
 
+/// View NAV (median): includes pending fee shares, so it equals the NAV the
+/// next deposit/mint will execute at.
+fn compute_deposit_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
+    compute_nav(env, config, NavKind::Deposit, supply_with_pending_fees(env, config)?)
+}
+
+/// View NAV (conservative): includes pending fee shares.
 fn compute_conservative_nav(env: &Env, config: &VaultConfig) -> Option<PriceData> {
-    compute_nav(env, config, NavKind::Collateral)
+    compute_nav(env, config, NavKind::Collateral, supply_with_pending_fees(env, config)?)
+}
+
+/// Execution NAV, read right after `accrue_fees_internal` (fees already minted).
+fn execution_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> i128 {
+    match compute_nav(env, config, kind, share_supply(env)) {
+        Some(pd) if pd.price > 0 => pd.price,
+        _ => panic_with_error!(env, VaultError::OracleUnavailable),
+    }
+}
+
+/// View NAV price, panicking when unpriced (as execution would).
+fn view_nav(env: &Env, config: &VaultConfig, kind: NavKind) -> i128 {
+    let pd = match kind {
+        NavKind::Deposit => compute_deposit_nav(env, config),
+        NavKind::Collateral => compute_conservative_nav(env, config),
+    };
+    match pd {
+        Some(pd) if pd.price > 0 => pd.price,
+        _ => panic_with_error!(env, VaultError::OracleUnavailable),
+    }
+}
+
+fn mul_div(env: &Env, a: i128, b: i128, d: i128, round_up: bool) -> i128 {
+    let p = match a.checked_mul(b) {
+        Some(p) => p,
+        None => panic_with_error!(env, VaultError::MathOverflow),
+    };
+    if round_up { (p + d - 1) / d } else { p / d }
+}
+
+// SEP-56 conversions. Rounding always favours the vault (ERC-4626): deposit
+// and redeem round down, mint and withdraw round up.
+fn shares_for_deposit(env: &Env, assets: i128, nav: i128) -> i128 {
+    mul_div(env, assets, share_scale(env), nav, false)
+}
+fn assets_for_mint(env: &Env, shares: i128, nav: i128) -> i128 {
+    mul_div(env, shares, nav, share_scale(env), true)
+}
+fn assets_for_redeem(env: &Env, shares: i128, nav: i128) -> i128 {
+    mul_div(env, shares, nav, share_scale(env), false)
+}
+fn shares_for_withdraw(env: &Env, assets: i128, nav: i128) -> i128 {
+    mul_div(env, assets, share_scale(env), nav, true)
+}
+
+/// Moves `from`'s numeraire in (OZ `deposit_internal`: direct transfer when
+/// operator == from, otherwise `transfer_from` under `from`'s allowance to the
+/// operator), mints `shares` to `receiver`, books the cash sleeve, emits events.
+fn deposit_shares(env: &Env, receiver: &Address, from: &Address, operator: &Address, assets: i128, shares: i128) {
+    OzVault::deposit_internal(env, receiver, assets, shares, from, operator);
+    update_cash_sleeve_balance(env, assets, true);
+    Mint { to: receiver.clone(), amount: shares }.publish(env);
+    Deposit { operator: operator.clone(), from: from.clone(), receiver: receiver.clone(), assets, shares }.publish(env);
+}
+
+/// Instant-redemption guards: enough cash, and the policy liquidity floor holds.
+fn check_redemption_liquidity(env: &Env, config: &VaultConfig, assets: i128) {
+    let cash_balance = get_cash_sleeve_balance(env);
+    if assets > cash_balance {
+        panic_with_error!(env, VaultError::ExceedsRedemptionCapacity);
+    }
+    let total_a = StrategyVault::total_assets(env.clone());
+    let floor_bps = get_policy_floor_bps(env, config);
+    if total_a > assets && floor_bps > 0 {
+        let remaining_assets = total_a - assets;
+        let remaining_cash = cash_balance - assets;
+        let lhs = remaining_cash.checked_mul(10_000);
+        let rhs = remaining_assets.checked_mul(floor_bps as i128);
+        match (lhs, rhs) {
+            (Some(l), Some(r)) if l >= r => {}
+            (Some(_), Some(_)) => panic_with_error!(env, VaultError::LiquidityFloorBreached),
+            _ => panic_with_error!(env, VaultError::MathOverflow),
+        }
+    }
+}
+
+/// Burns `owner`'s shares and pays `receiver` (OZ `withdraw_internal`, which
+/// spends the owner's share allowance when operator != owner), books the cash
+/// sleeve, emits events. Shortfalls keep the vault's public error codes.
+fn withdraw_shares(env: &Env, receiver: &Address, owner: &Address, operator: &Address, assets: i128, shares: i128) {
+    if operator != owner && Base::allowance(env, owner, operator) < shares {
+        panic_with_error!(env, VaultError::InsufficientAllowance);
+    }
+    if Base::balance(env, owner) < shares {
+        panic_with_error!(env, VaultError::InsufficientBalance);
+    }
+    update_cash_sleeve_balance(env, assets, false);
+    OzVault::withdraw_internal(env, receiver, owner, assets, shares, operator);
+    Burn { from: owner.clone(), amount: shares }.publish(env);
+    Withdraw { operator: operator.clone(), receiver: receiver.clone(), owner: owner.clone(), assets, shares }.publish(env);
 }
 
 /// Tokens of `asset` actually held by this vault right now.
 fn real_balance(env: &Env, asset: &Address) -> i128 {
     token::Client::new(env, asset).balance(&env.current_contract_address())
+}
+
+/// The Blend position behind a sleeve, if it is one: only `Lending` sleeves
+/// are looked up, and the oracle decides (single source of truth, D-H).
+fn blend_of(env: &Env, sleeve: &SleeveState) -> Option<BlendPositionRef> {
+    if sleeve.sleeve_type != SleeveType::Lending {
+        return None;
+    }
+    NavOracleClient::new(env, &get_config(env).oracle_contract).blend_position(&sleeve.contract_address)
+}
+
+/// The vault's plain-supply bTokens in a Blend reserve (never collateral).
+fn blend_b_tokens(env: &Env, pool: &BlendPoolClient, index: u32) -> i128 {
+    pool.get_positions(&env.current_contract_address()).supply.get(index).unwrap_or(0)
+}
+
+/// What the vault really holds of a sleeve: bTokens for a Blend position,
+/// otherwise its token balance.
+fn real_holding(env: &Env, sleeve: &SleeveState) -> i128 {
+    match blend_of(env, sleeve) {
+        Some(pos) => {
+            let pool = BlendPoolClient::new(env, &pos.pool);
+            let index = pool.get_reserve(&pos.underlying).config.index;
+            blend_b_tokens(env, &pool, index)
+        }
+        None => real_balance(env, &sleeve.contract_address),
+    }
+}
+
+/// Decision D-H: one Blend leg. Supply when `asset_out` is a Blend position
+/// whose underlying is `asset_in`; withdraw for the reverse. Returns
+/// (spent, received) MEASURED on the vault's own balances - token balance and
+/// bToken position - never taken from the pool's return value.
+fn blend_leg(env: &Env, config: &VaultConfig, op: &TradeOperation) -> (i128, i128) {
+    let oracle = NavOracleClient::new(env, &config.oracle_contract);
+    let (pos, supplying) = match (oracle.blend_position(&op.asset_out), oracle.blend_position(&op.asset_in)) {
+        (Some(p), None) if p.underlying == op.asset_in => (p, true),
+        (None, Some(p)) if p.underlying == op.asset_out => (p, false),
+        _ => panic_with_error!(env, VaultError::RouteUnavailable),
+    };
+    let me = env.current_contract_address();
+    let pool = BlendPoolClient::new(env, &pos.pool);
+    let reserve = pool.get_reserve(&pos.underlying);
+    let index = reserve.config.index;
+    let underlying = token::Client::new(env, &pos.underlying);
+    let (b_before, u_before) = (blend_b_tokens(env, &pool, index), underlying.balance(&me));
+    let request = if supplying {
+        // The pool pulls `amount_in` from the vault: authorize exactly that.
+        env.authorize_as_current_contract(vec![
+            env,
+            InvokerContractAuthEntry::Contract(SubContractInvocation {
+                context: ContractContext {
+                    contract: pos.underlying.clone(),
+                    fn_name: symbol_short!("transfer"),
+                    args: (me.clone(), pos.pool.clone(), op.amount_in).into_val(env),
+                },
+                sub_invocations: vec![env],
+            }),
+        ]);
+        BlendRequestRef { request_type: BLEND_SUPPLY, address: pos.underlying.clone(), amount: op.amount_in }
+    } else {
+        // Blend withdraws in underlying units and burns ceil(amount / b_rate)
+        // bTokens; rounding the conversion down keeps the burn <= amount_in.
+        let amount = match op.amount_in.checked_mul(reserve.data.b_rate) {
+            Some(v) => v / BLEND_RATE_SCALE,
+            None => panic_with_error!(env, VaultError::MathOverflow),
+        };
+        BlendRequestRef { request_type: BLEND_WITHDRAW, address: pos.underlying.clone(), amount }
+    };
+    pool.submit(&me, &me, &me, &vec![env, request]);
+    let (b_after, u_after) = (blend_b_tokens(env, &pool, index), underlying.balance(&me));
+    if supplying {
+        (u_before - u_after, b_after - b_before)
+    } else {
+        (b_before - b_after, u_after - u_before)
+    }
 }
 
 /// Holdings used for every valuation: min(recorded, actually held).
@@ -515,7 +1244,7 @@ fn real_balance(env: &Env, asset: &Address) -> i128 {
 /// freeze-and-burn lowers NAV immediately, while unsolicited transfers into the
 /// vault never raise it (no donation-based share-price manipulation).
 fn sleeve_holdings(env: &Env, sleeve: &SleeveState) -> i128 {
-    let held = real_balance(env, &sleeve.contract_address);
+    let held = real_holding(env, sleeve);
     if held < sleeve.current_balance {
         held
     } else {
@@ -600,28 +1329,10 @@ fn update_cash_sleeve_balance(env: &Env, amount: i128, is_deposit: bool) {
 }
 
 fn mint_shares_internal(env: &Env, receiver: &Address, shares: i128) {
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
-    let bal: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(receiver.clone()))
-        .unwrap_or(0);
+    increase_total_supply(env, shares);
+    Base::update(env, None, Some(receiver), shares);
 
-    env.storage()
-        .instance()
-        .set(&DataKey::TotalShares, &(total_shares + shares));
-    env.storage()
-        .instance()
-        .set(&DataKey::Balance(receiver.clone()), &(bal + shares));
-
-    env.events().publish(
-        (Symbol::new(env, "mint"), receiver.clone()),
-        shares,
-    );
+    Mint { to: receiver.clone(), amount: shares }.publish(env);
 }
 
 /// Moves `amount` shares from `from` to `to` (SEP-41 transfer semantics).
@@ -632,67 +1343,32 @@ fn mint_shares_internal(env: &Env, receiver: &Address, shares: i128) {
 /// self-transfer is a balance no-op (the caller still had to authorize it and
 /// must own at least `amount`).
 fn move_shares(env: &Env, from: &Address, to: &Address, amount: i128) {
-    let from_bal: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(from.clone()))
-        .unwrap_or(0);
-    if from_bal < amount {
+    if Base::balance(env, from) < amount {
         panic_with_error!(env, VaultError::InsufficientBalance);
     }
     if from == to {
         return;
     }
-
-    let new_from_bal = from_bal - amount;
-    if new_from_bal == 0 {
-        env.storage().instance().remove(&DataKey::Balance(from.clone()));
-    } else {
-        env.storage()
-            .instance()
-            .set(&DataKey::Balance(from.clone()), &new_from_bal);
-    }
-
-    let to_bal: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(to.clone()))
-        .unwrap_or(0);
-    let new_to_bal = match to_bal.checked_add(amount) {
-        Some(v) => v,
-        None => panic_with_error!(env, VaultError::MathOverflow),
-    };
-    env.storage()
-        .instance()
-        .set(&DataKey::Balance(to.clone()), &new_to_bal);
+    Base::update(env, Some(from), Some(to), amount);
 }
 
 fn burn_shares_internal(env: &Env, owner: &Address, shares: i128) {
-    let total_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::TotalShares)
-        .unwrap_or(0);
-    let bal: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(owner.clone()))
-        .unwrap_or(0);
-
-    let new_total = total_shares - shares;
-    let new_bal = bal - shares;
-
-    env.storage().instance().set(&DataKey::TotalShares, &new_total);
-    if new_bal == 0 {
-        env.storage().instance().remove(&DataKey::Balance(owner.clone()));
-    } else {
-        env.storage().instance().set(&DataKey::Balance(owner.clone()), &new_bal);
+    if Base::balance(env, owner) < shares {
+        panic_with_error!(env, VaultError::InsufficientBalance);
     }
+    Base::update(env, Some(owner), None, shares);
+    decrease_total_supply(env, shares);
 
-    env.events().publish(
-        (Symbol::new(env, "burn"), owner.clone()),
-        shares,
-    );
+    Burn { from: owner.clone(), amount: shares }.publish(env);
+}
+
+/// Consumes `amount` of `spender`'s allowance over `owner`'s shares, keeping
+/// the vault's public error code for a shortfall (expired counts as zero).
+fn spend_share_allowance(env: &Env, owner: &Address, spender: &Address, amount: i128) {
+    if Base::allowance(env, owner, spender) < amount {
+        panic_with_error!(env, VaultError::InsufficientAllowance);
+    }
+    Base::spend_allowance(env, owner, spender, amount);
 }
 
 /// Remaining room under (tvl_cap, per_user_cap) for `receiver`, in numéraire
@@ -702,11 +1378,7 @@ fn cap_room(env: &Env, config: &VaultConfig, receiver: &Address, deposit_nav: i1
         Ok((v, _)) => v,
         Err(e) => panic_with_error!(env, e),
     };
-    let held_shares: i128 = env
-        .storage()
-        .instance()
-        .get(&DataKey::Balance(receiver.clone()))
-        .unwrap_or(0);
+    let held_shares: i128 = Base::balance(env, receiver);
     let position = match held_shares.checked_mul(deposit_nav) {
         Some(v) => v / scale,
         None => panic_with_error!(env, VaultError::MathOverflow),
@@ -726,6 +1398,48 @@ fn enforce_caps(env: &Env, config: &VaultConfig, receiver: &Address, assets: i12
     }
 }
 
+/// Delay before a router (which can move vault funds) takes effect: 48 h,
+/// the same window as upgrades, policy amendments and oracle source changes.
+pub const ROUTER_CHANGE_DELAY_SECONDS: u64 = 48 * 3600;
+
+fn sleeve_index(sleeves: &Vec<SleeveState>, asset: &Address) -> u32 {
+    for i in 0..sleeves.len() {
+        if sleeves.get_unchecked(i).contract_address == *asset {
+            return i;
+        }
+    }
+    panic!()
+}
+
+/// Execute one Soroswap swap of exactly `amount_in`, measuring the result on
+/// the vault's own balances. Returns (spent, received).
+fn swap_on_soroswap(env: &Env, router: &Address, op: &TradeOperation, deadline: u64) -> (i128, i128) {
+    let me = env.current_contract_address();
+    let token_in = token::Client::new(env, &op.asset_in);
+    let token_out = token::Client::new(env, &op.asset_out);
+    let (in_before, out_before) = (token_in.balance(&me), token_out.balance(&me));
+    let client = SoroswapRouterClient::new(env, router);
+    let pair = client.router_pair_for(&op.asset_in, &op.asset_out);
+    // The router moves `amount_in` from the vault into the pair; authorize
+    // exactly that one transfer (contract-to-contract auth), nothing else.
+    env.authorize_as_current_contract(vec![
+        env,
+        InvokerContractAuthEntry::Contract(SubContractInvocation {
+            context: ContractContext {
+                contract: op.asset_in.clone(),
+                fn_name: symbol_short!("transfer"),
+                args: (me.clone(), pair, op.amount_in).into_val(env),
+            },
+            sub_invocations: vec![env],
+        }),
+    ]);
+    let path = vec![env, op.asset_in.clone(), op.asset_out.clone()];
+    client.swap_exact_tokens_for_tokens(&op.amount_in, &op.min_amount_out, &path, &me, &deadline);
+    let spent = in_before - token_in.balance(&me);
+    let received = token_out.balance(&me) - out_before;
+    (spent, received)
+}
+
 #[contract]
 pub struct StrategyVault;
 
@@ -741,7 +1455,7 @@ impl StrategyVault {
         symbol: String,
         decimals: u32,
     ) {
-        if config.management_fee_bps > 10000 || decimals > 18 {
+        if config.performance_fee_bps > MAX_PERFORMANCE_FEE_BPS || decimals > 18 {
             panic_with_error!(&env, VaultError::InvalidBps);
         }
         if config.tvl_cap <= 0 || config.per_user_cap <= 0 || config.per_user_cap > config.tvl_cap {
@@ -761,14 +1475,15 @@ impl StrategyVault {
         }
 
         env.storage().instance().set(&DataKey::Config, &config);
+        OzVault::set_asset(&env, config.numeraire.clone());
         env.storage().instance().set(&DataKey::Name, &name);
         env.storage().instance().set(&DataKey::Symbol, &symbol);
         env.storage().instance().set(&DataKey::Decimals, &decimals);
-        env.storage().instance().set(&DataKey::TotalShares, &0i128);
         env.storage().instance().set(&DataKey::IsPaused, &false);
         env.storage()
             .instance()
             .set(&DataKey::LastFeeAccrual, &env.ledger().timestamp());
+        env.storage().instance().set(&DataKey::HighWaterMark, &10i128.pow(decimals));
 
         let mut sleeves = Vec::new(&env);
         sleeves.push_back(SleeveState {
@@ -782,15 +1497,15 @@ impl StrategyVault {
         });
         env.storage().instance().set(&DataKey::Sleeves, &sleeves);
 
-        env.events().publish(
-            (Symbol::new(&env, "VAULT_INITIALIZED"), admin),
-            env.ledger().timestamp(),
-        );
+        VaultInitialized { admin, timestamp: env.ledger().timestamp() }.publish(&env);
     }
 
     // SEP-56 Vault Operations
-    pub fn deposit(env: Env, assets: i128, receiver: Address) -> i128 {
-        receiver.require_auth();
+    /// SEP-56 deposit: `operator` authorizes; `from` pays (directly when it is
+    /// the operator, otherwise via its numeraire allowance to the operator);
+    /// `receiver` gets the shares, priced at the median (deposit) NAV.
+    pub fn deposit(env: Env, assets: i128, receiver: Address, from: Address, operator: Address) -> i128 {
+        operator.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
         }
@@ -800,44 +1515,19 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let deposit_nav = match compute_deposit_nav(&env, &config) {
-            Some(pd) => pd.price,
-            None => panic_with_error!(&env, VaultError::OracleUnavailable),
-        };
-        if deposit_nav <= 0 {
-            panic_with_error!(&env, VaultError::OracleUnavailable);
-        }
-
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-
-        let shares = (assets.checked_mul(scale).unwrap()) / deposit_nav;
+        let nav = execution_nav(&env, &config, NavKind::Deposit);
+        let shares = shares_for_deposit(&env, assets, nav);
         if shares <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-        enforce_caps(&env, &config, &receiver, assets, deposit_nav, scale);
-
-        token::Client::new(&env, &config.numeraire).transfer(
-            &receiver,
-            &env.current_contract_address(),
-            &assets,
-        );
-
-        update_cash_sleeve_balance(&env, assets, true);
-        mint_shares_internal(&env, &receiver, shares);
-
-        env.events().publish(
-            // SEP-56 Deposit: [deposit, operator, from, receiver] (assets, shares).
-            // The receiver authorizes and pays, so it is also operator and from.
-            (Symbol::new(&env, "deposit"), receiver.clone(), receiver.clone(), receiver),
-            (assets, shares),
-        );
-
+        enforce_caps(&env, &config, &receiver, assets, nav, share_scale(&env));
+        deposit_shares(&env, &receiver, &from, &operator, assets, shares);
         shares
     }
 
-    pub fn mint(env: Env, shares: i128, receiver: Address) -> i128 {
-        receiver.require_auth();
+    /// SEP-56 mint: exactly `shares` to `receiver`; returns the assets paid.
+    pub fn mint(env: Env, shares: i128, receiver: Address, from: Address, operator: Address) -> i128 {
+        operator.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
         }
@@ -847,182 +1537,230 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let deposit_nav = match compute_deposit_nav(&env, &config) {
-            Some(pd) => pd.price,
-            None => panic_with_error!(&env, VaultError::OracleUnavailable),
-        };
-        if deposit_nav <= 0 {
-            panic_with_error!(&env, VaultError::OracleUnavailable);
-        }
-
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-
-        let assets = (shares.checked_mul(deposit_nav).unwrap() + scale - 1) / scale;
+        let nav = execution_nav(&env, &config, NavKind::Deposit);
+        let assets = assets_for_mint(&env, shares, nav);
         if assets <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-        enforce_caps(&env, &config, &receiver, assets, deposit_nav, scale);
-
-        token::Client::new(&env, &config.numeraire).transfer(
-            &receiver,
-            &env.current_contract_address(),
-            &assets,
-        );
-
-        update_cash_sleeve_balance(&env, assets, true);
-        mint_shares_internal(&env, &receiver, shares);
-
-        env.events().publish(
-            // SEP-56 Deposit: [deposit, operator, from, receiver] (assets, shares).
-            // The receiver authorizes and pays, so it is also operator and from.
-            (Symbol::new(&env, "deposit"), receiver.clone(), receiver.clone(), receiver),
-            (assets, shares),
-        );
-
+        enforce_caps(&env, &config, &receiver, assets, nav, share_scale(&env));
+        deposit_shares(&env, &receiver, &from, &operator, assets, shares);
         assets
     }
 
-    pub fn redeem(env: Env, shares: i128, receiver: Address, owner: Address) -> i128 {
-        owner.require_auth();
+    /// SEP-56 redeem: burns exactly `shares` of `owner` (operator == owner, or
+    /// within the owner's share allowance), pays `receiver` at the
+    /// conservative NAV, subject to cash and the policy liquidity floor.
+    pub fn redeem(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> i128 {
+        operator.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
         }
         if shares <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-
-        let owner_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(owner.clone()))
-            .unwrap_or(0);
-        if owner_bal < shares {
-            panic_with_error!(&env, VaultError::InsufficientBalance);
-        }
-
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let conservative_nav = match compute_conservative_nav(&env, &config) {
-            Some(pd) => pd.price,
-            None => panic_with_error!(&env, VaultError::OracleUnavailable),
-        };
-        if conservative_nav <= 0 {
-            panic_with_error!(&env, VaultError::OracleUnavailable);
-        }
-
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-
-        let assets = (shares.checked_mul(conservative_nav).unwrap()) / scale;
+        let nav = execution_nav(&env, &config, NavKind::Collateral);
+        let assets = assets_for_redeem(&env, shares, nav);
         if assets <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-
-        let cash_balance = get_cash_sleeve_balance(&env);
-        if assets > cash_balance {
-            panic_with_error!(&env, VaultError::ExceedsRedemptionCapacity);
-        }
-
-        let total_a = Self::total_assets(env.clone());
-        let floor_bps = get_policy_floor_bps(&env, &config);
-        if total_a > assets && floor_bps > 0 {
-            let remaining_assets = total_a - assets;
-            let remaining_cash = cash_balance - assets;
-            if remaining_cash.checked_mul(10000).unwrap()
-                < remaining_assets.checked_mul(floor_bps as i128).unwrap()
-            {
-                panic_with_error!(&env, VaultError::LiquidityFloorBreached);
-            }
-        }
-
-        burn_shares_internal(&env, &owner, shares);
-        update_cash_sleeve_balance(&env, assets, false);
-
-        token::Client::new(&env, &config.numeraire).transfer(
-            &env.current_contract_address(),
-            &receiver,
-            &assets,
-        );
-
-        env.events().publish(
-            // SEP-56 Withdraw: [withdraw, operator, receiver, owner] (assets, shares).
-            // The owner authorizes, so it is the operator.
-            (Symbol::new(&env, "withdraw"), owner.clone(), receiver, owner),
-            (assets, shares),
-        );
-
+        check_redemption_liquidity(&env, &config, assets);
+        withdraw_shares(&env, &receiver, &owner, &operator, assets, shares);
         assets
     }
 
-    pub fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address) -> i128 {
-        owner.require_auth();
+    /// Audit V6 preview: what `redeem_frozen(shares, ..)` would pay now and
+    /// record as claims (includes pending fee shares, like other previews).
+    pub fn preview_redeem_frozen(env: Env, shares: i128) -> FrozenRedemption {
+        let config = get_config(&env);
+        let supply = supply_with_pending_fees(&env, &config).unwrap_or_else(|| panic_with_error!(&env, VaultError::MathOverflow));
+        let (cash, claims, _) = frozen_split(&env, &config, shares, supply);
+        FrozenRedemption { cash, claims }
+    }
+
+    /// Audit V6 (VAULT-DESIGN: "the sleeve is frozen, not the basket;
+    /// redemptions from the frozen sleeve are queued"). While a funded sleeve
+    /// has no valid price, `redeem` stays halted (no fair share price). This
+    /// explicit opt-in pays `shares / supply` of every PRICED sleeve's value
+    /// in cash now and records `shares / supply` of each frozen sleeve's units
+    /// as a claim for `receiver`, settled by `settle_claim` once that asset is
+    /// priced again. The units leave the sleeve's books, so the remaining
+    /// holders' per-share value is unchanged. Same rules as `redeem`: operator
+    /// auth and allowance, pause, fee accrual, cash and liquidity floor.
+    pub fn redeem_frozen(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> FrozenRedemption {
+        operator.require_auth();
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        if shares <= 0 {
+            panic_with_error!(&env, VaultError::ZeroAmount);
+        }
+        let config = get_config(&env);
+        accrue_fees_internal(&env, &config);
+        let (cash, claims, priced) = frozen_split(&env, &config, shares, share_supply(&env));
+        if claims.is_empty() {
+            panic_with_error!(&env, VaultError::NoFrozenSleeve);
+        }
+        if cash == 0 && claims.iter().all(|(_, u)| u == 0) {
+            panic_with_error!(&env, VaultError::ZeroAmount);
+        }
+        let cash_balance = get_cash_sleeve_balance(&env);
+        if cash > cash_balance {
+            panic_with_error!(&env, VaultError::ExceedsRedemptionCapacity);
+        }
+        // Liquidity floor over the PRICED part (frozen units cannot be valued).
+        let floor_bps = get_policy_floor_bps(&env, &config) as i128;
+        let (rest_cash, rest_priced) = (cash_balance - cash, priced - cash);
+        if floor_bps > 0 && rest_priced > 0 {
+            match (rest_cash.checked_mul(10_000), rest_priced.checked_mul(floor_bps)) {
+                (Some(l), Some(r)) if l >= r => {}
+                (Some(_), Some(_)) => panic_with_error!(&env, VaultError::LiquidityFloorBreached),
+                _ => panic_with_error!(&env, VaultError::MathOverflow),
+            }
+        }
+        // Reserve the claimed units: out of the sleeve's books, into the claim.
+        let mut sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(&env));
+        for (asset, units) in claims.iter() {
+            if units == 0 {
+                continue;
+            }
+            let i = sleeve_index(&sleeves, &asset);
+            let mut sl = sleeves.get_unchecked(i);
+            sl.current_balance -= units;
+            sleeves.set(i, sl);
+            let key = DataKey::Claim(receiver.clone(), asset.clone());
+            let owed: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(owed + units));
+            // A1: money owed must not archive; renewed on every write (the
+            // keeper's extend job covers claims that wait longer).
+            env.storage().persistent().extend_ttl(&key, CLAIM_TTL_THRESHOLD, CLAIM_TTL_EXTEND_TO);
+            let total_key = DataKey::ClaimTotal(asset.clone());
+            let total: i128 = env.storage().instance().get(&total_key).unwrap_or(0);
+            env.storage().instance().set(&total_key, &(total + units));
+            ClaimRecorded { holder: receiver.clone(), asset: asset.clone(), units }.publish(&env);
+        }
+        env.storage().instance().set(&DataKey::Sleeves, &sleeves);
+        withdraw_shares(&env, &receiver, &owner, &operator, cash, shares);
+        FrozenRedemptionExecuted { owner, receiver, shares, cash }.publish(&env);
+        FrozenRedemption { cash, claims }
+    }
+
+    /// Audit V6: settle `holder`'s claim on `asset` in cash once the asset has
+    /// a valid conservative price again: units x price, paid to the holder;
+    /// the units return to the sleeve's books. Permissionless (pays only the
+    /// holder). If tokens were clawed back meanwhile, payment is capped pro
+    /// rata to the reserved units actually still held, so remaining holders
+    /// never pay for units that are gone.
+    pub fn settle_claim(env: Env, holder: Address, asset: Address) -> i128 {
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        let key = DataKey::Claim(holder.clone(), asset.clone());
+        let units: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+        if units <= 0 {
+            panic_with_error!(&env, VaultError::NoClaim);
+        }
+        let config = get_config(&env);
+        let price = match NavOracleClient::new(&env, &config.oracle_contract).collateral_price(&asset) {
+            Some(pd) if pd.price > 0 => pd.price,
+            _ => panic_with_error!(&env, VaultError::OracleUnavailable),
+        };
+        let mut sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(&env));
+        let i = sleeve_index(&sleeves, &asset);
+        let mut sl = sleeves.get_unchecked(i);
+        let total_key = DataKey::ClaimTotal(asset.clone());
+        let total: i128 = env.storage().instance().get(&total_key).unwrap_or(0);
+        let present = real_holding(&env, &sl) - sl.current_balance;
+        let paid_units = if present >= total {
+            units
+        } else if present <= 0 {
+            0
+        } else {
+            units.checked_mul(present).unwrap_or_else(|| panic_with_error!(&env, VaultError::MathOverflow)) / total
+        };
+        let paid = paid_units.checked_mul(price).unwrap_or_else(|| panic_with_error!(&env, VaultError::MathOverflow))
+            / share_scale(&env);
+        if paid > get_cash_sleeve_balance(&env) {
+            panic_with_error!(&env, VaultError::ExceedsRedemptionCapacity);
+        }
+        sl.current_balance += paid_units;
+        sleeves.set(i, sl);
+        env.storage().instance().set(&DataKey::Sleeves, &sleeves);
+        env.storage().persistent().remove(&key);
+        env.storage().instance().set(&total_key, &(total - units));
+        if paid > 0 {
+            update_cash_sleeve_balance(&env, paid, false);
+            token::Client::new(&env, &config.numeraire).transfer(&env.current_contract_address(), &holder, &paid);
+        }
+        ClaimSettled { holder, asset, units: paid_units, paid }.publish(&env);
+        paid
+    }
+
+    /// Audit V6: units of `asset` owed to `holder`.
+    pub fn get_claim(env: Env, holder: Address, asset: Address) -> i128 {
+        env.storage().persistent().get(&DataKey::Claim(holder, asset)).unwrap_or(0)
+    }
+
+    /// Audit V6: total units of `asset` reserved for claims.
+    pub fn get_claim_total(env: Env, asset: Address) -> i128 {
+        env.storage().instance().get(&DataKey::ClaimTotal(asset)).unwrap_or(0)
+    }
+
+    /// SEP-56 withdraw: pays exactly `assets`; returns the shares burned.
+    pub fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address, operator: Address) -> i128 {
+        operator.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
         }
         if assets <= 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
-
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let conservative_nav = match compute_conservative_nav(&env, &config) {
-            Some(pd) => pd.price,
-            None => panic_with_error!(&env, VaultError::OracleUnavailable),
-        };
-        if conservative_nav <= 0 {
-            panic_with_error!(&env, VaultError::OracleUnavailable);
-        }
-
-        let decimals: u32 = env.storage().instance().get(&DataKey::Decimals).unwrap_or(7);
-        let scale = 10i128.pow(decimals);
-
-        let shares = (assets.checked_mul(scale).unwrap() + (conservative_nav - 1)) / conservative_nav;
-        let owner_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(owner.clone()))
-            .unwrap_or(0);
-        if owner_bal < shares {
-            panic_with_error!(&env, VaultError::InsufficientBalance);
-        }
-
-        let cash_balance = get_cash_sleeve_balance(&env);
-        if assets > cash_balance {
-            panic_with_error!(&env, VaultError::ExceedsRedemptionCapacity);
-        }
-
-        let total_a = Self::total_assets(env.clone());
-        let floor_bps = get_policy_floor_bps(&env, &config);
-        if total_a > assets && floor_bps > 0 {
-            let remaining_assets = total_a - assets;
-            let remaining_cash = cash_balance - assets;
-            if remaining_cash.checked_mul(10000).unwrap()
-                < remaining_assets.checked_mul(floor_bps as i128).unwrap()
-            {
-                panic_with_error!(&env, VaultError::LiquidityFloorBreached);
-            }
-        }
-
-        burn_shares_internal(&env, &owner, shares);
-        update_cash_sleeve_balance(&env, assets, false);
-
-        token::Client::new(&env, &config.numeraire).transfer(
-            &env.current_contract_address(),
-            &receiver,
-            &assets,
-        );
-
-        env.events().publish(
-            // SEP-56 Withdraw: [withdraw, operator, receiver, owner] (assets, shares).
-            // The owner authorizes, so it is the operator.
-            (Symbol::new(&env, "withdraw"), owner.clone(), receiver, owner),
-            (assets, shares),
-        );
-
+        let nav = execution_nav(&env, &config, NavKind::Collateral);
+        let shares = shares_for_withdraw(&env, assets, nav);
+        check_redemption_liquidity(&env, &config, assets);
+        withdraw_shares(&env, &receiver, &owner, &operator, assets, shares);
         shares
+    }
+
+    /// SEP-56: shares `deposit(assets)` would mint now (fees included).
+    pub fn preview_deposit(env: Env, assets: i128) -> i128 {
+        if assets <= 0 {
+            return 0;
+        }
+        let config = get_config(&env);
+        shares_for_deposit(&env, assets, view_nav(&env, &config, NavKind::Deposit))
+    }
+
+    /// SEP-56: assets `mint(shares)` would cost now.
+    pub fn preview_mint(env: Env, shares: i128) -> i128 {
+        if shares <= 0 {
+            return 0;
+        }
+        let config = get_config(&env);
+        assets_for_mint(&env, shares, view_nav(&env, &config, NavKind::Deposit))
+    }
+
+    /// SEP-56: shares `withdraw(assets)` would burn now.
+    pub fn preview_withdraw(env: Env, assets: i128) -> i128 {
+        if assets <= 0 {
+            return 0;
+        }
+        let config = get_config(&env);
+        shares_for_withdraw(&env, assets, view_nav(&env, &config, NavKind::Collateral))
+    }
+
+    /// SEP-56: assets `redeem(shares)` would pay now.
+    pub fn preview_redeem(env: Env, shares: i128) -> i128 {
+        if shares <= 0 {
+            return 0;
+        }
+        let config = get_config(&env);
+        assets_for_redeem(&env, shares, view_nav(&env, &config, NavKind::Collateral))
     }
 
     pub fn total_assets(env: Env) -> i128 {
@@ -1034,10 +1772,7 @@ impl StrategyVault {
     }
 
     pub fn total_supply(env: Env) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::TotalShares)
-            .unwrap_or(0)
+        share_supply(&env)
     }
 
     pub fn convert_to_shares(env: Env, assets: i128) -> i128 {
@@ -1074,7 +1809,8 @@ impl StrategyVault {
         (shares.checked_mul(conservative_nav).unwrap()) / scale
     }
 
-    pub fn asset(env: Env) -> Address {
+    /// SEP-56 `query_asset`: the numéraire.
+    pub fn query_asset(env: Env) -> Address {
         get_config(&env).numeraire
     }
 
@@ -1127,21 +1863,14 @@ impl StrategyVault {
         config.tvl_cap = tvl_cap;
         config.per_user_cap = per_user_cap;
         env.storage().instance().set(&DataKey::Config, &config);
-        env.events().publish(
-            (Symbol::new(&env, "CAPS_LOWERED"), config.admin),
-            (tvl_cap, per_user_cap),
-        );
+        CapsLowered { admin: config.admin, tvl_cap, per_user_cap }.publish(&env);
     }
 
     pub fn max_withdraw(env: Env, owner: Address) -> i128 {
         if is_vault_paused(&env) {
             return 0;
         }
-        let owner_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(owner))
-            .unwrap_or(0);
+        let owner_bal: i128 = Base::balance(&env, &owner);
         let owner_assets = Self::convert_to_assets(env.clone(), owner_bal);
         let cap = Self::get_redemption_capacity(env);
         if owner_assets < cap.instant {
@@ -1155,11 +1884,7 @@ impl StrategyVault {
         if is_vault_paused(&env) {
             return 0;
         }
-        let owner_bal: i128 = env
-            .storage()
-            .instance()
-            .get(&DataKey::Balance(owner))
-            .unwrap_or(0);
+        let owner_bal: i128 = Base::balance(&env, &owner);
         let cap = Self::get_redemption_capacity(env.clone());
         let config = get_config(&env);
         let conservative_nav = match compute_conservative_nav(&env, &config) {
@@ -1184,13 +1909,13 @@ impl StrategyVault {
 
     // SEP-41 Fungible Token Standard
     pub fn balance(env: Env, id: Address) -> i128 {
-        env.storage()
-            .instance()
-            .get(&DataKey::Balance(id))
-            .unwrap_or(0)
+        Base::balance(&env, &id)
     }
 
-    pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+    /// SEP-41 transfer. `to` may be a muxed account (exchange / custodian
+    /// sub-account): shares are credited to the underlying address and the
+    /// muxed id is reported in the event only.
+    pub fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128) {
         from.require_auth();
         if is_vault_paused(&env) {
             panic_with_error!(&env, VaultError::VaultPaused);
@@ -1201,14 +1926,19 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        move_shares(&env, &from, &to, amount);
+        let to_addr = to.address();
+        move_shares(&env, &from, &to_addr, amount);
 
-        env.events().publish(
-            (Symbol::new(&env, "transfer"), from, to),
-            amount,
-        );
+        match to.id() {
+            Some(id) => MuxedTransfer { from, to: to_addr, to_muxed_id: Some(id), amount }.publish(&env),
+            None => Transfer { from, to: to_addr, amount }.publish(&env),
+        }
     }
 
+    /// SEP-41 approve. `expiration_ledger` (SEP-41 `live_until_ledger`) is
+    /// validated by the OpenZeppelin allowance storage (audit W6): a non-zero
+    /// allowance cannot already be expired, and none may outlive the network's
+    /// maximum entry TTL (error #102 `InvalidLiveUntilLedger`).
     pub fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32) {
         from.require_auth();
         if is_vault_paused(&env) {
@@ -1217,38 +1947,14 @@ impl StrategyVault {
         if amount < 0 {
             panic_with_error!(&env, VaultError::ZeroAmount);
         }
+        get_config(&env);
+        Base::set_allowance(&env, &from, &spender, amount, expiration_ledger);
 
-        let key = DataKey::Allowance(AllowanceDataKey {
-            from: from.clone(),
-            spender: spender.clone(),
-        });
-        if amount == 0 {
-            env.storage().instance().remove(&key);
-        } else {
-            let val = AllowanceValue {
-                amount,
-                expiration_ledger,
-            };
-            env.storage().instance().set(&key, &val);
-        }
-
-        env.events().publish(
-            (Symbol::new(&env, "approve"), from, spender),
-            amount,
-        );
+        Approve { from, spender, amount, live_until_ledger: expiration_ledger }.publish(&env);
     }
 
     pub fn allowance(env: Env, from: Address, spender: Address) -> i128 {
-        let key = DataKey::Allowance(AllowanceDataKey { from, spender });
-        if let Some(val) = env.storage().instance().get::<_, AllowanceValue>(&key) {
-            if env.ledger().sequence() <= val.expiration_ledger {
-                val.amount
-            } else {
-                0
-            }
-        } else {
-            0
-        }
+        Base::allowance(&env, &from, &spender)
     }
 
     pub fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128) {
@@ -1262,30 +1968,42 @@ impl StrategyVault {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config);
 
-        let key = DataKey::Allowance(AllowanceDataKey {
-            from: from.clone(),
-            spender: spender.clone(),
-        });
-        let mut val: AllowanceValue = match env.storage().instance().get(&key) {
-            Some(v) => v,
-            None => panic_with_error!(&env, VaultError::InsufficientAllowance),
-        };
-        if env.ledger().sequence() > val.expiration_ledger || val.amount < amount {
-            panic_with_error!(&env, VaultError::InsufficientAllowance);
-        }
-        val.amount -= amount;
-        if val.amount == 0 {
-            env.storage().instance().remove(&key);
-        } else {
-            env.storage().instance().set(&key, &val);
-        }
-
+        spend_share_allowance(&env, &from, &spender, amount);
         move_shares(&env, &from, &to, amount);
 
-        env.events().publish(
-            (Symbol::new(&env, "transfer"), from, to),
-            amount,
-        );
+        Transfer { from, to, amount }.publish(&env);
+    }
+
+    /// SEP-41 burn: destroys `amount` of the caller's own shares. No assets
+    /// leave the vault, so the remaining holders' NAV per share rises.
+    pub fn burn(env: Env, from: Address, amount: i128) {
+        from.require_auth();
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, VaultError::ZeroAmount);
+        }
+        let config = get_config(&env);
+        accrue_fees_internal(&env, &config);
+
+        burn_shares_internal(&env, &from, amount);
+    }
+
+    /// SEP-41 burn_from: `spender` burns `from`'s shares within its allowance.
+    pub fn burn_from(env: Env, spender: Address, from: Address, amount: i128) {
+        spender.require_auth();
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        if amount <= 0 {
+            panic_with_error!(&env, VaultError::ZeroAmount);
+        }
+        let config = get_config(&env);
+        accrue_fees_internal(&env, &config);
+
+        spend_share_allowance(&env, &from, &spender, amount);
+        burn_shares_internal(&env, &from, amount);
     }
 
     pub fn decimals(env: Env) -> u32 {
@@ -1408,6 +2126,9 @@ impl StrategyVault {
             values.push_back(value);
         }
 
+        // Empty vault: weight by the signed policy's current targets (audit
+        // W1b); the stored targets only before any policy is bound.
+        let signed = if total > 0 { None } else { signed_targets(&env, &config, &sleeves) };
         let mut weight_sum = 0i128;
         let mut weighted_haircut = 0i128;
         for i in 0..sleeves.len() {
@@ -1415,7 +2136,10 @@ impl StrategyVault {
             let weight = if total > 0 {
                 values.get(i).unwrap()
             } else {
-                sleeve.target_weight_bps as i128
+                match &signed {
+                    Some(t) => t.get_unchecked(i) as i128,
+                    None => sleeve.target_weight_bps as i128,
+                }
             };
             weight_sum = overflow(weight_sum.checked_add(weight));
             weighted_haircut = overflow(
@@ -1539,11 +2263,22 @@ impl StrategyVault {
     }
 
     // Sleeve Management & Info
+    /// The sleeve layout. Once a policy is bound, `target_weight_bps` shows
+    /// the signed policy's CURRENT target (audit W1b), not a stored copy.
     pub fn get_sleeves(env: Env) -> Vec<SleeveState> {
-        env.storage()
+        let mut sleeves: Vec<SleeveState> = env
+            .storage()
             .instance()
             .get(&DataKey::Sleeves)
-            .unwrap_or_else(|| Vec::new(&env))
+            .unwrap_or_else(|| Vec::new(&env));
+        if let Some(targets) = signed_targets(&env, &get_config(&env), &sleeves) {
+            for i in 0..sleeves.len() {
+                let mut s = sleeves.get_unchecked(i);
+                s.target_weight_bps = targets.get_unchecked(i);
+                sleeves.set(i, s);
+            }
+        }
+        sleeves
     }
 
     /// Replace the sleeve layout (targets, bands, tiers). Admin only.
@@ -1552,9 +2287,19 @@ impl StrategyVault {
     /// balance the vault has already recorded for that asset (0 for a new
     /// sleeve); any other value is rejected with `BalanceNotSettable`. A sleeve
     /// whose asset the vault still holds (recorded or real) cannot be removed.
+    ///
+    /// Audit W1b: once a policy is bound, the signed policy is the source of
+    /// truth for targets - every sleeve must be declared there with exactly
+    /// the signed target weight (`SleeveTargetMismatch` otherwise).
     pub fn set_sleeves(env: Env, sleeves: Vec<SleeveState>) {
         let config = get_config(&env);
         config.admin.require_auth();
+        let policy = PolicyClient::new(&env, &config.policy_contract);
+        let signed = if policy.get_policy_config(&env.current_contract_address()).is_some() {
+            Some(policy.get_sleeve_targets(&env.current_contract_address()))
+        } else {
+            None
+        };
 
         let existing: Vec<SleeveState> = env
             .storage()
@@ -1587,6 +2332,16 @@ impl StrategyVault {
             if s.asset_id != label {
                 panic_with_error!(&env, VaultError::InvalidSleeveConfig);
             }
+            if let Some(targets) = &signed {
+                let id = match registry.get_asset_by_address(&s.contract_address) {
+                    Some(e) => e.asset_id,
+                    None => panic_with_error!(&env, VaultError::AssetNotRegistered),
+                };
+                match targets.iter().find(|t| t.asset_id == id) {
+                    Some(t) if t.target_weight_bps == s.target_weight_bps => {}
+                    _ => panic_with_error!(&env, VaultError::SleeveTargetMismatch),
+                }
+            }
 
             let mut recorded = 0i128;
             for e in existing.iter() {
@@ -1617,16 +2372,13 @@ impl StrategyVault {
                     break;
                 }
             }
-            if !kept && (e.current_balance != 0 || real_balance(&env, &e.contract_address) != 0) {
+            if !kept && (e.current_balance != 0 || real_holding(&env, &e) != 0) {
                 panic_with_error!(&env, VaultError::SleeveHasHoldings);
             }
         }
 
         env.storage().instance().set(&DataKey::Sleeves, &sleeves);
-        env.events().publish(
-            (Symbol::new(&env, "SLEEVES_UPDATED"), config.admin),
-            sleeves.len(),
-        );
+        SleevesUpdated { admin: config.admin, count: sleeves.len() }.publish(&env);
     }
 
     pub fn get_config(env: Env) -> VaultConfig {
@@ -1634,9 +2386,19 @@ impl StrategyVault {
     }
 
     // Fee Engine
+    /// Audit A3: daily conservative NAV per share, oldest first (<= NAV_HISTORY_MAX).
+    pub fn get_nav_history(env: Env) -> Vec<NavPoint> {
+        env.storage().persistent().get(&DataKey::NavHistory).unwrap_or_else(|| Vec::new(&env))
+    }
+
     pub fn accrue_fees(env: Env) -> i128 {
         let config = get_config(&env);
         accrue_fees_internal(&env, &config)
+    }
+
+    /// Decision D-D: conservative NAV per share at which the last fee was taken.
+    pub fn get_high_water_mark(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::HighWaterMark).unwrap_or_else(|| share_scale(&env))
     }
 
     pub fn get_last_fee_accrual(env: Env) -> u64 {
@@ -1652,10 +2414,7 @@ impl StrategyVault {
         config.pause_authority.require_auth();
 
         env.storage().instance().set(&DataKey::IsPaused, &true);
-        env.events().publish(
-            (Symbol::new(&env, "VAULT_PAUSED"), config.pause_authority),
-            env.ledger().timestamp(),
-        );
+        VaultPaused { by: config.pause_authority, timestamp: env.ledger().timestamp() }.publish(&env);
     }
 
     pub fn unpause(env: Env) {
@@ -1663,10 +2422,7 @@ impl StrategyVault {
         config.admin.require_auth();
 
         env.storage().instance().set(&DataKey::IsPaused, &false);
-        env.events().publish(
-            (Symbol::new(&env, "VAULT_UNPAUSED"), config.admin),
-            env.ledger().timestamp(),
-        );
+        VaultUnpaused { admin: config.admin, timestamp: env.ledger().timestamp() }.publish(&env);
     }
 
     pub fn is_paused(env: Env) -> bool {
@@ -1685,10 +2441,12 @@ impl StrategyVault {
             executable_at: now + UPGRADE_TIMELOCK_SECONDS,
         };
         env.storage().instance().set(&DataKey::PendingUpgrade, &pending);
-        env.events().publish(
-            (Symbol::new(&env, "UPGRADE_PROPOSED"), config.admin),
-            (new_wasm_hash, pending.executable_at),
-        );
+        UpgradeProposed {
+            admin: config.admin,
+            wasm_hash: new_wasm_hash,
+            executable_at: pending.executable_at,
+        }
+        .publish(&env);
     }
 
     /// Execute the proposed upgrade once its timelock has elapsed (admin).
@@ -1703,11 +2461,9 @@ impl StrategyVault {
             panic_with_error!(&env, VaultError::UpgradeNotReady);
         }
         env.storage().instance().remove(&DataKey::PendingUpgrade);
-        env.events().publish(
-            (Symbol::new(&env, "UPGRADE"), config.admin),
-            pending.wasm_hash.clone(),
-        );
-        env.deployer().update_current_contract_wasm(pending.wasm_hash);
+        Upgrade { admin: config.admin, wasm_hash: pending.wasm_hash.clone() }.publish(&env);
+        env.deployer()
+            .update_current_contract(soroban_sdk::ContractExecutable::Wasm(pending.wasm_hash));
     }
 
     /// Drop a proposed upgrade (admin).
@@ -1719,10 +2475,7 @@ impl StrategyVault {
             None => panic_with_error!(&env, VaultError::NoPendingUpgrade),
         };
         env.storage().instance().remove(&DataKey::PendingUpgrade);
-        env.events().publish(
-            (Symbol::new(&env, "UPGRADE_CANCELLED"), config.admin),
-            pending.wasm_hash,
-        );
+        UpgradeCancelled { admin: config.admin, wasm_hash: pending.wasm_hash }.publish(&env);
     }
 
     pub fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade> {
@@ -1734,10 +2487,7 @@ impl StrategyVault {
         config.admin.require_auth();
 
         env.storage().instance().set(&DataKey::IsPaused, &true);
-        env.events().publish(
-            (Symbol::new(&env, "VAULT_PAUSED"), config.admin),
-            env.ledger().timestamp(),
-        );
+        VaultPaused { by: config.admin, timestamp: env.ledger().timestamp() }.publish(&env);
     }
 
     pub fn set_pause_authority(env: Env, new_pause_authority: Address) {
@@ -1754,6 +2504,116 @@ impl StrategyVault {
     /// policy hash and every enforced term. The vault's own consent is given by
     /// it being the invoker. Registration is one-time in the policy contract;
     /// later amendments are signed by the owner directly on the policy contract.
+    /// Designate the hot keeper key allowed to SUBMIT rebalances (admin).
+    /// The keeper cannot move value beyond what the signed policy validates.
+    pub fn set_keeper(env: Env, keeper: Address) {
+        get_config(&env).admin.require_auth();
+        env.storage().instance().set(&DataKey::Keeper, &keeper);
+    }
+
+    pub fn get_keeper(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Keeper)
+    }
+
+    /// Propose the executor contract for a trade route (admin). A router can
+    /// move vault funds, so it takes effect only after 48 h (anyone activates).
+    pub fn propose_router(env: Env, route: TradeRoute, router: Address) {
+        get_config(&env).admin.require_auth();
+        // Decision D-K: the delay protects depositors from a router swap. A
+        // vault's FIRST router, set while no shares exist, has nobody to
+        // protect yet (fresh testnet / factory vault): set atomically here,
+        // so no depositor can arrive between proposal and activation. Any
+        // later change, or any change once shares exist, waits 48 h.
+        if !env.storage().instance().has(&DataKey::Router(route as u32)) && share_supply(&env) == 0 {
+            env.storage().instance().set(&DataKey::Router(route as u32), &router);
+            RouterProposed { route: route as u32, router, effective_at: env.ledger().timestamp() }.publish(&env);
+            return;
+        }
+        let effective_at = env.ledger().timestamp().saturating_add(ROUTER_CHANGE_DELAY_SECONDS);
+        env.storage().instance().set(&DataKey::PendingRouter(route as u32), &PendingRouter { router: router.clone(), effective_at });
+        RouterProposed { route: route as u32, router, effective_at }.publish(&env);
+    }
+
+    pub fn activate_router(env: Env, route: TradeRoute) {
+        let pending: PendingRouter = env.storage().instance().get(&DataKey::PendingRouter(route as u32))
+            .unwrap_or_else(|| panic_with_error!(&env, VaultError::RouterNotReady));
+        if env.ledger().timestamp() < pending.effective_at {
+            panic_with_error!(&env, VaultError::RouterNotReady);
+        }
+        env.storage().instance().remove(&DataKey::PendingRouter(route as u32));
+        env.storage().instance().set(&DataKey::Router(route as u32), &pending.router);
+    }
+
+    pub fn get_router(env: Env, route: TradeRoute) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Router(route as u32))
+    }
+
+    /// Execute a rebalance proposal (audit W1). The keeper submits; the signed
+    /// policy must validate the proposal; every swap is measured on the
+    /// vault's own balances and must deliver at least `min_amount_out`;
+    /// sleeve holdings are booked from those measured deltas only. Finally
+    /// (audit W1b) the vault's ACTUAL holdings - not the claimed
+    /// `weights_after` - must satisfy the signed bands, caps and floor.
+    pub fn rebalance(env: Env, proposal: RebalanceProposal) {
+        let keeper: Address = env.storage().instance().get(&DataKey::Keeper)
+            .unwrap_or_else(|| panic_with_error!(&env, VaultError::Unauthorized));
+        if proposal.proposer != keeper {
+            panic_with_error!(&env, VaultError::Unauthorized);
+        }
+        keeper.require_auth();
+        if is_vault_paused(&env) {
+            panic_with_error!(&env, VaultError::VaultPaused);
+        }
+        let config = get_config(&env);
+        if proposal.vault != env.current_contract_address() {
+            panic_with_error!(&env, VaultError::Unauthorized);
+        }
+        let verdict = PolicyClient::new(&env, &config.policy_contract)
+            .validate_rebalance(&env.current_contract_address(), &proposal);
+        if !verdict.is_valid {
+            panic_with_error!(&env, VaultError::RebalanceRejected);
+        }
+
+        let mut sleeves: Vec<SleeveState> = env.storage().instance().get(&DataKey::Sleeves).unwrap_or_else(|| Vec::new(&env));
+        for op in proposal.operations.iter() {
+            let has = |a: &Address| sleeves.iter().any(|s| s.contract_address == *a);
+            if !has(&op.asset_in) || !has(&op.asset_out) {
+                panic_with_error!(&env, VaultError::SleeveNotFound);
+            }
+            let i_in = sleeve_index(&sleeves, &op.asset_in);
+            let i_out = sleeve_index(&sleeves, &op.asset_out);
+            let mut s_in = sleeves.get_unchecked(i_in);
+            if op.amount_in > sleeve_holdings(&env, &s_in) {
+                panic_with_error!(&env, VaultError::InsufficientBalance);
+            }
+            let (spent, received) = match op.route {
+                TradeRoute::Soroswap => {
+                    // A Blend position is not a token: never route it through an AMM.
+                    if blend_of(&env, &s_in).is_some() || blend_of(&env, &sleeves.get_unchecked(i_out)).is_some() {
+                        panic_with_error!(&env, VaultError::RouteUnavailable);
+                    }
+                    let router: Address = env.storage().instance().get(&DataKey::Router(TradeRoute::Soroswap as u32))
+                        .unwrap_or_else(|| panic_with_error!(&env, VaultError::RouteUnavailable));
+                    swap_on_soroswap(&env, &router, &op, proposal.deadline)
+                }
+                TradeRoute::Blend => blend_leg(&env, &config, &op),
+                _ => panic_with_error!(&env, VaultError::RouteUnavailable),
+            };
+            if spent > op.amount_in || received < op.min_amount_out {
+                panic_with_error!(&env, VaultError::SlippageExceeded);
+            }
+            s_in.current_balance -= spent;
+            sleeves.set(i_in, s_in);
+            let mut s_out = sleeves.get_unchecked(i_out);
+            s_out.current_balance += received;
+            sleeves.set(i_out, s_out);
+            RebalanceStep { proposer: keeper.clone(), asset_in: op.asset_in.clone(), asset_out: op.asset_out.clone(), spent, received }.publish(&env);
+        }
+        check_actual_allocation(&env, &config, &sleeves);
+        env.storage().instance().set(&DataKey::Sleeves, &sleeves);
+        RebalanceComplete { proposer: keeper, steps: proposal.operations.len() }.publish(&env);
+    }
+
     pub fn bind_policy(
         env: Env,
         owner: Address,
@@ -1768,6 +2628,21 @@ impl StrategyVault {
         let config = get_config(&env);
         config.admin.require_auth();
 
+        // Decision D-A: a "numeraire" sleeve is exempt from the concentration
+        // caps, so it must be THIS vault's settlement currency. The policy
+        // cannot check that itself (it cannot call back into the vault), and
+        // registration only happens here (it requires the vault's own auth).
+        let numeraire_sym = Symbol::new(&env, "numeraire");
+        let registry = AssetRegistryClient::new(&env, &config.registry_contract);
+        for t in sleeves.iter() {
+            if t.sleeve_type == numeraire_sym {
+                match registry.get_asset_by_address(&config.numeraire) {
+                    Some(e) if e.asset_id == t.asset_id => {}
+                    _ => panic_with_error!(&env, VaultError::InvalidSleeveConfig),
+                }
+            }
+        }
+
         PolicyClient::new(&env, &config.policy_contract).register_policy(
             &env.current_contract_address(),
             &owner,
@@ -1781,10 +2656,7 @@ impl StrategyVault {
             &sleeves,
         );
 
-        env.events().publish(
-            (Symbol::new(&env, "POLICY_BOUND"), owner),
-            policy_hash,
-        );
+        PolicyBound { owner, policy_hash }.publish(&env);
     }
 
     pub fn get_policy_hash(env: Env) -> Option<BytesN<32>> {

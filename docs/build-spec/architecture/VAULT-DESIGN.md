@@ -26,14 +26,14 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 - One WASM deployed; multiple vault instances share the code
 - Upgraded atomically via CAP-85 (Adapter, Protocol 28)
 
-### Private Vault (Q1 2027)
+### Private Vault (built 17 Nov 2026, decision D-C)
 - Deployed **per institution** via a factory contract
 - Own policy, own admin accounts, own share class
 - Required for: treasuries needing custom policy limits, multisig control, audit exports
 - Supports ML-DSA admin keys after Bell (Protocol 30)
 - More expensive (own state, own rent)
 
-**v1 delivers Strategy Vault only.** Private Vault Factory is Q1 2027.
+**Private Vault Factory (D-C, `ac597cd`):** `contracts/vault-factory` deploys the same audited vault WASM for a treasury. The factory fixes the shared registry / oracle / policy and the fee treasury; the creator chooses admin, pause authority, numéraire, performance fee (≤ 10 % of profit) and caps (≤ the factory's beta TVL cap). Addresses are bound to the creator (no squatting); `is_vault` attests origin; code for future vaults changes only after 48 h. Gated (SEP-57) private vaults still wait for an issuer allow-listing partner.
 
 ---
 
@@ -53,7 +53,11 @@ This makes the vault SEP-56 compatible even though it internally holds many asse
 - If an issuer freezes an asset: the **sleeve** is frozen, not the entire basket
   - Remaining sleeves continue to operate
   - Redemptions from frozen sleeve are queued
-  - **Implementation status (15 Nov 2026):** a frozen or unpriced sleeve that holds nothing is skipped when pricing shares, so it never blocks the vault (audit V3). A *funded* frozen sleeve currently hard-stops pricing; queued in-kind claims are tracked as audit V6 and ship with rebalance execution (W1).
+  - **Implementation status (16 Nov 2026):** a frozen or unpriced sleeve that holds nothing is skipped when pricing shares (audit V3). For a *funded* sleeve without a valid price (audit **V6**, `d1ecad4`):
+    - `redeem` and deposits stay halted — there is no fair share price, and an entry at a stale price would dilute holders.
+    - `redeem_frozen(shares, …)` (explicit opt-in) pays `shares / supply` of every **priced** sleeve's conservative value in cash now, and records `shares / supply` of each frozen sleeve's **units** as a claim for the receiver. The units leave the sleeve's books, so the remaining holders' per-share value is unchanged. The usual rules apply: operator auth + allowance, pause, fee accrual, cash actually held, and the liquidity floor measured over the priced part.
+    - `settle_claim(holder, asset)` (anyone may call; pays only the holder) settles in cash at units × **conservative** price once the asset is priced again, returning the units to the books. If the issuer clawed tokens back meanwhile, payment is capped pro rata to the reserved units still held. Settlement needs cash: the keeper raises it through policy-validated rebalances.
+    - A sleeve with outstanding claims cannot be removed (the reserved units are still held).
 
 ---
 
@@ -167,7 +171,7 @@ Can liquidity sleeve cover it?
 
 | Fee | Method | On-chain? |
 |---|---|---|
-| Management fee | Share dilution inside vault | YES — visible on-chain |
+| Performance fee (D-D) | 10% of profit above the per-share high-water mark (conservative NAV), max 0.20%/yr of assets, at most daily; share dilution | YES — enforced and visible on-chain |
 | Subscription fee | Off-chain billing | No |
 | Issuer expense ratios | Pass-through; no Constella markup | Shown in UI before deposit |
 

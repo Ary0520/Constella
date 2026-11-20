@@ -3,6 +3,7 @@ TDD Test Suite for Slice 2: Thesis Engine Optimise & Simulate (Steps 3 & 4)
 Written FIRST before implementation code is created.
 """
 
+from tests.fixtures import fixture_registry
 import pytest
 import pandas as pd
 import numpy as np
@@ -41,7 +42,7 @@ def test_t05_hrp_and_constrained_weights_sum_and_caps():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     result = optimize_portfolio(policy, candidates)
@@ -51,13 +52,21 @@ def test_t05_hrp_and_constrained_weights_sum_and_caps():
     assert abs(total_weight - 1.0) < 1e-4, f"Weights sum to {total_weight}, expected 1.0"
     assert sum(result.weights_bps.values()) == 10000, f"Weights bps sum to {sum(result.weights_bps.values())}"
 
-    # 2. Per-issuer cap (30%)
-    for issuer, weight in result.issuer_weights.items():
-        assert weight <= policy.max_issuer_weight + 1e-4, f"Issuer {issuer} weight {weight} exceeds cap {policy.max_issuer_weight}"
-
-    # 3. Per-asset cap (25%)
+    # D-A (owner, 17 Nov 2026): the issuer and single-asset caps apply to every
+    # asset EXCEPT the vault currency (USDC); Cash Reserve keeps USDC >= 85 %
+    # and lending <= 15 %. Checked exactly, integer bps.
+    from src.optimizer import check_allocation
+    assert check_allocation(result.weights_bps, policy, candidates, "USDC") == []
+    by = {c.asset_id: c for c in candidates}
+    non_num_issuers = {}
     for asset_id, weight in result.weights.items():
-        assert weight <= policy.max_single_asset_weight + 1e-4, f"Asset {asset_id} weight {weight} exceeds cap {policy.max_single_asset_weight}"
+        if asset_id == "USDC":
+            continue
+        assert weight <= policy.max_single_asset_weight + 1e-9, f"{asset_id} above the single-asset cap"
+        non_num_issuers[by[asset_id].issuer] = non_num_issuers.get(by[asset_id].issuer, 0.0) + weight
+    for issuer, weight in non_num_issuers.items():
+        assert weight <= policy.max_issuer_weight + 1e-9, f"issuer {issuer} {weight} above the cap (vault currency excluded)"
+    assert result.weights["USDC"] >= 0.85
 
     # 4. Liquidity floor (>= 10%)
     cash_weight = result.sleeve_weights.get("cash", 0.0)
@@ -76,7 +85,7 @@ def test_t06_currency_matching_constraint():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     result = optimize_portfolio(policy, candidates)
@@ -105,7 +114,7 @@ def test_t07_redemption_ladder_breakdown():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -115,9 +124,11 @@ def test_t07_redemption_ladder_breakdown():
     total_ladder = ladder.instant_pct + ladder.within_24h_pct + ladder.within_1w_pct + ladder.illiquid_pct
     assert abs(total_ladder - 1.0) < 1e-4, f"Ladder sum {total_ladder} != 1.0"
 
-    # For this runway basket, cash is instant (>= 10%), remaining is tier 1 T-bills (24h)
-    assert ladder.instant_pct >= 0.10
-    assert ladder.within_24h_pct >= 0.60
+    # D-A Cash Reserve: >= 85 % sits in instant vault currency; the rest (EUR
+    # T-bills here) redeems within 24h. (The old >= 60 % within-24h expectation
+    # described T-bill-heavy baskets, not a Phase-1 profile.)
+    assert ladder.instant_pct >= 0.85
+    assert ladder.within_24h_pct <= 0.15
     assert ladder.illiquid_pct == 0.0
 
 
@@ -135,7 +146,7 @@ def test_t08_stress_simulations_depeg_and_freeze():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -145,9 +156,12 @@ def test_t08_stress_simulations_depeg_and_freeze():
     assert sim_report.depeg_stress.nav_impact_pct < 0.0
     assert sim_report.depeg_stress.nav_impact_pct >= -0.05  # cannot exceed 5% total drawdown
 
-    # Issuer freeze: trapped liquidity matches largest issuer's weight
-    assert sim_report.issuer_freeze_stress.trapped_liquidity_pct > 0.0
-    assert sim_report.issuer_freeze_stress.trapped_liquidity_pct <= policy.max_issuer_weight + 1e-4
+    # Issuer freeze: the honest D-A disclosure - a Circle freeze traps the USDC
+    # vault currency too (the issuer cap exempts it, the risk does not go away).
+    circle = opt_result.issuer_weights["CIRCLE"]
+    assert circle >= 0.85
+    assert abs(sim_report.issuer_freeze_stress.trapped_liquidity_pct - circle) < 1e-4
+    assert "CIRCLE" in sim_report.issuer_freeze_stress.description
 
 
 def test_t09_mandatory_legal_disclaimer():
@@ -162,7 +176,7 @@ def test_t09_mandatory_legal_disclaimer():
 
     thesis = "Park runway."
     policy = parse_thesis(thesis, jurisdiction="non-US", investor_class="retail")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -183,7 +197,7 @@ def test_t10_hrp_with_historical_returns_dataframe():
 
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
 
     np.random.seed(42)
@@ -199,11 +213,23 @@ def test_t10_hrp_with_historical_returns_dataframe():
     assert abs(sum(result.weights.values()) - 1.0) < 1e-4
     assert sum(result.weights_bps.values()) == 10000
 
-    # Ensure hard caps are still respected under HRP projection
-    for issuer, weight in result.issuer_weights.items():
-        assert weight <= policy.max_issuer_weight + 1e-4
+    # Hard rules still hold exactly under the HRP refinement.
+    # D-A (owner, 17 Nov 2026): the issuer and single-asset caps apply to every
+    # asset EXCEPT the vault currency (USDC); Cash Reserve keeps USDC >= 85 %
+    # and lending <= 15 %. Checked exactly, integer bps.
+    from src.optimizer import check_allocation
+    assert check_allocation(result.weights_bps, policy, candidates, "USDC") == []
+    by = {c.asset_id: c for c in candidates}
+    non_num_issuers = {}
     for asset_id, weight in result.weights.items():
-        assert weight <= policy.max_single_asset_weight + 1e-4
+        if asset_id == "USDC":
+            continue
+        assert weight <= policy.max_single_asset_weight + 1e-9, f"{asset_id} above the single-asset cap"
+        non_num_issuers[by[asset_id].issuer] = non_num_issuers.get(by[asset_id].issuer, 0.0) + weight
+    for issuer, weight in non_num_issuers.items():
+        assert weight <= policy.max_issuer_weight + 1e-9, f"issuer {issuer} {weight} above the cap (vault currency excluded)"
+    assert result.weights["USDC"] >= 0.85
+
 
 
 def test_t11_simulation_with_custom_historical_nav():
@@ -218,7 +244,7 @@ def test_t11_simulation_with_custom_historical_nav():
 
     thesis = "Park runway."
     policy = parse_thesis(thesis, jurisdiction="non-US", investor_class="retail")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
 
@@ -259,7 +285,7 @@ def test_t13_exit_hours_derivation():
     # Runway thesis: assets are tier 0 (cash) and tier 1 (T-bills) -> 24 hours
     thesis = "Park 18 months of runway safe, 70% dollar T-bill funds, 20% euro T-bills for payroll, 10% instant liquidity."
     policy = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
-    registry = AssetRegistry()
+    registry = fixture_registry()
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
     sim_report = simulate_portfolio(opt_result.weights, candidates, policy)

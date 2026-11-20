@@ -3,6 +3,7 @@ Comprehensive unit tests for Slice 1: Models, Parser, and Retriever.
 Verifies boundary conditions, schema validation, and edge cases.
 """
 
+from tests.fixtures import fixture_registry
 import pytest
 from pydantic import ValidationError
 from src.models import PolicyDraft, AssetCandidate, SleeveType
@@ -39,9 +40,9 @@ def test_policy_draft_bounds_validation():
 
 
 def test_asset_registry_lookups():
-    registry = AssetRegistry()
+    registry = fixture_registry()
     assets = registry.list_assets()
-    assert len(assets) == 7
+    assert len(assets) == 8
 
     usdc = registry.get_asset("USDC")
     assert usdc is not None
@@ -51,12 +52,12 @@ def test_asset_registry_lookups():
 
     jqqq = registry.get_asset("JH_JQQQ")
     assert jqqq is not None
-    assert jqqq.requires_professional is True
+    assert jqqq.investor_classes_required == ["professional"]
     assert "US" in jqqq.blocked_jurisdictions
 
 
 def test_institutional_investor_access():
-    registry = AssetRegistry()
+    registry = fixture_registry()
     # Institutional investor in EU should have access to JH_JQQQ (equity)
     policy = PolicyDraft(
         jurisdiction="EU",
@@ -72,7 +73,7 @@ def test_institutional_investor_access():
 
 
 def test_exclusions_filtering():
-    registry = AssetRegistry()
+    registry = fixture_registry()
     # Explicitly exclude lending and equity
     policy = PolicyDraft(
         jurisdiction="EU",

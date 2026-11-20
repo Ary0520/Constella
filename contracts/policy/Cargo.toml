@@ -15,3 +15,4 @@ soroban-sdk = { workspace = true }
 soroban-sdk = { workspace = true, features = ["testutils"] }
 constella-registry = { path = "../registry" }
 constella-nav-oracle = { path = "../nav-oracle" }
+constella-testkit = { path = "../testkit" }

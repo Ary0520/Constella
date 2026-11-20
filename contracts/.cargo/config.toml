@@ -1,5 +1,8 @@
 [build]
-target-dir = "C:/Users/aryan/.cargo_target/constella"
+# Windows host builds (tests, clippy). Kept on D: so build output does not
+# fill the system drive (15 Nov 2026). Docker release builds override this
+# with CARGO_TARGET_DIR (see docker/README-stellar-build.md).
+target-dir = "D:/cargo_target/constella"
 
 [target.x86_64-pc-windows-gnu]
 rustflags = ["-C", "link-arg=-Wl,--exclude-all-symbols"]

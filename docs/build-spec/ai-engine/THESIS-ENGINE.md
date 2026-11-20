@@ -46,11 +46,25 @@ class PolicyDraft(BaseModel):
     ambiguities: List[str]          # fields with low confidence, flagged for user
 ```
 
-**LLM instructions:**
-- Use schema-constrained output (function calling mode)
-- Do NOT hallucinate asset names; leave `exclusions` for domain-level exclusions only
-- If the thesis is ambiguous, generate the most conservative reasonable interpretation AND flag ambiguities for user confirmation
-- Output confidence score for each parsed field
+**User caps (audit A2, implemented):** caps the user states ("no more than 40% per issuer", "no single asset above 15%") are carried into the policy as written; a cap looser than the documented default is applied **and** flagged for confirmation; conflicting caps resolve to the strictest; impossible or "minimum per issuer" caps keep the default and are flagged. The same rules apply to the LLM parser's output (validated after the model).
+
+**LLM-assisted Parse (decision D-J, implemented `8dd73df`, `c9ef464`; `src/thesis_llm.py`, `src/llm.py`):**
+The model helps with language only; it proposes and never decides.
+- OpenRouter chat/completions, `response_format` json_schema `strict`, `provider: {require_parameters: true, data_collection: "deny", zdr: true}`; pinned models `anthropic/claude-haiku-5.5` → `openai/gpt-5-mini` → `google/gemini-2.5-flash`. No `temperature` (current models reject it, and with `require_parameters` it excludes every endpoint).
+- Schema has **no nullable unions** (some providers' strict mode refuses them): `numbers: [{field, pct, quote}]`, enums with `"unstated"`.
+- **Jurisdiction and investor class come from onboarding only** — never from the text or the model.
+- **Grounding:** each number needs a quote found verbatim in the thesis that contains it; otherwise dropped and flagged.
+- **Merge with the rule-based parser toward the safer value:** lower cap, higher cash floor, more conservative risk / yield orientation, union of exclusions; duplicate readings → lowest cap / highest floor; conflicting currency readings ignored; every disagreement is flagged for the review screen.
+- Thesis sent delimited as untrusted data; > 4000 characters or any error / budget refusal → rule-based parser (flagged).
+- **SpendGuard:** before sending, the worst case (prompt + `max_tokens` at the dearest pinned model, live prices from `/models`) must fit the run budget and leave the account above a floor; the actual `usage.cost` is booked after (worst case if absent); truncated output is an error.
+
+---
+
+**Real yield numbers (audit A3, implemented):** `src/yields.py` reads rates from the chain, never assumes them. Blend supply APR = Blend v2's own interest model on the pool's live reserve data (verified against the real pool's accrual to <= 1 bp); vault realised APR = the vault's own daily conservative NAV history (`get_nav_history`, at most one point a day, 90 kept). Assets without a live source stay 0 = unknown and are never quoted. Rates are simple APRs, variable, never promised.
+
+**LLM-assisted Explain (D-J):** the model writes a ≤ 120-word summary and 2-4 risks from a structured facts object only (allocation, vault currency, profile, floor, cap, warnings, items needing confirmation). It is discarded if it contains any number not in the facts or any promise ("guaranteed", "risk-free", "insured", ...). The deterministic `ExplanationReport` remains the authoritative explanation.
+
+**Tests:** offline `tests/test_thesis_llm.py` (82 total in the suite; guard mutation 21/21); live `tests/test_llm_live.py`, opt-in (`CONSTELLA_LIVE_LLM=1`, key in env, shared $0.03 guard) — 3/3 on Claude Haiku 5.5, $0.00088 per run (17 Nov 2026).
 
 ---
 
@@ -59,20 +73,19 @@ class PolicyDraft(BaseModel):
 **Output:** Candidate asset list (from registry ONLY — no exceptions)
 
 ```python
+# Audit A3 / decision D-B (implemented, `3eaaa02`)
+registry = AssetRegistry.from_chain(rpc_url, passphrase, registry_id, any_account)  # registry.list_assets()
 def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[AssetCandidate]:
-    # 1. Filter by jurisdiction compatibility
-    eligible = registry.filter_by_jurisdiction(policy.jurisdiction)
-    # 2. Filter by investor class
-    eligible = [a for a in eligible if 
-                policy.investor_class in a.investor_classes_required or a.permissionless]
-    # 3. Filter by exclusions
-    eligible = [a for a in eligible if a.sleeve_type not in policy.exclusions]
-    # 4. Rank by relevance to objectives via vector similarity
-    ranked = vector_search(policy.objectives, eligible)
-    return ranked  # Only registry IDs — hallucinated assets cannot appear
+    # 1-2. Eligibility = issuer rules recorded ON CHAIN (blocked / eligible
+    #      jurisdictions, required investor classes, active flag) AND
+    #      Constella's class policy: retail = permissionless only (until
+    #      Phase 4); sanctioned jurisdictions get nothing; vague answers fail closed.
+    eligible = eligibility.eligible_assets(registry.list_assets(), policy.jurisdiction, policy.investor_class)
+    # 3. Exclusions; 4. currency alignment (vector ranking: future)
+    ...
 ```
 
-**Closed universe enforcement:** The vector search only searches over assets in the registry. Only registry contract addresses are valid outputs. If a user asks for "Amazon stock," and it's not in the registry, it cannot appear in the proposal — the diff screen will explain why.
+**Closed universe enforcement (A3):** the on-chain registry is the only source of assets, contract addresses and issuer rules; the engine keeps display text only, skips on-chain assets it has no description for, and never invents yields (unknown until a live source exists). The vector search, when added, only searches over assets in the registry. Only registry contract addresses are valid outputs. If a user asks for "Amazon stock," and it's not in the registry, it cannot appear in the proposal — the diff screen will explain why.
 
 ---
 
@@ -92,7 +105,7 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 - No illiquid assets in liquid baskets
 - Each sleeve within its declared liquidity tier
 
-**Fallback:** If HRP fails to converge → equal-weight within constraints.
+**Fail closed (audit A1 / decision D-A, implemented `fce2fed`):** there is **no** fallback that relaxes a rule. Hard rules — the profile (Cash Reserve, the default and only Phase-1 profile: vault currency ≥ 85 %, lending ≤ 15 %), the liquidity floor, and the user's issuer / single-asset caps on every asset **except the vault currency** — are never relaxed. The user's currency split is a soft target: if it conflicts, `InfeasibleAllocation` lists the reasons and offers the nearest valid allocation without it, which the user must accept. An exact LP proves feasibility, SLSQP / HRP refinements are kept only if still valid, bps rounding is cap-safe largest-remainder, and an integer-exact final check raises rather than returning an invalid allocation. The explainer discloses the vault-currency issuer exposure (e.g. "92 % depends on CIRCLE through USDC") plainly.
 
 **Covariance inputs:**
 - Historical NAV returns (where available; short histories for newer tokenized funds)
@@ -231,8 +244,8 @@ Each asset in the registry has a text document for semantic search:
 
 | Component | Technology |
 |---|---|
-| LLM | GPT-4o or Claude via API (schema-constrained function calling) |
-| Orchestration | LangChain |
+| LLM | OpenRouter (D-J): Claude Haiku 5.5 with gpt-5-mini / gemini-2.5-flash fallbacks, json_schema strict, ZDR + no data collection |
+| Orchestration | Direct HTTP (stdlib), no LangChain — two calls do not need a framework |
 | Vector search | pgvector (PostgreSQL extension) or Chroma |
 | Portfolio optimisation | PyPortfolioOpt (HRP) |
 | Policy schema | Pydantic (Python) |

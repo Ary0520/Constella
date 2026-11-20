@@ -16,6 +16,8 @@
 
 1. **Passkey secp256r1 Authentication:**
    - Signatures are verified against the standard NIST P-256 (`secp256r1`) curve using `env.crypto().secp256r1_verify(&public_key, &msg_hash, &signature)`.
+   - **Correction (audit S1, 15 Nov 2026):** verifying P-256 over the raw payload is wrong. Real passkeys sign a WebAuthn assertion: `SHA-256(authenticatorData ‖ SHA-256(clientDataJSON))`, with the payload as the base64url `challenge`. Each signature is now `{public_key, signature: WebAuthnSigData {signature, authenticator_data, client_data}}`, verified by OpenZeppelin `stellar_accounts::verifiers::webauthn::verify`.
+   - **Superseded (W4.3b):** the custom signer/weight/threshold model was replaced by OpenZeppelin context rules. A protected owner rule and a scoped M-of-N recovery rule replace the old roles, and the shared `webauthn-verifier` and `threshold-policy` contracts do the checking. See `CONTRACTS-SPEC.md`.
    - Public keys are 65-byte uncompressed SEC-1 format (`0x04 || X || Y`).
    - Signatures are 64-byte raw format (`r || s`, 32 bytes each).
 2. **CustomAccountInterface Conformance:**

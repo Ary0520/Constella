@@ -1,8 +1,94 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, Symbol, Vec,
+    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec,
 };
+
+// Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
+// Events::publish encodings; pinned by golden/events.txt).
+
+/// Topics: [SPONSOR_INITIALIZED, admin]. Data: daily budget (stroops).
+#[contractevent(topics = ["SPONSOR_INITIALIZED"], data_format = "single-value")]
+pub struct SponsorInitialized {
+    #[topic]
+    pub admin: Address,
+    pub daily_budget_stroops: u64,
+}
+
+/// Topics: [CONTRACT_WHITELISTED, admin]. Data: target contract.
+#[contractevent(topics = ["CONTRACT_WHITELISTED"], data_format = "single-value")]
+pub struct ContractWhitelisted {
+    #[topic]
+    pub admin: Address,
+    pub target: Address,
+}
+
+/// Topics: [CONTRACT_UNWHITELISTED, admin]. Data: target contract.
+#[contractevent(topics = ["CONTRACT_UNWHITELISTED"], data_format = "single-value")]
+pub struct ContractUnwhitelisted {
+    #[topic]
+    pub admin: Address,
+    pub target: Address,
+}
+
+/// Topics: [SPONSORED_OP, user, target_contract]. Data: fee spent (stroops).
+#[contractevent(topics = ["SPONSORED_OP"], data_format = "single-value")]
+pub struct SponsoredOp {
+    #[topic]
+    pub user: Address,
+    #[topic]
+    pub target_contract: Address,
+    pub fee_spent_stroops: u64,
+}
+
+/// Topics: [LIMITS_UPDATED, admin]. Data: daily budget (stroops).
+#[contractevent(topics = ["LIMITS_UPDATED"], data_format = "single-value")]
+pub struct LimitsUpdated {
+    #[topic]
+    pub admin: Address,
+    pub daily_budget_stroops: u64,
+}
+
+/// Topics: [SPONSOR_ADMIN_TRANSFERRED, old_admin]. Data: new admin.
+#[contractevent(topics = ["SPONSOR_ADMIN_TRANSFERRED"], data_format = "single-value")]
+pub struct SponsorAdminTransferred {
+    #[topic]
+    pub old_admin: Address,
+    pub new_admin: Address,
+}
+
+/// Topics: [SPONSOR_PAUSED, admin]. Data: void.
+/// Decision D-I: a relayer account joined / left the pool.
+#[contractevent(topics = ["RELAYER_ADDED"], data_format = "single-value")]
+pub struct RelayerAdded {
+    #[topic]
+    pub admin: Address,
+    pub relayer: Address,
+}
+
+#[contractevent(topics = ["RELAYER_REMOVED"], data_format = "single-value")]
+pub struct RelayerRemoved {
+    #[topic]
+    pub admin: Address,
+    pub relayer: Address,
+}
+
+/// Decision D-I: maximum relayer accounts in the pool (bounded, so the set can
+/// live in instance storage without the F1a growth problem).
+pub const MAX_RELAYERS: u32 = 16;
+
+#[contractevent(topics = ["SPONSOR_PAUSED"], data_format = "single-value")]
+pub struct SponsorPaused {
+    #[topic]
+    pub admin: Address,
+}
+
+/// Topics: [SPONSOR_UNPAUSED, admin]. Data: void.
+#[contractevent(topics = ["SPONSOR_UNPAUSED"], data_format = "single-value")]
+pub struct SponsorUnpaused {
+    #[topic]
+    pub admin: Address,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
@@ -19,6 +105,14 @@ pub enum SponsorError {
     ContractAlreadyWhitelisted = 9,
     ContractNotWhitelisted = 10,
     InvalidConfig = 11,
+    /// No relayer has been designated yet (audit F1b).
+    RelayerNotSet = 12,
+    /// The address is already in the relayer set (decision D-I).
+    RelayerExists = 13,
+    /// The relayer set is full (MAX_RELAYERS).
+    TooManyRelayers = 14,
+    /// The address is not in the relayer set.
+    NotARelayer = 15,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -55,6 +149,20 @@ pub enum DataKey {
     WhitelistList,
     UserStats(Address),
     GlobalStats,
+    /// Audit F1b / decision D-I: the bounded set of relayer accounts allowed
+    /// to record sponsored operations (a pool, so throughput scales).
+    Relayers,
+}
+
+/// Audit F1a: TTLs (in ledgers, ~5 s each). Per-user stats live in their own
+/// persistent entries; the instance (config, global stats, whitelist - all
+/// bounded) is extended on use so the sponsor never archives while in use.
+const DAY_LEDGERS: u32 = 17_280;
+const TTL_THRESHOLD: u32 = 29 * DAY_LEDGERS;
+const TTL_EXTEND_TO: u32 = 30 * DAY_LEDGERS;
+
+fn extend_instance(env: &Env) {
+    env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
 #[contract]
@@ -102,10 +210,7 @@ impl FeeSponsorContract {
             .instance()
             .set(&DataKey::WhitelistList, &empty_list);
 
-        env.events().publish(
-            (Symbol::new(&env, "SPONSOR_INITIALIZED"), admin),
-            daily_budget_stroops,
-        );
+        SponsorInitialized { admin, daily_budget_stroops }.publish(&env);
 
     }
 
@@ -133,10 +238,7 @@ impl FeeSponsorContract {
         list.push_back(target.clone());
         env.storage().instance().set(&DataKey::WhitelistList, &list);
 
-        env.events().publish(
-            (Symbol::new(&env, "CONTRACT_WHITELISTED"), config.admin),
-            target,
-        );
+        ContractWhitelisted { admin: config.admin, target }.publish(&env);
 
         Ok(())
     }
@@ -174,10 +276,7 @@ impl FeeSponsorContract {
             .instance()
             .set(&DataKey::WhitelistList, &new_list);
 
-        env.events().publish(
-            (Symbol::new(&env, "CONTRACT_UNWHITELISTED"), config.admin),
-            target,
-        );
+        ContractUnwhitelisted { admin: config.admin, target }.publish(&env);
 
         Ok(())
     }
@@ -234,14 +333,68 @@ impl FeeSponsorContract {
         Ok(())
     }
 
-    /// Record an executed sponsored operation (updates quotas and consumes daily budget)
+    /// Audit F1b / D-I: add a relayer account to the pool - a service key
+    /// that pays fees and records sponsored operations. Admin only. Least
+    /// privilege: a relayer can only record (within the limits); it cannot
+    /// change limits, the whitelist, the admin, the pool, or unpause.
+    pub fn add_relayer(env: Env, relayer: Address) -> Result<(), SponsorError> {
+        let config = Self::require_admin(&env)?;
+        let mut set = Self::get_relayers(env.clone());
+        if set.contains(&relayer) {
+            return Err(SponsorError::RelayerExists);
+        }
+        if set.len() >= MAX_RELAYERS {
+            return Err(SponsorError::TooManyRelayers);
+        }
+        set.push_back(relayer.clone());
+        env.storage().instance().set(&DataKey::Relayers, &set);
+        extend_instance(&env);
+        RelayerAdded { admin: config.admin, relayer }.publish(&env);
+        Ok(())
+    }
+
+    /// Remove a relayer account (e.g. a rotated or compromised key). Admin only.
+    pub fn remove_relayer(env: Env, relayer: Address) -> Result<(), SponsorError> {
+        let config = Self::require_admin(&env)?;
+        let mut set = Self::get_relayers(env.clone());
+        let Some(i) = set.first_index_of(&relayer) else {
+            return Err(SponsorError::NotARelayer);
+        };
+        set.remove(i);
+        env.storage().instance().set(&DataKey::Relayers, &set);
+        extend_instance(&env);
+        RelayerRemoved { admin: config.admin, relayer }.publish(&env);
+        Ok(())
+    }
+
+    pub fn get_relayers(env: Env) -> Vec<Address> {
+        env.storage().instance().get(&DataKey::Relayers).unwrap_or_else(|| Vec::new(&env))
+    }
+
+    pub fn is_relayer(env: Env, relayer: Address) -> bool {
+        Self::get_relayers(env).contains(&relayer)
+    }
+
+    /// Record a sponsored operation BEFORE the relayer submits it: enforces
+    /// the whitelist, pause, per-user quotas and the global daily budget on
+    /// chain, and consumes `fee_spent_stroops` (the relayer's fee cap for the
+    /// operation - an upper bound). `relayer` must be in the pool and sign
+    /// (audit F1b, decision D-I).
     pub fn record_sponsored_op(
         env: Env,
+        relayer: Address,
         user: Address,
         target_contract: Address,
         fee_spent_stroops: u64,
     ) -> Result<(), SponsorError> {
-        let _config = Self::require_admin(&env)?;
+        let set = Self::get_relayers(env.clone());
+        if set.is_empty() {
+            return Err(SponsorError::RelayerNotSet);
+        }
+        if !set.contains(&relayer) {
+            return Err(SponsorError::NotARelayer);
+        }
+        relayer.require_auth();
 
         // Ensure operation adheres to whitelist, circuit breaker, and budget before recording
         Self::validate_sponsorship(
@@ -275,18 +428,12 @@ impl FeeSponsorContract {
             last_op_timestamp: now,
         };
 
-        env.storage()
-            .instance()
-            .set(&DataKey::UserStats(user.clone()), &updated_user_stats);
+        let key = DataKey::UserStats(user.clone());
+        env.storage().persistent().set(&key, &updated_user_stats);
+        env.storage().persistent().extend_ttl(&key, TTL_THRESHOLD, TTL_EXTEND_TO);
+        extend_instance(&env);
 
-        env.events().publish(
-            (
-                Symbol::new(&env, "SPONSORED_OP"),
-                user,
-                target_contract,
-            ),
-            fee_spent_stroops,
-        );
+        SponsoredOp { user, target_contract, fee_spent_stroops }.publish(&env);
 
         Ok(())
     }
@@ -313,10 +460,7 @@ impl FeeSponsorContract {
 
         env.storage().instance().set(&DataKey::Config, &config);
 
-        env.events().publish(
-            (Symbol::new(&env, "LIMITS_UPDATED"), config.admin),
-            daily_budget_stroops,
-        );
+        LimitsUpdated { admin: config.admin, daily_budget_stroops }.publish(&env);
 
         Ok(())
     }
@@ -328,10 +472,7 @@ impl FeeSponsorContract {
         config.admin = new_admin.clone();
         env.storage().instance().set(&DataKey::Config, &config);
 
-        env.events().publish(
-            (Symbol::new(&env, "SPONSOR_ADMIN_TRANSFERRED"), old_admin),
-            new_admin,
-        );
+        SponsorAdminTransferred { old_admin, new_admin }.publish(&env);
 
         Ok(())
     }
@@ -342,8 +483,7 @@ impl FeeSponsorContract {
         config.is_paused = true;
         env.storage().instance().set(&DataKey::Config, &config);
 
-        env.events()
-            .publish((Symbol::new(&env, "SPONSOR_PAUSED"), config.admin), ());
+        SponsorPaused { admin: config.admin }.publish(&env);
 
         Ok(())
     }
@@ -354,8 +494,7 @@ impl FeeSponsorContract {
         config.is_paused = false;
         env.storage().instance().set(&DataKey::Config, &config);
 
-        env.events()
-            .publish((Symbol::new(&env, "SPONSOR_UNPAUSED"), config.admin), ());
+        SponsorUnpaused { admin: config.admin }.publish(&env);
 
         Ok(())
     }
@@ -372,7 +511,7 @@ impl FeeSponsorContract {
     pub fn get_user_stats(env: Env, user: Address) -> UserSponsorStats {
         let now = env.ledger().timestamp();
         let stored: Option<UserSponsorStats> =
-            env.storage().instance().get(&DataKey::UserStats(user));
+            env.storage().persistent().get(&DataKey::UserStats(user));
         match stored {
             Some(stats) => {
                 let hourly = if stats.last_op_timestamp == 0

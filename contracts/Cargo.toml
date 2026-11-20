@@ -9,6 +9,12 @@ members = [
     "vault-strategy",
     "smart-account",
     "fee-sponsor",
+    "webauthn-verifier",
+    "threshold-policy",
+    "testkit",
+    "vault-factory",
+    "account-factory",
+    "collateral-oracle",
 ]
 
 [workspace.package]
@@ -18,7 +24,7 @@ authors = ["Constella Engineering Team"]
 license = "Apache-2.0"
 
 [workspace.dependencies]
-soroban-sdk = "22.0.0"
+soroban-sdk = "28.0.0"
 
 [profile.release]
 opt-level = "z"

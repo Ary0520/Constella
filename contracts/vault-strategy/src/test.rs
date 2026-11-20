@@ -15,6 +15,27 @@ use soroban_sdk::{
     Address, Env, String, Symbol, Vec as SdkVec,
 };
 
+/// SDK 28 returns events as XDR (`ContractEvents`). Convert them back to the
+/// `(contract, topics, data)` tuples these assertions use - the same mapping
+/// the SDK applies in its own `PartialEq` for `ContractEvents` (W4.1).
+fn all_events(env: &soroban_sdk::Env) -> soroban_sdk::Vec<(soroban_sdk::Address, soroban_sdk::Vec<soroban_sdk::Val>, soroban_sdk::Val)> {
+    use soroban_sdk::testutils::Events as _;
+    use soroban_sdk::{xdr, TryFromVal};
+    let mut out = soroban_sdk::Vec::new(env);
+    for e in env.events().all().events() {
+        let Some(id) = e.contract_id.clone() else { continue };
+        let addr = soroban_sdk::Address::try_from_val(env, &xdr::ScAddress::Contract(id)).unwrap();
+        let xdr::ContractEventBody::V0(body) = &e.body;
+        let mut topics = soroban_sdk::Vec::new(env);
+        for t in body.topics.iter() {
+            topics.push_back(soroban_sdk::Val::try_from_val(env, t).unwrap());
+        }
+        out.push_back((addr, topics, soroban_sdk::Val::try_from_val(env, &body.data).unwrap()));
+    }
+    out
+}
+
+
 #[allow(dead_code)]
 struct TestContext<'a> {
     env: Env,
@@ -93,7 +114,7 @@ fn setup_test_context() -> TestContext<'static> {
         oracle_contract: oracle_id.clone(),
         registry_contract: registry_id.clone(),
         treasury: treasury.clone(),
-        management_fee_bps: 100, // 1% per year
+        performance_fee_bps: 1_000, // D-D: 10 % of profit
         tvl_cap: 1_000_000 * 10_000_000, // FIXTURE: ROADMAP 3.2 $1M beta cap
         per_user_cap: 100_000 * 10_000_000, // FIXTURE: design-partner ticket size (GTM)
     };
@@ -149,7 +170,7 @@ fn test_t40_deposit_and_mint_median_nav() {
     assert_eq!(ctx.numeraire_client.balance(&ctx.alice), 1000_0000000);
 
     // Alice deposits 500 USDC
-    let shares_minted = ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+    let shares_minted = ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(shares_minted, 500_0000000);
 
     // Verify balances after deposit
@@ -160,7 +181,7 @@ fn test_t40_deposit_and_mint_median_nav() {
     assert_eq!(ctx.numeraire_client.balance(&ctx.vault_id), 500_0000000);
 
     // Alice mints 250 shares
-    let assets_paid = ctx.vault_client.mint(&250_0000000, &ctx.alice);
+    let assets_paid = ctx.vault_client.mint(&250_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(assets_paid, 250_0000000);
 
     // Verify balances after mint
@@ -172,7 +193,7 @@ fn test_t40_deposit_and_mint_median_nav() {
 
     // Test convert functions
     assert_eq!(ctx.vault_client.convert_to_shares(&100_0000000), 100_0000000);
-    assert_eq!(ctx.vault_client.asset(), ctx.numeraire_address);
+    assert_eq!(ctx.vault_client.query_asset(), ctx.numeraire_address);
 }
 
 // -------------------------------------------------------------------------
@@ -184,7 +205,7 @@ fn test_t41_instant_redemption_conservative_nav() {
 
     // Deposit 1000 USDC by Alice at $1.00 NAV
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&1000_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 1000_0000000);
 
     // Verify Invariant: conservative_nav <= deposit_nav
@@ -196,14 +217,14 @@ fn test_t41_instant_redemption_conservative_nav() {
     assert_eq!(cons_nav.price, 10_000_000);
 
     // Alice redeems 100 shares for Bob: 100 shares * $1.00 = 100 USDC
-    let assets_out = ctx.vault_client.redeem(&100_0000000, &ctx.bob, &ctx.alice);
+    let assets_out = ctx.vault_client.redeem(&100_0000000, &ctx.bob, &ctx.alice, &ctx.alice);
     assert_eq!(assets_out, 100_0000000);
     assert_eq!(ctx.numeraire_client.balance(&ctx.bob), 100_0000000);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 900_0000000);
     assert_eq!(ctx.vault_client.total_supply(), 900_0000000);
 
     // Alice withdraws 99 USDC directly: burns exactly 99 shares at $1.00
-    let shares_burned = ctx.vault_client.withdraw(&99_0000000, &ctx.alice, &ctx.alice);
+    let shares_burned = ctx.vault_client.withdraw(&99_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(shares_burned, 99_0000000);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 801_0000000);
     assert_eq!(ctx.vault_client.total_supply(), 801_0000000);
@@ -215,33 +236,19 @@ fn test_t41_instant_redemption_conservative_nav() {
 // -------------------------------------------------------------------------
 #[test]
 fn test_t42_fee_dilution_calculation() {
+    // Decision D-D: the fee is a share of PROFIT, so a cash-only vault that
+    // earned nothing in a year mints no fee shares (the old 1 %/yr management
+    // fee would have taken 10 shares here). Profit cases: security_regressions dd::*.
     let ctx = setup_test_context();
-
-    // Management fee = 100 bps = 1% / year
     ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
-
-    let initial_shares = ctx.vault_client.total_supply();
+    ctx.vault_client.deposit(&1000_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let initial_assets = ctx.vault_client.total_assets();
-    assert_eq!(initial_shares, 1000_0000000);
-    assert_eq!(initial_assets, 1000_0000000);
-    assert_eq!(ctx.vault_client.balance(&ctx.treasury), 0);
-
-    // Advance time by exactly 1 year (31,536,000 seconds)
     ctx.env.ledger().set_timestamp(1_000_000 + 31_536_000);
-
-    // Accrue fees
-    let fee_shares = ctx.vault_client.accrue_fees();
-    // 1% of 1000 shares = 10 shares
-    assert_eq!(fee_shares, 10_0000000);
-
-    // Verify treasury received diluted shares
-    assert_eq!(ctx.vault_client.balance(&ctx.treasury), 10_0000000);
-    assert_eq!(ctx.vault_client.total_supply(), 1010_0000000);
-    assert_eq!(ctx.vault_client.balance(&ctx.alice), 1000_0000000);
-
-    // Critical Invariant: Total underlying assets unchanged!
+    assert_eq!(ctx.vault_client.accrue_fees(), 0);
+    assert_eq!(ctx.vault_client.balance(&ctx.treasury), 0);
+    assert_eq!(ctx.vault_client.total_supply(), 1000_0000000);
     assert_eq!(ctx.vault_client.total_assets(), initial_assets);
+    assert_eq!(ctx.vault_client.get_high_water_mark(), 10_000_000);
 }
 
 // -------------------------------------------------------------------------
@@ -253,7 +260,7 @@ fn test_t43_collateral_passport_views() {
 
     // Deposit initial capital
     ctx.numeraire_admin.mint(&ctx.alice, &500_0000000);
-    ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
 
     // 1. Dual NAV
     let cons_nav = ctx.vault_client.get_nav_conservative().unwrap();
@@ -329,10 +336,10 @@ fn test_t44_emergency_pause_and_unpause() {
     assert_eq!(ctx.vault_client.max_redeem(&ctx.alice), 0);
 
     // Operations must panic with VaultPaused
-    let res = ctx.vault_client.try_deposit(&50_0000000, &ctx.alice);
+    let res = ctx.vault_client.try_deposit(&50_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(res.unwrap_err().unwrap(), VaultError::VaultPaused.into());
 
-    let res_mint = ctx.vault_client.try_mint(&50_0000000, &ctx.alice);
+    let res_mint = ctx.vault_client.try_mint(&50_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(res_mint.unwrap_err().unwrap(), VaultError::VaultPaused.into());
 
     let res_transfer = ctx.vault_client.try_transfer(&ctx.alice, &ctx.bob, &10_0000000);
@@ -343,7 +350,7 @@ fn test_t44_emergency_pause_and_unpause() {
     assert!(!ctx.vault_client.is_paused());
 
     // Operations resume normally
-    let shares = ctx.vault_client.deposit(&50_0000000, &ctx.alice);
+    let shares = ctx.vault_client.deposit(&50_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(shares, 50_0000000);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 50_0000000);
 
@@ -371,7 +378,7 @@ fn test_t45_sep41_token_standard() {
     let ctx = setup_test_context();
 
     ctx.numeraire_admin.mint(&ctx.alice, &500_0000000);
-    ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
 
     // Metadata
     assert_eq!(ctx.vault_client.decimals(), 7);
@@ -414,163 +421,8 @@ fn test_t45_sep41_token_standard() {
 // -------------------------------------------------------------------------
 // T46: Liquidity Sleeve Floor & Capacity Boundary Protection
 // -------------------------------------------------------------------------
-#[test]
-#[ignore = "audit V2: fabricated sleeve holdings via set_sleeves; re-enable when W1 (policy-validated rebalance execution) can acquire real holdings"]
-fn test_t46_liquidity_sleeve_floor_protection() {
-    let ctx = setup_test_context();
-
-    // Deploy an RWA token (BENJI)
-    let benji_admin = Address::generate(&ctx.env);
-    let benji_sac = ctx.env.register_stellar_asset_contract_v2(benji_admin);
-    let benji_address = benji_sac.address();
-
-    // Register BENJI in Asset Registry
-    let mut benji_sources = SdkVec::new(&ctx.env);
-    benji_sources.push_back(Symbol::new(&ctx.env, "BENJI_MEDIAN"));
-    ctx.registry_client.add_asset(&AssetEntry {
-        contract_address: benji_address.clone(),
-        asset_id: Symbol::new(&ctx.env, "BENJI"),
-        issuer: Symbol::new(&ctx.env, "FRANKLIN_TEMPLETON"),
-        sleeve_type: RegSleeveType::UsdGovFund,
-        liquidity_tier: 1, // 24h liquidity
-        permissionless: true,
-        oracle_sources: benji_sources,
-        eligible_jurisdictions: SdkVec::new(&ctx.env),
-        blocked_jurisdictions: SdkVec::new(&ctx.env),
-        investor_classes_required: SdkVec::new(&ctx.env),
-        is_active: true,
-        added_at: 1_000_000,
-    });
-
-    // Configure oracle for USD_GOV_FUNDS sleeve
-    let gov_sym = Symbol::new(&ctx.env, "USD_GOV_FUNDS");
-    ctx.oracle_client.configure_sleeve(&gov_sym, &300, &2);
-    let s1 = ExtOracleSource {
-        source_id: Symbol::new(&ctx.env, "BENJI_MEDIAN"),
-        asset: benji_address.clone(),
-        sleeve: gov_sym.clone(),
-        price: 10_000_000,
-        timestamp: 1_000_000,
-        staleness_limit_seconds: 14400,
-        min_liquidity_depth_usd: 100_000,
-        current_liquidity_depth_usd: 200_000,
-        is_active: true,
-    };
-    let s2 = ExtOracleSource {
-        source_id: Symbol::new(&ctx.env, "BENJI_MIN"),
-        asset: benji_address.clone(),
-        sleeve: gov_sym,
-        price: 9_900_000,
-        timestamp: 1_000_000,
-        staleness_limit_seconds: 14400,
-        min_liquidity_depth_usd: 100_000,
-        current_liquidity_depth_usd: 200_000,
-        is_active: true,
-    };
-    ctx.oracle_client.register_source(&s1);
-    ctx.oracle_client.register_source(&s2);
-
-    // Register policy for vault: 10% liquidity floor (1000 bps)
-    let dummy_hash = soroban_sdk::BytesN::from_array(&ctx.env, &[7u8; 32]);
-    let mut policy_targets = SdkVec::new(&ctx.env);
-    policy_targets.push_back(SleeveTarget {
-        asset_id: Symbol::new(&ctx.env, "USDC"),
-        target_weight_bps: 2000,
-        min_band_bps: 1000,
-        max_band_bps: 3000,
-        sleeve_type: Symbol::new(&ctx.env, "cash"),
-    });
-    policy_targets.push_back(SleeveTarget {
-        asset_id: Symbol::new(&ctx.env, "BENJI"),
-        target_weight_bps: 8000,
-        min_band_bps: 7000,
-        max_band_bps: 9000,
-        sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund"),
-    });
-    ctx.policy_client.register_policy(
-        &ctx.vault_id,
-        &ctx.policy_owner,
-        &dummy_hash,
-        &ctx.registry_client.address,
-        &1000, // 10% min liquidity sleeve floor
-        &8000,
-        &8000,
-        &50,
-        &200,
-        &policy_targets,
-    );
-
-    // Initial setup: Admin deposits $100,000 to seed the vault
-    ctx.numeraire_admin.mint(&ctx.admin, &100_000_0000000);
-    ctx.vault_client.deposit(&100_000_0000000, &ctx.admin);
-    assert_eq!(ctx.vault_client.total_supply(), 100_000_0000000);
-
-    // Set multi-sleeve configuration on vault:
-    // CASH_STABLE: 20% target, $20,000 balance
-    // USD_GOV_FUNDS: 80% target, $80,000 balance
-    let mut sleeves = SdkVec::new(&ctx.env);
-    sleeves.push_back(SleeveState {
-        asset_id: String::from_str(&ctx.env, "USDC"),
-        contract_address: ctx.numeraire_address.clone(),
-        target_weight_bps: 2000,
-        band_bps: 200,
-        current_balance: 20_000_0000000,
-        sleeve_type: SleeveType::CashStable,
-        liquidity_tier: 0,
-    });
-    sleeves.push_back(SleeveState {
-        asset_id: String::from_str(&ctx.env, "BENJI"),
-        contract_address: benji_address,
-        target_weight_bps: 8000,
-        band_bps: 200,
-        current_balance: 80_000_0000000,
-        sleeve_type: SleeveType::UsdGovFunds,
-        liquidity_tier: 1,
-    });
-    ctx.vault_client.set_sleeves(&sleeves);
-
-    // Total assets = 20,000 cash + 80,000 * 0.99 conservative = 99,200 USDC
-    let total_a = ctx.vault_client.total_assets();
-    assert_eq!(total_a, 99_200_0000000);
-
-    // Check Redemption Capacity:
-    // Cash = 20,000. Floor = 10%.
-    // max_instant = (20,000 * 10000 - 99,200 * 1000) / 9000
-    // = (200,000,000 - 99,200,000) / 9000 = 100,800,000 / 9000 = 11,200 USDC
-    let cap = ctx.vault_client.get_redemption_capacity();
-    assert_eq!(cap.instant, 11_200_0000000);
-    assert_eq!(cap.in_24h, 79_200_0000000); // 80,000 * 0.99
-
-    // Deposit 1,000 USDC by Alice
-    ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
-
-    // Alice redeems within allowable instant capacity: 500 shares (~496 USDC < 11,200 USDC)
-    let alice_bal = ctx.vault_client.balance(&ctx.alice);
-    let shares_to_redeem = alice_bal / 2;
-    let redeemed = ctx.vault_client.redeem(&shares_to_redeem, &ctx.alice, &ctx.alice);
-    assert!(redeemed > 0);
-
-    // Attempt redemption that would breach the 10% liquidity floor:
-    // Admin has ~100,000 shares. Trying to redeem 15,000 shares (~14,880 USDC > 11,200 max instant capacity)
-    let res = ctx.vault_client.try_redeem(&15_000_0000000, &ctx.admin, &ctx.admin);
-    assert_eq!(res.unwrap_err().unwrap(), VaultError::LiquidityFloorBreached.into());
-
-    // Attempt redemption that exceeds total cash physical balance ($21,000 - $496 = $20,504):
-    // Trying to redeem 30,000 shares (~29,760 USDC > 20,504 cash)
-    let res_cap = ctx.vault_client.try_redeem(&30_000_0000000, &ctx.admin, &ctx.admin);
-    assert_eq!(res_cap.unwrap_err().unwrap(), VaultError::ExceedsRedemptionCapacity.into());
-
-    // Verify oracle status returns BENJI sources via registry lookup
-    let oracle_status = ctx.vault_client.get_oracle_status();
-    let mut found_benji = false;
-    for src in oracle_status.iter() {
-        if src.source_id == Symbol::new(&ctx.env, "BENJI_MEDIAN") {
-            found_benji = true;
-        }
-    }
-    assert!(found_benji);
-}
+// `test_t46_liquidity_sleeve_floor_protection` (ignored since audit V2: fabricated holdings) is rebuilt on real
+// Soroswap acquisitions as `w1b::the_liquidity_floor_limits_instant_redemptions_on_real_holdings` in tests/security_regressions.rs.
 
 // -------------------------------------------------------------------------
 // Edge Cases & Robustness
@@ -634,10 +486,10 @@ fn test_edge_cases_and_authorizations() {
     assert_eq!(weights_res.unwrap_err().unwrap(), VaultError::InvalidBps.into());
 
     // 4. Zero amount operations rejected
-    let zero_dep = ctx.vault_client.try_deposit(&0, &ctx.alice);
+    let zero_dep = ctx.vault_client.try_deposit(&0, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(zero_dep.unwrap_err().unwrap(), VaultError::ZeroAmount.into());
 
-    let zero_redeem = ctx.vault_client.try_redeem(&0, &ctx.alice, &ctx.alice);
+    let zero_redeem = ctx.vault_client.try_redeem(&0, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(zero_redeem.unwrap_err().unwrap(), VaultError::ZeroAmount.into());
 
     let zero_transfer = ctx.vault_client.try_transfer(&ctx.alice, &ctx.bob, &0);
@@ -647,243 +499,11 @@ fn test_edge_cases_and_authorizations() {
 // -------------------------------------------------------------------------
 // Boundary & Dual NAV Edge Cases
 // -------------------------------------------------------------------------
-#[test]
-#[ignore = "audit V2: fabricated sleeve holdings via set_sleeves; re-enable when W1 (policy-validated rebalance execution) can acquire real holdings"]
-fn test_exact_liquidity_floor_boundary() {
-    let ctx = setup_test_context();
+// `test_exact_liquidity_floor_boundary` (ignored since audit V2: fabricated holdings) is rebuilt on real
+// Soroswap acquisitions as `w1b::redeeming_exactly_to_the_floor_leaves_zero_capacity` in tests/security_regressions.rs.
 
-    let benji_admin = Address::generate(&ctx.env);
-    let benji_sac = ctx.env.register_stellar_asset_contract_v2(benji_admin);
-    let benji_address = benji_sac.address();
-
-    let mut benji_sources = SdkVec::new(&ctx.env);
-    benji_sources.push_back(Symbol::new(&ctx.env, "BENJI_MEDIAN"));
-    ctx.registry_client.add_asset(&AssetEntry {
-        contract_address: benji_address.clone(),
-        asset_id: Symbol::new(&ctx.env, "BENJI"),
-        issuer: Symbol::new(&ctx.env, "FRANKLIN_TEMPLETON"),
-        sleeve_type: RegSleeveType::UsdGovFund,
-        liquidity_tier: 1,
-        permissionless: true,
-        oracle_sources: benji_sources,
-        eligible_jurisdictions: SdkVec::new(&ctx.env),
-        blocked_jurisdictions: SdkVec::new(&ctx.env),
-        investor_classes_required: SdkVec::new(&ctx.env),
-        is_active: true,
-        added_at: 1_000_000,
-    });
-
-    let gov_sym = Symbol::new(&ctx.env, "USD_GOV_FUNDS");
-    ctx.oracle_client.configure_sleeve(&gov_sym, &300, &1);
-    ctx.oracle_client.register_source(&ExtOracleSource {
-        source_id: Symbol::new(&ctx.env, "BENJI_MEDIAN"),
-        asset: benji_address.clone(),
-        sleeve: gov_sym,
-        price: 10_000_000, // $1.00
-        timestamp: 1_000_000,
-        staleness_limit_seconds: 14400,
-        min_liquidity_depth_usd: 100_000,
-        current_liquidity_depth_usd: 200_000,
-        is_active: true,
-    });
-
-    // 10% liquidity floor (1000 bps)
-    let dummy_hash = soroban_sdk::BytesN::from_array(&ctx.env, &[7u8; 32]);
-    let mut policy_targets = SdkVec::new(&ctx.env);
-    policy_targets.push_back(SleeveTarget {
-        asset_id: Symbol::new(&ctx.env, "USDC"),
-        target_weight_bps: 1000,
-        min_band_bps: 500,
-        max_band_bps: 1500,
-        sleeve_type: Symbol::new(&ctx.env, "cash"),
-    });
-    policy_targets.push_back(SleeveTarget {
-        asset_id: Symbol::new(&ctx.env, "BENJI"),
-        target_weight_bps: 9000,
-        min_band_bps: 8500,
-        max_band_bps: 9500,
-        sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund"),
-    });
-    ctx.policy_client.register_policy(
-        &ctx.vault_id,
-        &ctx.policy_owner,
-        &dummy_hash,
-        &ctx.registry_client.address,
-        &1000, // 10% floor
-        &9000,
-        &9000,
-        &50,
-        &200,
-        &policy_targets,
-    );
-
-    // Seed vault with $10,000 cash and $90,000 BENJI = $100,000 total assets
-    // Cash is exactly 10,000 / 100,000 = 10.00%
-    ctx.numeraire_admin.mint(&ctx.admin, &100_000_0000000);
-    ctx.vault_client.deposit(&100_000_0000000, &ctx.admin);
-
-    let mut sleeves = SdkVec::new(&ctx.env);
-    sleeves.push_back(SleeveState {
-        asset_id: String::from_str(&ctx.env, "USDC"),
-        contract_address: ctx.numeraire_address.clone(),
-        target_weight_bps: 1000,
-        band_bps: 200,
-        current_balance: 10_000_0000000, // Exactly 10%
-        sleeve_type: SleeveType::CashStable,
-        liquidity_tier: 0,
-    });
-    sleeves.push_back(SleeveState {
-        asset_id: String::from_str(&ctx.env, "BENJI"),
-        contract_address: benji_address,
-        target_weight_bps: 9000,
-        band_bps: 200,
-        current_balance: 90_000_0000000, // 90%
-        sleeve_type: SleeveType::UsdGovFunds,
-        liquidity_tier: 1,
-    });
-    ctx.vault_client.set_sleeves(&sleeves);
-
-    // Exact boundary assertions:
-    let cap = ctx.vault_client.get_redemption_capacity();
-    assert_eq!(cap.instant, 0); // Zero instant capacity because floor is reached exactly!
-    assert_eq!(ctx.vault_client.max_withdraw(&ctx.admin), 0);
-    assert_eq!(ctx.vault_client.max_redeem(&ctx.admin), 0);
-
-    // Any withdraw or redeem attempt must be rejected with LiquidityFloorBreached
-    let res = ctx.vault_client.try_withdraw(&1_0000000, &ctx.admin, &ctx.admin);
-    assert_eq!(res.unwrap_err().unwrap(), VaultError::LiquidityFloorBreached.into());
-
-    let res_redeem = ctx.vault_client.try_redeem(&1_0000000, &ctx.admin, &ctx.admin);
-    assert_eq!(res_redeem.unwrap_err().unwrap(), VaultError::LiquidityFloorBreached.into());
-}
-
-#[test]
-#[ignore = "audit V2: fabricated sleeve holdings via set_sleeves; re-enable when W1 (policy-validated rebalance execution) can acquire real holdings"]
-fn test_dual_nav_asymmetric_max_redeem() {
-    let ctx = setup_test_context();
-
-    // Deploy an RWA token with 50% conservative haircut vs median
-    let benji_admin = Address::generate(&ctx.env);
-    let benji_sac = ctx.env.register_stellar_asset_contract_v2(benji_admin);
-    let benji_address = benji_sac.address();
-
-    let mut benji_sources = SdkVec::new(&ctx.env);
-    benji_sources.push_back(Symbol::new(&ctx.env, "BENJI_MED"));
-    ctx.registry_client.add_asset(&AssetEntry {
-        contract_address: benji_address.clone(),
-        asset_id: Symbol::new(&ctx.env, "BENJI"),
-        issuer: Symbol::new(&ctx.env, "FRANKLIN_TEMPLETON"),
-        sleeve_type: RegSleeveType::UsdGovFund,
-        liquidity_tier: 1,
-        permissionless: true,
-        oracle_sources: benji_sources,
-        eligible_jurisdictions: SdkVec::new(&ctx.env),
-        blocked_jurisdictions: SdkVec::new(&ctx.env),
-        investor_classes_required: SdkVec::new(&ctx.env),
-        is_active: true,
-        added_at: 1_000_000,
-    });
-
-    let gov_sym = Symbol::new(&ctx.env, "USD_GOV_FUNDS");
-    ctx.oracle_client.configure_sleeve(&gov_sym, &10000, &2);
-    // Median = $1.00 (10_000_000), Conservative = $0.50 (5_000_000)
-    ctx.oracle_client.register_source(&ExtOracleSource {
-        source_id: Symbol::new(&ctx.env, "BENJI_MED"),
-        asset: benji_address.clone(),
-        sleeve: gov_sym.clone(),
-        price: 10_000_000,
-        timestamp: 1_000_000,
-        staleness_limit_seconds: 14400,
-        min_liquidity_depth_usd: 100_000,
-        current_liquidity_depth_usd: 200_000,
-        is_active: true,
-    });
-    ctx.oracle_client.register_source(&ExtOracleSource {
-        source_id: Symbol::new(&ctx.env, "BENJI_LOW"),
-        asset: benji_address.clone(),
-        sleeve: gov_sym,
-        price: 5_000_000,
-        timestamp: 1_000_000,
-        staleness_limit_seconds: 14400,
-        min_liquidity_depth_usd: 100_000,
-        current_liquidity_depth_usd: 200_000,
-        is_active: true,
-    });
-
-    // Policy: 0% floor to isolate capacity check
-    let dummy_hash = soroban_sdk::BytesN::from_array(&ctx.env, &[7u8; 32]);
-    let mut policy_targets = SdkVec::new(&ctx.env);
-    policy_targets.push_back(SleeveTarget {
-        asset_id: Symbol::new(&ctx.env, "USDC"),
-        target_weight_bps: 5000,
-        min_band_bps: 0,
-        max_band_bps: 10000,
-        sleeve_type: Symbol::new(&ctx.env, "cash"),
-    });
-    policy_targets.push_back(SleeveTarget {
-        asset_id: Symbol::new(&ctx.env, "BENJI"),
-        target_weight_bps: 5000,
-        min_band_bps: 0,
-        max_band_bps: 10000,
-        sleeve_type: Symbol::new(&ctx.env, "usd_gov_fund"),
-    });
-    ctx.policy_client.register_policy(
-        &ctx.vault_id,
-        &ctx.policy_owner,
-        &dummy_hash,
-        &ctx.registry_client.address,
-        &0, // 0% floor
-        &10000,
-        &10000,
-        &50,
-        &200,
-        &policy_targets,
-    );
-
-    // Initial deposit: 1000 USDC -> 1000 shares
-    ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-    ctx.vault_client.deposit(&1000_0000000, &ctx.alice);
-
-    // Configure sleeves: 500 USDC cash, 500 BENJI
-    let mut sleeves = SdkVec::new(&ctx.env);
-    sleeves.push_back(SleeveState {
-        asset_id: String::from_str(&ctx.env, "USDC"),
-        contract_address: ctx.numeraire_address.clone(),
-        target_weight_bps: 5000,
-        band_bps: 200,
-        current_balance: 500_0000000,
-        sleeve_type: SleeveType::CashStable,
-        liquidity_tier: 0,
-    });
-    sleeves.push_back(SleeveState {
-        asset_id: String::from_str(&ctx.env, "BENJI"),
-        contract_address: benji_address,
-        target_weight_bps: 5000,
-        band_bps: 200,
-        current_balance: 500_0000000,
-        sleeve_type: SleeveType::UsdGovFunds,
-        liquidity_tier: 1,
-    });
-    ctx.vault_client.set_sleeves(&sleeves);
-
-    // Conservative NAV: (500 + 500 * 0.50) / 1000 = 0.750 ($0.75)
-    let cons_nav = ctx.vault_client.get_nav_conservative().unwrap();
-    assert_eq!(cons_nav.price, 7_500_000); // 0.75
-
-    // Cash = 500 USDC. Instant capacity = 500 USDC.
-    let cap = ctx.vault_client.get_redemption_capacity();
-    assert_eq!(cap.instant, 500_0000000);
-
-    // Shares needed to redeem 500 USDC at 0.75 conservative NAV:
-    // 500 / 0.75 = 666.6666666 shares
-    let max_red = ctx.vault_client.max_redeem(&ctx.alice);
-    assert_eq!(max_red, 666_6666666);
-
-    // Alice redeems exactly max_redeem shares
-    let assets_out = ctx.vault_client.redeem(&max_red, &ctx.alice, &ctx.alice);
-    assert!(assets_out <= cap.instant);
-    assert_eq!(assets_out, 499_9999999);
-}
+// `test_dual_nav_asymmetric_max_redeem` (ignored since audit V2: fabricated holdings) is rebuilt on real
+// Soroswap acquisitions as `w1b::redemptions_use_the_conservative_nav_after_a_real_purchase` in tests/security_regressions.rs.
 
 #[test]
 fn test_mint_ceiling_rounding() {
@@ -892,7 +512,7 @@ fn test_mint_ceiling_rounding() {
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
 
     // When NAV is $1.00 (10_000_000), minting 1 share requires (1 * 10_000_000 + 10_000_000 - 1) / 10_000_000 = 1 stroop of assets
-    let assets_paid = ctx.vault_client.mint(&1, &ctx.alice);
+    let assets_paid = ctx.vault_client.mint(&1, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(assets_paid, 1);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 1);
 }
@@ -902,7 +522,7 @@ fn test_storage_cleanup_zero_balance_and_allowance() {
     let ctx = setup_test_context();
 
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     assert_eq!(ctx.vault_client.balance(&ctx.alice), 100_0000000);
 
     // Transfer entire balance to Bob
@@ -967,7 +587,7 @@ fn test_self_transfer_does_not_mint_shares() {
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let before = ctx.vault_client.balance(&ctx.alice);
     let supply = ctx.vault_client.total_supply();
 
@@ -998,7 +618,7 @@ fn test_self_transfer_more_than_balance_rejected() {
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let bal = ctx.vault_client.balance(&ctx.alice);
     ctx.env.mock_auths(&[MockAuth {
         address: &ctx.alice,
@@ -1019,7 +639,7 @@ fn test_self_transfer_from_does_not_mint_shares() {
     use soroban_sdk::IntoVal;
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let bal = ctx.vault_client.balance(&ctx.alice);
     let supply = ctx.vault_client.total_supply();
     ctx.vault_client.approve(&ctx.alice, &ctx.bob, &bal, &1000);
@@ -1046,7 +666,7 @@ fn test_self_transfer_from_does_not_mint_shares() {
 fn test_transfer_conserves_total_supply() {
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let supply = ctx.vault_client.total_supply();
     ctx.vault_client.transfer(&ctx.alice, &ctx.bob, &40_0000000);
     ctx.vault_client.transfer(&ctx.bob, &ctx.alice, &15_0000000);
@@ -1093,6 +713,7 @@ fn register_gov_fund(ctx: &TestContext) -> Address {
             min_liquidity_depth_usd: 100_000,
             current_liquidity_depth_usd: 200_000,
             is_active: true,
+            feeder: Address::generate(&ctx.env),
         });
     }
     gov
@@ -1114,7 +735,7 @@ fn sleeve(ctx: &TestContext, id: &str, addr: &Address, st: SleeveType, bps: u32,
 fn test_v2_set_sleeves_rejects_balance_injection() {
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let gov = register_gov_fund(&ctx);
 
     let mut sleeves = SdkVec::new(&ctx.env);
@@ -1136,7 +757,7 @@ fn test_v2_set_sleeves_rejects_balance_injection() {
 fn test_v2_set_sleeves_preserves_recorded_balances() {
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let gov = register_gov_fund(&ctx);
 
     let mut sleeves = SdkVec::new(&ctx.env);
@@ -1195,7 +816,7 @@ fn test_v2_cannot_remove_sleeve_that_holds_tokens() {
 fn test_v2_unsolicited_transfers_do_not_move_nav() {
     let ctx = setup_test_context();
     ctx.numeraire_admin.mint(&ctx.alice, &100_0000000);
-    ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+    ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
     let gov = register_gov_fund(&ctx);
     let mut sleeves = SdkVec::new(&ctx.env);
     sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 100_0000000));
@@ -1287,7 +908,7 @@ mod v3 {
     fn vault_with_empty_gov_sleeve(ctx: &TestContext) -> Address {
         let gov = register_gov_fund(ctx);
         ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-        ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+        ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         let mut sleeves = SdkVec::new(&ctx.env);
         sleeves.push_back(sleeve(ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, 500_0000000));
         sleeves.push_back(sleeve(ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
@@ -1301,17 +922,21 @@ mod v3 {
     fn assert_vault_operates(ctx: &TestContext) {
         let dep_nav = ctx.vault_client.get_nav_deposit().expect("deposit NAV").price;
         let cons_nav = ctx.vault_client.get_nav_conservative().expect("conservative NAV").price;
-        // Only cash is held, so both NAVs equal total_assets / total_supply.
+        // Only cash is held, so both NAVs agree.
         assert_eq!(dep_nav, cons_nav);
+        // Views price pending management fees (W4.2b), so minting them must not
+        // move the NAV; afterwards NAV = total_assets / total_supply.
+        ctx.vault_client.accrue_fees();
+        assert_eq!(ctx.vault_client.get_nav_deposit().unwrap().price, dep_nav, "view NAV must include pending fees");
         let expected = ctx.vault_client.total_assets() * 10_000_000 / ctx.vault_client.total_supply();
         assert!((dep_nav - expected).abs() <= 1, "nav {dep_nav} vs assets/supply {expected}");
 
         let usdc_before = ctx.numeraire_client.balance(&ctx.alice);
-        let minted = ctx.vault_client.deposit(&100_0000000, &ctx.alice);
+        let minted = ctx.vault_client.deposit(&100_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         assert!(minted > 0);
-        let paid = ctx.vault_client.redeem(&50_0000000, &ctx.alice, &ctx.alice);
+        let paid = ctx.vault_client.redeem(&50_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         assert!(paid > 0);
-        let burned = ctx.vault_client.withdraw(&10_0000000, &ctx.alice, &ctx.alice);
+        let burned = ctx.vault_client.withdraw(&10_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         assert!(burned > 0);
         assert_eq!(
             ctx.numeraire_client.balance(&ctx.alice),
@@ -1359,7 +984,7 @@ mod v3 {
             added_at: 1_000_000,
         });
         ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-        ctx.vault_client.deposit(&500_0000000, &ctx.alice);
+        ctx.vault_client.deposit(&500_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         let mut sleeves = SdkVec::new(&ctx.env);
         sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 8000, 500_0000000));
         sleeves.push_back(sleeve(&ctx, "SPIKO_EUR", &eur, SleeveType::EurSovereign, 2000, 0));
@@ -1381,7 +1006,7 @@ mod v4 {
     fn vault_with_empty_gov(ctx: &TestContext) {
         let gov = register_gov_fund(ctx);
         ctx.numeraire_admin.mint(&ctx.alice, &1000_0000000);
-        ctx.vault_client.deposit(&600_0000000, &ctx.alice);
+        ctx.vault_client.deposit(&600_0000000, &ctx.alice, &ctx.alice, &ctx.alice);
         let mut sleeves = SdkVec::new(&ctx.env);
         sleeves.push_back(sleeve(ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 4000, 600_0000000));
         sleeves.push_back(sleeve(ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 6000, 0));
@@ -1475,11 +1100,11 @@ mod w3 {
         ctx.numeraire_admin.mint(&ctx.bob, &(10 * ONE));
         // Feeds price the vault at $1.00 deposit NAV: 100k USDC = the cap.
         assert_eq!(ctx.vault_client.max_deposit(&ctx.alice), 100_000 * ONE);
-        ctx.vault_client.deposit(&(100_000 * ONE), &ctx.alice);
+        ctx.vault_client.deposit(&(100_000 * ONE), &ctx.alice, &ctx.alice, &ctx.alice);
         assert_eq!(ctx.vault_client.max_deposit(&ctx.alice), 0);
-        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
-        assert_eq!(ctx.vault_client.try_mint(&ONE, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
-        assert_eq!(ctx.vault_client.deposit(&(10 * ONE), &ctx.bob), 10 * ONE, "other users unaffected");
+        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.alice, &ctx.alice, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
+        assert_eq!(ctx.vault_client.try_mint(&ONE, &ctx.alice, &ctx.alice, &ctx.alice).err().unwrap().unwrap(), err(VaultError::UserCapExceeded));
+        assert_eq!(ctx.vault_client.deposit(&(10 * ONE), &ctx.bob, &ctx.bob, &ctx.bob), 10 * ONE, "other users unaffected");
     }
 
     #[test]
@@ -1488,14 +1113,14 @@ mod w3 {
         ctx.vault_client.lower_caps(&(150 * ONE), &(100 * ONE));
         ctx.numeraire_admin.mint(&ctx.alice, &(1000 * ONE));
         ctx.numeraire_admin.mint(&ctx.bob, &(1000 * ONE));
-        ctx.vault_client.deposit(&(100 * ONE), &ctx.alice);
+        ctx.vault_client.deposit(&(100 * ONE), &ctx.alice, &ctx.alice, &ctx.alice);
         assert_eq!(ctx.vault_client.max_deposit(&ctx.bob), 50 * ONE, "TVL room binds before bob's user room");
         let m = ctx.vault_client.max_mint(&ctx.bob);
-        ctx.vault_client.mint(&m, &ctx.bob);
+        ctx.vault_client.mint(&m, &ctx.bob, &ctx.bob, &ctx.bob);
         assert_eq!(ctx.vault_client.max_deposit(&ctx.bob), 0);
-        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.bob).err().unwrap().unwrap(), err(VaultError::TvlCapExceeded));
+        assert_eq!(ctx.vault_client.try_deposit(&ONE, &ctx.bob, &ctx.bob, &ctx.bob).err().unwrap().unwrap(), err(VaultError::TvlCapExceeded));
         // Withdrawals reopen room.
-        ctx.vault_client.redeem(&(10 * ONE), &ctx.alice, &ctx.alice);
+        ctx.vault_client.redeem(&(10 * ONE), &ctx.alice, &ctx.alice, &ctx.alice);
         assert!(ctx.vault_client.max_deposit(&ctx.bob) > 0);
     }
 
@@ -1662,7 +1287,7 @@ mod w7 {
         targets(&ctx, 1000, &gov, "SPIKO_USD", SleeveType::UsdGovFunds);
         assert_eq!(haircut(&ctx), 1450); // target-weighted while empty
         ctx.numeraire_admin.mint(&ctx.alice, &(100 * 10_000_000));
-        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice);
+        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice, &ctx.alice, &ctx.alice);
         assert_eq!(haircut(&ctx), 1000, "the vault actually holds only cash");
         assert_eq!(ctx.vault_client.get_listing_kit().liquidation_threshold_bps, 9000);
     }
@@ -1729,7 +1354,6 @@ mod m4 {
 // -------------------------------------------------------------------------
 mod m2 {
     use super::*;
-    use soroban_sdk::testutils::Events;
     use soroban_sdk::{FromVal, SymbolStr, TryFromVal, Val};
 
     const STANDARD: [&str; 6] = ["transfer", "approve", "mint", "burn", "deposit", "withdraw"];
@@ -1744,7 +1368,7 @@ mod m2 {
     /// Every event the vault emitted in the last call follows Rule 8.
     fn check_names(ctx: &TestContext) -> usize {
         let mut seen = 0;
-        for (contract, topics, _) in ctx.env.events().all().iter() {
+        for (contract, topics, _) in all_events(&ctx.env).iter() {
             if contract != ctx.vault_id {
                 continue;
             }
@@ -1762,13 +1386,13 @@ mod m2 {
         let ctx = setup_test_context();
         ctx.numeraire_admin.mint(&ctx.alice, &(1000 * 10_000_000));
         let mut total = 0;
-        ctx.vault_client.deposit(&(500 * 10_000_000), &ctx.alice);
+        ctx.vault_client.deposit(&(500 * 10_000_000), &ctx.alice, &ctx.alice, &ctx.alice);
         total += check_names(&ctx);
         ctx.vault_client.transfer(&ctx.alice, &ctx.bob, &(10 * 10_000_000));
         total += check_names(&ctx);
         ctx.vault_client.approve(&ctx.alice, &ctx.bob, &(10 * 10_000_000), &500);
         total += check_names(&ctx);
-        ctx.vault_client.redeem(&(10 * 10_000_000), &ctx.alice, &ctx.alice);
+        ctx.vault_client.redeem(&(10 * 10_000_000), &ctx.alice, &ctx.alice, &ctx.alice);
         total += check_names(&ctx);
         ctx.env.ledger().set_timestamp(1_000_000 + 30 * 86_400);
         ctx.vault_client.accrue_fees();
@@ -1791,24 +1415,134 @@ mod m2 {
     fn deposit_and_withdraw_events_follow_sep56_layout() {
         let ctx = setup_test_context();
         ctx.numeraire_admin.mint(&ctx.alice, &(100 * 10_000_000));
-        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice);
-        let dep = ctx.env.events().all().iter()
+        ctx.vault_client.deposit(&(100 * 10_000_000), &ctx.alice, &ctx.alice, &ctx.alice);
+        let dep = all_events(&ctx.env).iter()
             .find(|(c, t, _)| *c == ctx.vault_id && name_of(&ctx.env, &t.get(0).unwrap()) == "deposit")
             .expect("deposit event");
         assert_eq!(dep.1.len(), 4, "deposit topics: [deposit, operator, from, receiver]");
         for i in 1..4 {
             assert_eq!(Address::try_from_val(&ctx.env, &dep.1.get(i).unwrap()).unwrap(), ctx.alice);
         }
-        let (assets, shares): (i128, i128) = <(i128, i128)>::try_from_val(&ctx.env, &dep.2).unwrap();
-        assert_eq!((assets, shares), (100 * 10_000_000, 100 * 10_000_000));
+        // SEP-56 v0.1.2 defines Deposit/Withdraw as #[contractevent] structs:
+        // data is the default map encoding {assets, shares} (W4.2b).
+        let data = soroban_sdk::Map::<Symbol, i128>::try_from_val(&ctx.env, &dep.2).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data.get(Symbol::new(&ctx.env, "assets")), Some(100 * 10_000_000));
+        assert_eq!(data.get(Symbol::new(&ctx.env, "shares")), Some(100 * 10_000_000));
 
-        ctx.vault_client.redeem(&(40 * 10_000_000), &ctx.bob, &ctx.alice);
-        let wd = ctx.env.events().all().iter()
+        ctx.vault_client.redeem(&(40 * 10_000_000), &ctx.bob, &ctx.alice, &ctx.alice);
+        let wd = all_events(&ctx.env).iter()
             .find(|(c, t, _)| *c == ctx.vault_id && name_of(&ctx.env, &t.get(0).unwrap()) == "withdraw")
             .expect("withdraw event");
         assert_eq!(wd.1.len(), 4, "withdraw topics: [withdraw, operator, receiver, owner]");
         assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(1).unwrap()).unwrap(), ctx.alice, "operator");
         assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(2).unwrap()).unwrap(), ctx.bob, "receiver");
         assert_eq!(Address::try_from_val(&ctx.env, &wd.1.get(3).unwrap()).unwrap(), ctx.alice, "owner");
+        let data = soroban_sdk::Map::<Symbol, i128>::try_from_val(&ctx.env, &wd.2).unwrap();
+        assert_eq!(data.len(), 2);
+        assert_eq!(data.get(Symbol::new(&ctx.env, "shares")), Some(40 * 10_000_000));
+        assert!(data.get(Symbol::new(&ctx.env, "assets")).unwrap() > 0);
     }
+}
+
+// -------------------------------------------------------------------------
+// Audit W4.1b (2026-11-15): golden event encodings.
+// -------------------------------------------------------------------------
+/// Golden event recorder (audit W4.1b). Captures the exact XDR of every event
+/// the contract under test emits during a scenario and compares it with the
+/// committed `golden/events.txt`, so the `Events::publish` -> `#[contractevent]`
+/// migration is proven byte-for-byte. Regenerate ONLY deliberately with
+/// `UPDATE_GOLDEN=1 cargo test golden_events`.
+struct GoldenEvents {
+    contract: soroban_sdk::Address,
+    lines: std::vec::Vec<std::string::String>,
+    names: std::collections::BTreeSet<std::string::String>,
+}
+
+impl GoldenEvents {
+    fn new(contract: &soroban_sdk::Address) -> Self {
+        Self { contract: contract.clone(), lines: std::vec::Vec::new(), names: Default::default() }
+    }
+
+    fn capture(&mut self, env: &soroban_sdk::Env, step: &str) {
+        use soroban_sdk::testutils::Events as _;
+        use soroban_sdk::xdr::{ContractEventBody, Limits, ScVal, WriteXdr};
+        for e in env.events().all().filter_by_contract(&self.contract).events() {
+            let ContractEventBody::V0(body) = &e.body;
+            let name = match body.topics.first() {
+                Some(ScVal::Symbol(s)) => std::string::String::from_utf8_lossy(s.0.as_slice()).into_owned(),
+                _ => std::string::String::from("?"),
+            };
+            let b64 = e.body.to_xdr_base64(Limits::none()).unwrap();
+            self.lines.push(std::format!("{step} | {name} | {b64}"));
+            self.names.insert(name);
+        }
+    }
+
+    fn finish(self, expected_names: &[&str]) {
+        for n in expected_names {
+            assert!(self.names.contains(*n), "scenario never emitted `{n}`; coverage incomplete");
+        }
+        let dir = std::format!("{}/golden", env!("CARGO_MANIFEST_DIR"));
+        let path = std::format!("{dir}/events.txt");
+        let text = self.lines.join("\n") + "\n";
+        if std::env::var("UPDATE_GOLDEN").as_deref() == Ok("1") {
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &text).unwrap();
+        } else {
+            let expected = std::fs::read_to_string(&path)
+                .unwrap_or_else(|_| panic!("missing golden file {path}"));
+            assert_eq!(expected.replace("\r\n", "\n"), text, "event encoding changed vs {path}");
+        }
+    }
+}
+
+#[test]
+fn golden_events_vault() {
+    let ctx = setup_test_context();
+    let env = &ctx.env;
+    // Fresh vault so the constructor event is captured too.
+    let cfg = ctx.vault_client.get_config();
+    let id = env.register(StrategyVault, (cfg, String::from_str(env, "Golden"), String::from_str(env, "GLD"), 7u32));
+    let v = StrategyVaultClient::new(env, &id);
+    let mut g = GoldenEvents::new(&id);
+    g.capture(env, "constructor");
+    let one = 10_000_000i128;
+    ctx.numeraire_admin.mint(&ctx.alice, &(1000 * one));
+    v.deposit(&(300 * one), &ctx.alice, &ctx.alice, &ctx.alice); g.capture(env, "deposit");
+    v.mint(&(100 * one), &ctx.alice, &ctx.alice, &ctx.alice); g.capture(env, "mint");
+    v.transfer(&ctx.alice, &ctx.bob, &(10 * one)); g.capture(env, "transfer");
+    v.approve(&ctx.alice, &ctx.bob, &(20 * one), &1000); g.capture(env, "approve");
+    v.transfer_from(&ctx.bob, &ctx.alice, &ctx.bob, &(5 * one)); g.capture(env, "transfer_from");
+    v.redeem(&(10 * one), &ctx.bob, &ctx.alice, &ctx.alice); g.capture(env, "redeem");
+    v.withdraw(&(10 * one), &ctx.alice, &ctx.alice, &ctx.alice); g.capture(env, "withdraw");
+    env.ledger().set_timestamp(1_000_000 + 30 * 86_400);
+    v.accrue_fees(); g.capture(env, "accrue_fees");
+    v.lower_caps(&(500_000 * one), &(50_000 * one)); g.capture(env, "lower_caps");
+    let gov = register_gov_fund(&ctx);
+    let cash = v.get_sleeves().get(0).unwrap().current_balance;
+    let mut sleeves = SdkVec::new(env);
+    sleeves.push_back(sleeve(&ctx, "USDC", &ctx.numeraire_address, SleeveType::CashStable, 5000, cash));
+    sleeves.push_back(sleeve(&ctx, "SPIKO_USD", &gov, SleeveType::UsdGovFunds, 5000, 0));
+    v.set_sleeves(&sleeves); g.capture(env, "set_sleeves");
+    v.pause(); g.capture(env, "pause");
+    v.unpause(); g.capture(env, "unpause");
+    v.admin_pause(); g.capture(env, "admin_pause");
+    v.unpause();
+    v.propose_upgrade(&soroban_sdk::BytesN::from_array(env, &[0xAB; 32])); g.capture(env, "propose_upgrade");
+    v.cancel_upgrade(); g.capture(env, "cancel_upgrade");
+    let targets = SdkVec::from_array(env, [PolicySleeveTargetRef {
+        asset_id: Symbol::new(env, "USDC"), target_weight_bps: 10000, min_band_bps: 9000, max_band_bps: 10000,
+        sleeve_type: Symbol::new(env, "cash") }]);
+    // The owner signs register_policy inside the vault's call (a non-root auth).
+    env.mock_all_auths_allowing_non_root_auth();
+    v.bind_policy(&ctx.policy_owner, &soroban_sdk::BytesN::from_array(env, &[0x5A; 32]), &1000, &10000, &10000, &50, &500, &targets);
+    g.capture(env, "bind_policy");
+    // `UPGRADE` is emitted only by a successful execute_upgrade, which needs a
+    // real uploaded WASM; it is verified in the local-network e2e suite.
+    // FEE_ACCRUAL needs real profit (D-D); its encoding is asserted in
+    // security_regressions `w6_fee_shares_are_announced_with_a_mint_event`.
+    g.finish(&["VAULT_INITIALIZED", "deposit", "mint", "transfer", "approve", "burn", "withdraw",
+        "CAPS_LOWERED", "SLEEVES_UPDATED", "VAULT_PAUSED", "VAULT_UNPAUSED", "UPGRADE_PROPOSED", "UPGRADE_CANCELLED",
+        "POLICY_BOUND"]);
 }

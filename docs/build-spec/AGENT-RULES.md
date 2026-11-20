@@ -101,7 +101,7 @@ Once a user signs a policy hash, the policy contract enforces it. **No model, ke
 | Policy keys | Descriptive, underscore-separated |
 | Registry IDs | `ISSUER_TICKER` format (e.g. `FRANKLIN_BENJI`) |
 | Sleeve names | Semantic: `USD_GOV_FUNDS`, `EUR_SOVEREIGN`, `CASH_STABLE`, `YIELD_DOLLAR`, `LENDING`, `EQUITY`, `XLM` |
-| Token events | SEP-41 (`transfer`, `approve`, `mint`, `burn`) and SEP-56 (`deposit`, `withdraw`, with the SEP-56 topic layout) event names are defined by the standards and take precedence over `SCREAMING_SNAKE_CASE`; every other event is `SCREAMING_SNAKE_CASE` |
+| Token events | SEP-41 (`transfer`, `approve`, `mint`, `burn`) and SEP-56 (`deposit`, `withdraw`, with the SEP-56 topic layout) event names are defined by the standards and take precedence over `SCREAMING_SNAKE_CASE`. Events emitted **inside audited OpenZeppelin library code** keep the library's names (e.g. smart-account `context_rule_added`, `signer_registered`); forking audited code to rename events is not allowed. Every event Constella code emits itself is `SCREAMING_SNAKE_CASE` |
 
 ---
 
@@ -162,5 +162,8 @@ The 15 Nov 2026 audit (`docs/audit/AUDIT-2026-11-15.md`) found bugs that a green
 - **Security-relevant tests must not use `mock_all_auths()`.** Use `mock_auths` with an explicit expected authorization tree, or real signatures, and assert *who* authorized (`env.auths()`).
 - **Every fix ships with:** (1) an isolated unit test, (2) a regression test that fails on the pre-fix code, (3) the full workspace suite green.
 - **Write adversarial cases**: self-transfers, zero/max amounts, future timestamps, unauthorized callers, reverts mid-call.
+- **Cross-contract mirror structs** (e.g. the vault's `PolicyConfigRef`, `RegistryAssetEntryRef`) must change in lockstep with the source struct. Since soroban-sdk 28, decoding a `contracttype` silently ignores unknown fields and only errors on a missing non-`Option` field, so a stale mirror can drop data instead of failing. Every mirror must be exercised by a cross-contract test.
+- **Events are typed `#[contractevent]` structs** (never `Events::publish`, deprecated since soroban-sdk 23). Each crate has a `golden_events_*` test pinning the exact XDR of every event type it emits in `golden/events.txt`; an encoding change must be deliberate, reviewed, and regenerated with `UPDATE_GOLDEN=1`.
+- **Release builds use `stellar contract build`** (stellar-cli v25.2.0+), required by soroban-sdk 28 spec shaking; plain `cargo build --target wasm32v1-none` is refused by the SDK.
 
 

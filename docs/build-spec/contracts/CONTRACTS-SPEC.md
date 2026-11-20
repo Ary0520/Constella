@@ -13,10 +13,14 @@ constella-contracts/
 ├── registry/           # Asset registry — the closed universe
 ├── policy/             # Policy storage and validation
 ├── vault-strategy/     # Shared strategy vault (SEP-56)
-├── vault-factory/      # Deploys private vault instances [Q1 2027]
-├── vault-private/      # Per-institution vault (same WASM as strategy) [Q1 2027]
+├── vault-factory/      # Deploys private vault instances ✅ built (D-C, `ac597cd`)
+├── vault-private/      # Per-institution vault = vault-strategy WASM deployed by the factory (no separate crate)
 ├── nav-oracle/         # NAV computation and circuit breakers
 ├── keeper/             # Rebalance proposer and TTL extender
+├── smart-account/      # Passkey smart account (OZ context rules)
+├── webauthn-verifier/  # Shared passkey verifier (OZ Verifier)
+├── threshold-policy/   # Shared M-of-N policy (OZ Policy)
+├── fee-sponsor/        # Fee sponsorship quotas
 ├── adapters/
 │   ├── blend/          # Blend supply position adapter [Phase 2]
 │   ├── defindex/       # DeFindex yield aggregator adapter [Phase 2]
@@ -85,6 +89,18 @@ fn update_policy(env: Env, vault: Address, new_hash: BytesN<32>, min_liquidity_s
                  max_single_asset_bps: u32, max_issuer_bps: u32, max_slippage_bps: u32,
                  rebalance_band_bps: u32, new_sleeves: Vec<SleeveTarget>)
 fn validate_rebalance(env: Env, vault: Address, proposal: RebalanceProposal) -> ValidationResult
+// Audit W1b: checks ACTUAL holdings, (registry asset_id, value in numéraire) per sleeve, against
+// every band, the single-asset and issuer caps and the cash floor. Exact (no rounding), read-only.
+fn validate_holdings(env: Env, vault: Address, holdings: Vec<(Symbol, i128)>) -> ValidationResult
+// Decision D-L (resolves P5): update_policy APPLIES AT ONCE (and cancels any pending amendment) only if
+// the amendment strictly reduces risk: floor >=, single/issuer caps <=, slippage <=, band unchanged, no new
+// or retyped asset, risk sleeves only lower target/bands, the numeraire sleeve only raises them, and
+// something changes. Everything else is scheduled for the full notice (>= 48 h). No short-notice mode.
+// Decision D-A / A1b: the signed sleeve with sleeve_type "numeraire" (exact spelling; at most one;
+// an active registry cash asset; fixed at binding, cannot change by amendment) is the vault currency:
+// counted as cash for the floor, EXEMPT from max_single_asset_bps and max_issuer_bps in both checks.
+// vault.bind_policy refuses a "numeraire" sleeve that is not the vault's own numéraire.
+fn get_sleeve_targets(env: Env, vault: Address) -> Vec<SleeveTarget>
 fn get_policy_hash(env: Env, vault: Address) -> BytesN<32>
 fn get_policy_config(env: Env, vault: Address) -> Option<PolicyConfig> // includes owner + terms_hash
 ```
@@ -133,18 +149,43 @@ pub struct TradeOperation {
 
 **Purpose:** Shared vault for multiple holders. Core of Constella for most users.
 
-**Base:** OpenZeppelin stellar-contracts v0.8.0 SEP-56 vault module.
+**Base:** OpenZeppelin stellar-contracts v0.8.0. The share ledger (balances, allowances, total supply) uses `stellar-tokens` fungible storage (audit W4.2a): one **persistent** entry per holder and a persistent total supply, TTL extended on access; allowances are **temporary** entries whose `live_until_ledger` is validated; the instance entry's TTL is extended on use, and per-holder state never lives in instance storage. Routing the SEP-56 entry points through the OZ vault module is W4.2b. Events are the vault's own golden-pinned shapes. SEP-41 v0.5+ allows a single-value/vec **or** a map data format; the vault uses single-value/vec, the same as the Stellar Asset Contract (OZ 0.8.0 uses maps — also conformant).
 
 **Key functions:**
 ```rust
-// SEP-56 required
-fn deposit(env: Env, assets: i128, receiver: Address) -> i128   // returns shares
-fn redeem(env: Env, shares: i128, receiver: Address, owner: Address) -> i128  // returns assets
+// SEP-56 v0.1.2 (operator authorizes; see SEPS.md for allowance rules)
+fn deposit(env: Env, assets: i128, receiver: Address, from: Address, operator: Address) -> i128  // shares, median NAV
+fn mint(env: Env, shares: i128, receiver: Address, from: Address, operator: Address) -> i128     // assets paid
+fn withdraw(env: Env, assets: i128, receiver: Address, owner: Address, operator: Address) -> i128 // shares burned
+fn redeem(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> i128   // assets, conservative NAV
+// Audit V6: while a funded sleeve has no valid price (redeem halts):
+fn redeem_frozen(env: Env, shares: i128, receiver: Address, owner: Address, operator: Address) -> FrozenRedemption // {cash, claims: Vec<(asset, units)>}
+fn preview_redeem_frozen(env: Env, shares: i128) -> FrozenRedemption
+fn settle_claim(env: Env, holder: Address, asset: Address) -> i128  // anyone; pays holder units x conservative price
+fn get_claim(env: Env, holder: Address, asset: Address) -> i128
+fn get_claim_total(env: Env, asset: Address) -> i128
+fn preview_deposit(env: Env, assets: i128) -> i128   // == deposit result, pending fees included
+fn preview_mint(env: Env, shares: i128) -> i128
+fn preview_withdraw(env: Env, assets: i128) -> i128
+fn preview_redeem(env: Env, shares: i128) -> i128
 fn total_assets(env: Env) -> i128
 fn total_supply(env: Env) -> i128
 fn convert_to_shares(env: Env, assets: i128) -> i128
 fn convert_to_assets(env: Env, shares: i128) -> i128
-fn asset(env: Env) -> Address   // the numéraire
+fn query_asset(env: Env) -> Address   // the numéraire
+
+// SEP-41 share token
+fn balance(env: Env, id: Address) -> i128
+fn transfer(env: Env, from: Address, to: MuxedAddress, amount: i128)   // credits the underlying account
+fn transfer_from(env: Env, spender: Address, from: Address, to: Address, amount: i128)
+fn approve(env: Env, from: Address, spender: Address, amount: i128, expiration_ledger: u32)
+    // expired (amount > 0) or beyond the network max TTL -> error #102 InvalidLiveUntilLedger
+fn allowance(env: Env, from: Address, spender: Address) -> i128      // 0 once expired
+fn burn(env: Env, from: Address, amount: i128)                       // no assets leave; NAV/share rises
+fn burn_from(env: Env, spender: Address, from: Address, amount: i128)
+fn decimals(env: Env) -> u32
+fn name(env: Env) -> String
+fn symbol(env: Env) -> String
 
 // Collateral Passport (view-only)
 fn get_nav_conservative(env: Env) -> Option<PriceData>
@@ -164,6 +205,16 @@ fn cancel_upgrade(env: Env)                          // admin
 fn get_pending_upgrade(env: Env) -> Option<PendingUpgrade>
 fn lower_caps(env: Env, tvl_cap: i128, per_user_cap: i128)  // admin; decrease only
 fn max_deposit(env: Env, receiver: Address) -> i128  // real remaining room under both caps
+// Rebalancing (audit W1a, W1b)
+fn set_keeper(env: Env, keeper: Address)                        // admin
+fn rebalance(env: Env, proposal: RebalanceProposal)              // keeper; policy-validated; measured swaps;
+                                                                 // actual holdings re-checked (AllocationOutOfPolicy)
+// TradeRoute::Blend (D-H): supply underlying -> Blend position, or withdraw; measured deltas.
+// set_sleeves: once a policy is bound, each sleeve must be declared in it with the signed
+// target weight (SleeveTargetMismatch); band enforcement always uses the policy's bands.
+fn propose_router(env: Env, route: TradeRoute, router: Address)  // admin; active after 48h
+fn activate_router(env: Env, route: TradeRoute)                  // anyone, after the delay
+fn get_router(env: Env, route: TradeRoute) -> Option<Address>
 ```
 
 **VaultState struct:**
@@ -178,7 +229,7 @@ pub struct VaultState {
     pause_authority: Address,
     is_paused: bool,
     last_fee_accrual: u64,
-    management_fee_bps: u32,
+    performance_fee_bps: u32, // D-D: <= 1000 (10% of profit); cap 0.20%/yr of assets; daily crystallization
     tvl_cap: i128,        // required, > 0; total vault value cap (Rule 6; $1M in beta)
     per_user_cap: i128,   // required, > 0, <= tvl_cap; per-receiver cap on deposit/mint
 }
@@ -219,6 +270,51 @@ pub struct RiskSheet {
 
 ---
 
+## Smart Account, WebAuthn Verifier and Threshold Policy (W4.3b, `4b421cc`)
+
+**Base:** OpenZeppelin `stellar-accounts` 0.8.0 (context-rule smart account).
+
+```rust
+// smart-account
+fn __constructor(env: Env, verifier: Address, owner_key: Bytes, name: String) // installs the owner rule
+fn __check_auth(env, payload: Hash<32>, sig: AuthPayload, contexts: Vec<Context>) // OZ do_check_auth
+fn get_owner_rule(env: Env) -> u32
+fn propose_recovery(env: Env, new_owner: Signer)   // guardians (recovery rule); executable after 48h
+fn cancel_recovery(env: Env)                       // owner rule only
+fn execute_recovery(env: Env)                      // anyone, once 48h have passed
+fn get_pending_recovery(env: Env) -> Option<PendingRecovery>
+// OZ SmartAccount: add_context_rule, get_context_rule(s_count), add/remove_signer,
+// add/remove_policy, update_context_rule_name / _valid_until, remove_context_rule,
+// get_signer_id, get_policy_id, auth_digest. No `execute`, no `initialize`.
+
+// webauthn-verifier (stateless, one deployment for all accounts)
+fn verify(env, hash: Bytes, key_data: Bytes /* 65-byte P-256 key [+ credential id] */,
+          sig_data: Bytes /* XDR WebAuthnSigData */) -> bool
+
+// threshold-policy (one deployment, state per (account, rule))
+fn enforce / install / uninstall      // OZ Policy, simple_threshold
+fn get_threshold(env, context_rule_id: u32, smart_account: Address) -> u32
+fn set_threshold(env, threshold: u32, context_rule: ContextRule, smart_account: Address)
+```
+
+**Rules:**
+- **Owner rule:** installed by the constructor. `Default` scope (any operation), owner passkey, no policies.
+- **Recovery rule:** added by the owner. `CallContract(self)` scope, with guardian passkeys under an M-of-N threshold policy. Guardians may only call `propose_recovery`; `__check_auth` refuses any other self-call made under a non-owner rule (`ManagementRequiresOwner`). The new key replaces the owner's after a 48 h delay, which the owner can cancel (D-F).
+- **Signed rule choice:** each operation is matched to the rule the signer chose, and that choice is signed. A passkey signs a WebAuthn assertion over `SHA-256(XDR(account, signature_payload, context_rule_ids))`.
+
+**Anti-bricking (Constella overrides of OZ defaults):**
+- The owner rule cannot be removed, cannot be given an expiry, and must keep at least one signer.
+- No signer removal may leave a threshold-governed rule with fewer signers than its threshold.
+
+**Errors:** `AccError` 1 `InvalidPublicKey`, 2 `OwnerRuleProtected`, 3 `OwnerRuleNeedsSigner`, 4 `ThresholdUnreachable`, 5 `ManagementRequiresOwner`, 6 `NoPendingRecovery`, 7 `RecoveryNotReady`, 8 `AlreadyOwner`; OZ `SmartAccountError` 3000-3018, `WebAuthnError` 3110-3119, simple threshold 32xx.
+
+**Client requirements:**
+- Submit low-S P-256 signatures.
+- Encode `WebAuthnSigData` as XDR in the `AuthPayload` signer map.
+- Pass one rule ID per authorized context. A vault deposit authorizes two contexts (the vault call and the USDC transfer), and both use the owner rule.
+
+---
+
 ## NAV Oracle Contract
 
 **Purpose:** Computes conservative and deposit NAV from multiple sources. Enforces all oracle safety rules from `architecture/NAV-ORACLE.md`.
@@ -230,22 +326,45 @@ pub struct RiskSheet {
 // struct PriceData { price: i128, timestamp: u64 }
 fn base(env: Env) -> Asset                                         // numéraire
 fn assets(env: Env) -> Vec<Asset>
+// Decision D-H: Blend v2 supply positions (price per bToken = underlying x live b_rate / 1e12)
+fn set_blend_factory(env: Env, factory: Address)                   // admin; once; official pool factory
+fn register_blend_position(env: Env, pool: Address, underlying: Address) // admin; factory.is_pool; immutable
+fn blend_position(env: Env, pool: Address) -> Option<BlendPosition>
 fn decimals(env: Env) -> u32
 fn resolution(env: Env) -> u32                                     // seconds
 fn price(env: Env, asset: Asset, timestamp: u64) -> Option<PriceData>
 fn prices(env: Env, asset: Asset, records: u32) -> Option<Vec<PriceData>>
-fn lastprice(env: Env, asset: Asset) -> Option<PriceData>          // conservative NAV; None while sleeve paused/halted
+fn lastprice(env: Env, asset: Asset) -> Option<PriceData>          // live conservative price; None if stale/<2 sources/paused (W5)
+// price/prices: history on the resolution grid, newest first, <= 20 records; base = 10^decimals; Other -> None
 
 // Constella extensions (non-SEP-40)
-fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>  // minimum of valid sources
-fn asset_price(env: Env, asset: Address) -> Option<PriceData>            // median of the asset's own valid sources; base = 1.0
-fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<PriceData>     // median of valid sources
+// SourcedPrice { price, timestamp, source }
+fn collateral_price(env: Env, asset: Address) -> Option<SourcedPrice>       // minimum of the asset's valid sources
+fn asset_price(env: Env, asset: Address) -> Option<SourcedPrice>            // median of the asset's own valid sources; base = 1.0
+fn get_collateral_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice>  // single-asset sleeves only (O6)
+fn get_deposit_nav(env: Env, sleeve_id: Symbol) -> Option<SourcedPrice>     // single-asset sleeves only (O6)
 
 // Oracle management
 fn get_sources(env: Env) -> Vec<OracleSource>
 fn is_halted(env: Env) -> bool
 fn is_sleeve_paused(env: Env, sleeve_id: String) -> bool
-fn update_source(env: Env, source_id: String, price: i128, timestamp: u64)  // oracle feeds only
+fn update_price(env: Env, source_id: Symbol, price: i128, liquidity_depth_usd: i128, timestamp: u64)  // the source's own feeder only (O7a)
+fn register_source(env: Env, source: OracleSource)   // admin; immediate for an unpriced asset, else pending 48h
+fn activate_source(env: Env, source_id: Symbol)      // anyone, after the delay; never changes an existing source's price
+fn cancel_source_change(env: Env, source_id: Symbol) // admin
+fn deactivate_source(env: Env, source_id: Symbol)    // admin; immediate (fails safe)
+fn get_pending_source(env: Env, source_id: Symbol) -> Option<PendingSource>
+fn configure_sleeve(env: Env, sleeve_id: Symbol, deviation_threshold_bps: u32, min_valid_sources: u32) // admin; <= 500 bps, >= 2 sources; loosening waits 48h (O5)
+fn activate_sleeve_config(env: Env, sleeve_id: Symbol)   // anyone, after the delay
+fn cancel_sleeve_config(env: Env, sleeve_id: Symbol)     // admin
+fn get_pending_sleeve_config(env: Env, sleeve_id: Symbol) -> Option<PendingSleeveConfig>
+// Reflector pull sources (O7b)
+fn register_reflector_source(env: Env, source: OracleSource, config: ReflectorConfig) // admin; validated against the live feed
+fn pull_price(env: Env, source_id: Symbol) -> Option<SourcedPrice>  // live converted price; None if gappy/stale/unreadable/overflow
+fn get_pull_feed(env: Env, source_id: Symbol) -> Option<PullFeed>
+// RedStone pull sources (O7c)
+fn register_redstone_source(env: Env, source: OracleSource, config: RedStoneConfig) // admin; both feeds must be readable
+fn get_redstone_feed(env: Env, source_id: Symbol) -> Option<RedStoneConfig>
 // caller must sign AND be the pause authority or the admin (audit O1)
 fn trigger_circuit_breaker(env: Env, caller: Address, sleeve_id: Symbol, reason: Symbol)
 fn clear_circuit_breaker(env: Env, sleeve_id: Symbol)  // admin (multisig) only
@@ -350,7 +469,7 @@ State migrations use the standard CAP-85 data-migration path.
 
 ## Events Reference
 
-All state-changing functions must emit events. Format:
+All state-changing functions must emit events, declared as typed `#[contractevent]` structs (audit W4.1b) so they appear in the contract interface spec for wallets, indexers and generated clients. Exact encodings are pinned by each crate's `golden/events.txt`. Format:
 
 ```
 Topic: ["EVENT_NAME", ...discriminators]
@@ -359,14 +478,14 @@ Data: { relevant fields, timestamp }
 
 | Event | Trigger |
 |---|---|
-| `deposit` | SEP-56 event (name defined by the standard): topics `[deposit, operator, from, receiver]`, data `(assets, shares)`; emitted by `deposit` and `mint` |
-| `withdraw` | SEP-56 event: topics `[withdraw, operator, receiver, owner]`, data `(assets, shares)`; emitted by `withdraw` and `redeem` |
-| `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard) |
+| `deposit` | SEP-56 event (name defined by the standard): topics `[deposit, operator, from, receiver]`, data map `{assets, shares}`; emitted by `deposit` and `mint` |
+| `withdraw` | SEP-56 event: topics `[withdraw, operator, receiver, owner]`, data map `{assets, shares}`; emitted by `withdraw` and `redeem` |
+| `transfer` / `approve` / `mint` / `burn` | SEP-41 share-token events (names defined by the standard): `transfer` `[transfer, from, to]` data `amount`, or map `{amount, to_muxed_id}` when `to` is muxed; `approve` `[approve, from, spender]` data `[amount, live_until_ledger]`; `mint` `[mint, to]` data `amount` (deposits, mints **and accrued fee shares** to the treasury); `burn` `[burn, from]` data `amount` (redeem, withdraw, `burn`, `burn_from`) |
 | `REBALANCE_STEP` | Each trade in a rebalance |
 | `REBALANCE_COMPLETE` | Full rebalance completed |
 | `NAV_PAUSE` | Circuit breaker triggered |
 | `NAV_RESUME` | Circuit breaker cleared |
-| `FEE_ACCRUAL` | Management fee accrued |
+| `FEE_ACCRUAL` | Performance fee crystallized (shares minted to the treasury; only on profit above the high-water mark) |
 | `POLICY_REGISTERED` | New policy hash stored |
 | `POLICY_UPDATED` | Policy hash updated |
 | `VAULT_PAUSED` | Vault paused |
