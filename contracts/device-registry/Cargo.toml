@@ -1,0 +1,17 @@
+[package]
+name = "constella-device-registry"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+stellar-accounts = "=0.8.0"
+
+[dev-dependencies]
+soroban-sdk = { workspace = true, features = ["testutils"] }
+constella-account-factory = { path = "../account-factory" }

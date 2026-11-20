@@ -36,6 +36,7 @@ from stellar_sdk import Keypair, SorobanServer
 
 from .accounts import RateLimiter, parse_owner_key
 from .faucet import Faucet, parse_address
+from .pairing import Pairing
 from .gateway import Rejected
 from .relayer import Relayer
 
@@ -56,7 +57,14 @@ def parse_allowed(spec: str) -> dict[str, frozenset[str]]:
 
 
 def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimiter | None = None,
-                 trust_proxy: bool = False, cors_origin: str | None = None, faucet: "Faucet | None" = None):
+                 *args, **kwargs):
+    return _make_handler(relayer, factory, limiter, *args, **kwargs)
+
+
+def _make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimiter | None = None,
+                 trust_proxy: bool = False, cors_origin: str | None = None, faucet: "Faucet | None" = None,
+                 pairing: Pairing | None = None):
+    pairing = pairing or Pairing()
     class Handler(BaseHTTPRequestHandler):
         server_version = "constella-relayer"
 
@@ -101,6 +109,12 @@ def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimi
                     return self._reply(200, relayer.prepare(body.get("func")))
                 if self.path == "/submit":
                     return self._reply(200, asdict(relayer.submit(body.get("func"), body.get("auth"))))
+                if self.path == "/pair/start":
+                    return self._reply(200, pairing.start(body.get("account")))
+                if self.path == "/pair/join":
+                    return self._reply(200, pairing.join(body.get("code"), body.get("device_key"), body.get("name")))
+                if self.path == "/pair/status":
+                    return self._reply(200, pairing.status(body.get("code")))
                 if self.path == "/faucet" and faucet:
                     client = self.client_address[0]
                     if trust_proxy and self.headers.get("X-Forwarded-For"):

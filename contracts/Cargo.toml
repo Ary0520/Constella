@@ -15,6 +15,7 @@ members = [
     "vault-factory",
     "account-factory",
     "collateral-oracle",
+    "device-registry",
 ]
 
 [workspace.package]

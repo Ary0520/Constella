@@ -312,6 +312,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "constella-device-registry"
+version = "0.1.0"
+dependencies = [
+ "constella-account-factory",
+ "soroban-sdk",
+ "stellar-accounts",
+]
+
+[[package]]
 name = "constella-fee-sponsor"
 version = "0.1.0"
 dependencies = [
