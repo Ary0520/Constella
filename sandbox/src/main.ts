@@ -49,8 +49,22 @@ async function act(label: string, fn: () => Promise<unknown>) {
   } catch (e: any) {
     const msg = e?.message ?? String(e);
     log(`${label}: FAILED - ${msg}`);
-    status(`${label} failed: ${msg}`, "err");
+    status(`${label} failed: ${explain(msg)}`, "err");
   }
+}
+
+/** Plain-language explanations for the errors users actually meet (the raw
+ * code stays in the activity log). */
+function explain(msg: string): string {
+  const m = msg.toLowerCase();
+  if (m.includes("rate_limited")) return "daily limit reached for this action (testnet faucet / new accounts). Try again tomorrow or from another network.";
+  if (m.includes("notallowederror") || m.includes("the operation either timed out or was not allowed")) return "the passkey prompt was cancelled or failed on the device. Try again; on a phone, make sure you approve the prompt for this website.";
+  if (m.includes("failed to fetch")) return "could not reach the Constella service (network). Check your connection and try again.";
+  if (m.includes("faucet_refused")) return "the faucet could not send to this address (a Stellar wallet account needs a USDC trustline first).";
+  if (m.includes("error(contract, #10)") || m.includes("balanceerror")) return "not enough balance for this transaction (USDC or shares). Get test USDC first, or use a smaller amount.";
+  if (m.includes("error(contract, #8)")) return "the vault does not hold enough cash for this redemption right now - try a smaller amount.";
+  if (m.includes("simulation_failed")) return "the network rejected the transaction in a dry run, before anything was signed or spent. Details are in the activity log.";
+  return msg;
 }
 
 // ---------------------------------------------------------------- state
@@ -162,11 +176,18 @@ function layout() {
     return testUsdc(a.address);
   });
   $("forget").onclick = () => { try { localStorage.removeItem(ACCOUNT_KEY); } catch { /* */ } refresh(); };
-  $("deposit").onclick = () => act("deposit", () => {
-    const u = actor(); return u.call("deposit", userArgs(toUnits($<HTMLInputElement>("dep").value), u.address));
+  $("deposit").onclick = () => act("deposit", async () => {
+    const u = actor(); const amt = toUnits($<HTMLInputElement>("dep").value);
+    const bal = BigInt(await chain.view(cfg.assets.USDC, "balance", [sv.addr(u.address)]).catch(() => 0));
+    if (amt <= 0n) throw new Error("enter an amount above 0");
+    if (bal < amt) throw new Error(`you have ${fmt(bal)} USDC, so you cannot deposit ${fmt(amt)}. Click "Get 100 test USDC" first, or deposit less.`);
+    return u.call("deposit", userArgs(amt, u.address));
   });
-  $("redeem").onclick = () => act("redeem", () => {
-    const u = actor(); return u.call("redeem", userArgs(toUnits($<HTMLInputElement>("red").value), u.address));
+  $("redeem").onclick = () => act("redeem", async () => {
+    const u = actor(); const sh = toUnits($<HTMLInputElement>("red").value);
+    const have = BigInt(await chain.view(cfg.contracts.vault, "balance", [sv.addr(u.address)]).catch(() => 0));
+    if (have < sh) throw new Error(`you hold ${fmt(have)} vault shares, so you cannot redeem ${fmt(sh)}. Deposit first, or redeem less.`);
+    return u.call("redeem", userArgs(sh, u.address));
   });
   $("redeemFrozen").onclick = () => act("redeem while frozen", () => {
     const u = actor(); return u.call("redeem_frozen", userArgs(toUnits($<HTMLInputElement>("fz").value), u.address));
