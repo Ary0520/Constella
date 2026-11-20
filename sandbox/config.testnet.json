@@ -1,0 +1,31 @@
+{
+  "network": {
+    "rpc_url": "https://soroban-testnet.stellar.org",
+    "passphrase": "Test SDF Network ; September 2015",
+    "friendbot": "https://friendbot.stellar.org",
+    "name": "testnet",
+    "explorer": "https://stellar.expert/explorer/testnet"
+  },
+  "assets": {
+    "USDC": "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
+    "EURC": "CCUUDM434BMZMYWYDITHFXHDMIVTGGD6T2I5UKNX5BSLXLW7HVR4MCGZ"
+  },
+  "contracts": {
+    "registry": "CDLZ6W2YJ7FTEBV4FI2WFCQPKSFHOZG35RM3G44XD4BZ7MYZJYIS66W3",
+    "oracle": "CCQEPZH4HFEBARYSKXBY7TTQXMI4I4OSLDX7XXFD5Y7QNKSGHDPZAL74",
+    "policy": "CA5OXHLX7OZV44VYZ3EXIV3CADVACXJB6ULEK2RLDNBWPG7O7M4A4IPP",
+    "vault": "CBVEAQSRMIIH5CGQWWVKWX3JRAT6RAKXOCZBABHIV4QCELLEU6E675Z4",
+    "verifier": "CAXCWYF2YCVIWYLR2YIEWXVPKHSIQH2AYKW3CST5JMNFDDCEBZRQPLOP",
+    "account_factory": "CA6YQJ4PISBYUXMYTFGCAZPKM6K4XFAMW6MFIOGLWQ6FPSP637U2DFDC",
+    "fee_sponsor": "CAXAUOSRGIGO6I7VKQISC64ZDD4TPFL2N2ZSWCS6BK6CYDZZMIJYUGNV",
+    "vault_factory": "CCEBF3MSUZFZAHPF62EKH3C2Q5RAS3ESOVNZQXG7VIWWCD2FZLRQTLIY",
+    "collateral_oracle": "CB2FUKPRDTMVHMQR4BTVDEOVIL5YJQQTENP5Q5TNZHHDUVWQMB4LQICJ"
+  },
+  "accounts": {
+    "admin": "GCO3QAKBB5BN4LOXLFZTRRKP2MA5HBK2CRFAOMX3SAZ67EMIOI4PVA37"
+  },
+  "services": {
+    "relayer": "https://constella-services-production.up.railway.app/relayer",
+    "thesis_api": "https://constella-services-production.up.railway.app/api"
+  }
+}

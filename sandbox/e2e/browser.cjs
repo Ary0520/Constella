@@ -15,7 +15,7 @@ const text = async (p, sel) => ((await p.textContent(sel)) || "").replace(/\s+/g
   const cdp = await page.context().newCDPSession(page);
   await cdp.send("WebAuthn.enable");
   const { authenticatorId } = await cdp.send("WebAuthn.addVirtualAuthenticator", { options: { protocol: "ctap2", transport: "internal", hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true } });
-  await page.goto("http://localhost:5173/");
+  await page.goto(process.env.CONSOLE_URL || "http://localhost:5173/");
   await page.waitForSelector("#create");
   // 1. The relayer request is interrupted (as in the first real test).
   let dropped = false;
@@ -36,7 +36,7 @@ const text = async (p, sel) => ((await p.textContent(sel)) || "").replace(/\s+/g
   await page.click("#faucet");
   await page.waitForFunction(() => document.getElementById("status").className !== "busy", null, { timeout: 60000 });
   console.log("2 FAUCET:", await text(page, "#status"), "|", await text(page, "#acct"));
-  await page.fill("#dep", "200");
+  await page.fill("#dep", process.env.CONSOLE_URL ? "40" : "200");
   await page.click("#deposit");
   await page.waitForFunction(() => document.getElementById("status").className !== "busy", null, { timeout: 90000 });
   console.log("2 DEPOSIT:", await text(page, "#status"), "|", await text(page, "#acct"));

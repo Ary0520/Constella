@@ -14,7 +14,7 @@ export interface Config {
   assets: { USDC: string; EURC: string; issuer: string };
   contracts: Record<string, string>;
   accounts: Record<string, string>;
-  LOCAL_ONLY_secrets: Record<string, string>;
+  LOCAL_ONLY_secrets?: Record<string, string>; // absent on the hosted testnet console
   services: { relayer: string; thesis_api: string };
 }
 
@@ -50,7 +50,9 @@ export class Chain {
 
   /** A demo/admin action signed by a LOCAL throwaway key. */
   async invokeAs(who: string, contract: string, fn: string, args: xdr.ScVal[] = []): Promise<string> {
-    const kp = Keypair.fromSecret(this.cfg.LOCAL_ONLY_secrets[who]);
+    const secret = this.cfg.LOCAL_ONLY_secrets?.[who];
+    if (!secret) throw new Error("operator-only action: not available on this console");
+    const kp = Keypair.fromSecret(secret);
     // One pending transaction per account: TRY_AGAIN_LATER (e.g. two buttons
     // at once) is retried with a fresh sequence number.
     let sent: any;

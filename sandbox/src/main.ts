@@ -85,6 +85,15 @@ function saveAccount(a: Passkey) {
 }
 
 // ---------------------------------------------------------------- render
+/** Hosted (testnet) console: no secrets at all - faucet via the relayer,
+ * operator actions hidden. Local console: throwaway local keys. */
+const hosted = () => !cfg.LOCAL_ONLY_secrets;
+
+async function testUsdc(address: string) {
+  if (hosted()) return chain.relayer("/faucet", { address });
+  return chain.invokeAs("issuer", cfg.assets.USDC, "mint", [sv.addr(address), sv.i128(1_000n * ONE)]);
+}
+
 function layout() {
   const c = cfg.contracts;
   $("app").innerHTML = `
@@ -150,7 +159,7 @@ function layout() {
   });
   $("faucet").onclick = () => act("faucet", async () => {
     const a = need();
-    return chain.invokeAs("issuer", cfg.assets.USDC, "mint", [sv.addr(a.address), sv.i128(1_000n * ONE)]);
+    return testUsdc(a.address);
   });
   $("forget").onclick = () => { try { localStorage.removeItem(ACCOUNT_KEY); } catch { /* */ } refresh(); };
   $("deposit").onclick = () => act("deposit", () => {
@@ -166,8 +175,14 @@ function layout() {
   const needWallet = () => { if (!wallet) throw new Error("connect a Stellar wallet first"); return wallet; };
   $("wfund").onclick = () => act("friendbot", () => friendbotFund(chain, needWallet().address));
   $("wtrust").onclick = () => act("add USDC trustline", () => addUsdcTrustline(chain, needWallet()));
-  $("wfaucet").onclick = () => act("faucet (wallet)", () =>
-    chain.invokeAs("issuer", cfg.assets.USDC, "mint", [sv.addr(needWallet().address), sv.i128(1_000n * ONE)]));
+  $("wfaucet").onclick = () => act("faucet (wallet)", () => testUsdc(needWallet().address));
+  if (hosted()) {
+    // Operator-only on the hosted testnet console (no keys in the browser).
+    for (const id of ["freeze", "unfreeze", "pause", "unpause"]) $(id).style.display = "none";
+    $("freeze").insertAdjacentHTML("beforebegin", `<p><i>On testnet, freezing prices and pausing are operator actions (not available from this public page). Redeem-while-frozen works whenever a price is genuinely unavailable.</i></p>`);
+    for (const id of ["faucet", "wfaucet"]) $(id).textContent = "Get 100 test USDC (testnet faucet, once a day)";
+    document.querySelector("h1")!.textContent = "Constella sandbox - Stellar TESTNET";
+  }
   $("freeze").onclick = () => act("freeze EURC", () =>
     chain.invokeAs("admin", cfg.contracts.oracle, "trigger_circuit_breaker", [sv.addr(cfg.accounts.admin), sv.sym("CASH"), sv.sym("SANDBOX")]));
   $("unfreeze").onclick = () => act("restore prices", () =>
