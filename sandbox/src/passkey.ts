@@ -141,3 +141,43 @@ export async function getAssertion(credentialId: string, challenge: Uint8Array, 
   const r = cred.response as AuthenticatorAssertionResponse;
   return { authenticatorData: new Uint8Array(r.authenticatorData), clientDataJSON: new Uint8Array(r.clientDataJSON), signature: new Uint8Array(r.signature) };
 }
+
+// ------------------------------------------- test passkey (LOCAL testing only)
+// A P-256 key held by this browser (WebCrypto) that produces exactly the
+// WebAuthn assertion a platform authenticator would: authenticatorData =
+// SHA-256(rpId) || flags(UP|UV) || counter; clientDataJSON with the challenge;
+// signature over authenticatorData || SHA-256(clientDataJSON). For testing
+// when no usable authenticator exists (e.g. phones refuse 'localhost'
+// passkeys). The real product uses real passkeys only.
+
+/** WebCrypto signs in raw r||s (P1363); attachSignature expects DER. */
+export function rawToDer(raw: Uint8Array): Uint8Array {
+  const int = (b: Uint8Array) => {
+    let i = 0;
+    while (i < b.length - 1 && b[i] === 0) i++;
+    let v = b.slice(i);
+    if (v[0] & 0x80) v = new Uint8Array([0, ...v]);
+    return new Uint8Array([0x02, v.length, ...v]);
+  };
+  const r = int(raw.slice(0, 32)), s = int(raw.slice(32));
+  return new Uint8Array([0x30, r.length + s.length, ...r, ...s]);
+}
+
+export async function createTestPasskey(): Promise<{ id: string; publicKey: Uint8Array; jwk: JsonWebKey }> {
+  const kp = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+  const publicKey = new Uint8Array(await crypto.subtle.exportKey("raw", kp.publicKey)); // 0x04||X||Y
+  const jwk = await crypto.subtle.exportKey("jwk", kp.privateKey);
+  return { id: "test-passkey", publicKey, jwk };
+}
+
+export async function testAssertion(jwk: JsonWebKey, challenge: Uint8Array, rpId: string, origin: string): Promise<Assertion> {
+  const key = await crypto.subtle.importKey("jwk", jwk, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const sha = async (b: Uint8Array) => new Uint8Array(await crypto.subtle.digest("SHA-256", b as BufferSource));
+  const counter = Math.floor(Date.now() / 1000);
+  const authenticatorData = new Uint8Array([...(await sha(new TextEncoder().encode(rpId))), 0x05,
+    (counter >>> 24) & 255, (counter >>> 16) & 255, (counter >>> 8) & 255, counter & 255]);
+  const clientDataJSON = new TextEncoder().encode(JSON.stringify({ type: "webauthn.get", challenge: b64u(challenge), origin, crossOrigin: false }));
+  const msg = new Uint8Array([...authenticatorData, ...(await sha(clientDataJSON))]);
+  const raw = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, msg as BufferSource));
+  return { authenticatorData, clientDataJSON, signature: rawToDer(raw) };
+}

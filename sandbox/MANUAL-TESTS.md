@@ -91,6 +91,14 @@ live stack), `npm run test:browser` (headless Chromium with a virtual passkey).
 
 ## Troubleshooting
 
+- **Fastest path for local testing:** **Create a test passkey (in this browser)** - no device prompt at all;
+  exercises every flow for real on chain (same signature format the smart account checks). Local only.
+- **Phones and `localhost`:** Android's passkey manager may create but then not find a passkey for
+  `localhost` (a development address) -> "no passkeys" on the phone. Use Windows Hello or the test passkey
+  locally; phones will work on a real domain (testnet deployment).
+- **Windows Hello** = your Windows PIN / fingerprint / face. Set it up in Windows Settings -> Accounts ->
+  Sign-in options -> PIN (Windows Hello). Without it, "Create with this device" shows "Something went wrong".
+
 - **Phone says "no passkeys" when signing a deposit:** the account was created with a passkey that is not on
   that phone (e.g. from an earlier unfinished attempt). Section 2 shows where the passkey is stored. Click
   **Start over with a new passkey**, then create with **this device (Windows Hello)** - signing then happens

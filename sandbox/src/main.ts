@@ -5,7 +5,7 @@
  */
 import { xdr } from "@stellar/stellar-sdk";
 import { Chain, Config, Passkey, sv, thesis } from "./chain";
-import { createPasskey } from "./passkey";
+import { createPasskey, createTestPasskey } from "./passkey";
 import { addUsdcTrustline, connectWallet, friendbotFund, WalletSigner, walletInvoke, walletStatus } from "./wallet";
 
 const ONE = 10_000_000n;
@@ -96,6 +96,7 @@ function layout() {
     <div id="acct"></div>
     <button id="create">Create with this device (Windows Hello / Touch ID)</button>
     <button id="createPhone">Create with phone / security key</button>
+    <button id="createTest">Create a test passkey (in this browser - local testing only)</button>
     <button id="faucet">Get 1,000 test USDC</button>
     <button id="forget">Start over with a new passkey</button></section>
 
@@ -140,6 +141,13 @@ function layout() {
   $("refresh").onclick = () => refresh();
   $("create").onclick = () => act("create passkey account", () => createAccount("platform"));
   $("createPhone").onclick = () => act("create passkey account", () => createAccount("cross-platform"));
+  $("createTest").onclick = () => act("create test passkey account", async () => {
+    if (loadAccount()) throw new Error("this browser already has an account - use 'Start over with a new passkey' first");
+    const t = await createTestPasskey();
+    const pending: Passkey = { credentialId: t.id, publicKey: t.publicKey, address: "", attachment: "test", testKey: t.jwk };
+    saveAccount(pending);
+    return finishSetup(pending);
+  });
   $("faucet").onclick = () => act("faucet", async () => {
     const a = need();
     return chain.invokeAs("issuer", cfg.assets.USDC, "mint", [sv.addr(a.address), sv.i128(1_000n * ONE)]);
@@ -258,7 +266,7 @@ async function refresh() {
         chain.view(cfg.assets.USDC, "balance", [sv.addr(a.address)]), chain.view(c.vault, "balance", [sv.addr(a.address)]),
         chain.view(c.vault, "get_claim", [sv.addr(a.address), sv.addr(cfg.assets.EURC)]),
       ]);
-      const where = a.attachment === "platform" ? "this device (Windows Hello / Touch ID)" : a.attachment === "cross-platform" ? "a phone or security key" : "unknown (created before this was recorded)";
+      const where = a.testKey ? "this browser (TEST passkey - local testing only, no prompt)" : a.attachment === "platform" ? "this device (Windows Hello / Touch ID)" : a.attachment === "cross-platform" ? "a phone or security key" : "unknown (created before this was recorded)";
       $("acct").innerHTML = `<div class="mono">account ${a.address}</div><div>USDC ${fmt(usdc)} · vault shares ${fmt(shares)} · XLM: none needed</div>
         <div>passkey stored on: <b>${where}</b>${a.transports?.length ? ` (${a.transports.join(", ")})` : ""} - signing needs that same passkey</div>`;
       $("claims").innerHTML = `open EURC claim for this account: <b>${fmt(claim)}</b> units ${BigInt(claim) > 0n ? "(the keeper settles it once EURC is priced again)" : ""}`;

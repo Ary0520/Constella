@@ -43,6 +43,17 @@ run("console code on the live local stack", () => {
   let acct: Passkey;
   const c = cfg.contracts;
 
+  it("the in-browser TEST passkey (WebCrypto) is accepted by the smart account on chain", async () => {
+    const { createTestPasskey, testAssertion } = await import("../src/passkey");
+    const t = await createTestPasskey();
+    const out = await chain.relayer("/accounts", { owner_key: Buffer.from(t.publicKey).toString("hex") });
+    const a: Passkey = { credentialId: t.id, publicKey: t.publicKey, address: out.account, testKey: t.jwk };
+    await chain.invokeAs("issuer", cfg.assets.USDC, "mint", [sv.addr(a.address), sv.i128(100n * ONE)]);
+    await chain.sponsored(a, c.vault, "deposit", [sv.i128(50n * ONE), sv.addr(a.address), sv.addr(a.address), sv.addr(a.address)],
+      (_id, ch) => testAssertion(t.jwk, ch, "localhost", "http://localhost:5173"));
+    expect(BigInt(await chain.view(c.vault, "balance", [sv.addr(a.address)]))).toBeGreaterThan(0n);
+  }, 120_000);
+
   it("the relayer creates a zero-XLM passkey account", async () => {
     const out = await chain.relayer("/accounts", { owner_key: Buffer.from(pk.pub).toString("hex") });
     acct = { credentialId: "software", publicKey: pk.pub, address: out.account };
