@@ -16,7 +16,8 @@ Configuration (environment only - the secret is never logged):
   SPONSOR_CONTRACT_ID, SPONSOR_ALLOWED ("C...:deposit,redeem;C...:fn"),
   RELAYER_MAX_FEE_STROOPS (default 1_000_000), RELAYER_HOST, RELAYER_PORT,
   ACCOUNT_FACTORY_ID (enables /accounts, audit A2), ACCOUNTS_PER_IP_PER_DAY (3),
-  ACCOUNTS_PER_DAY (200), ACCOUNT_MAX_FEE_STROOPS (30_000_000: an account
+  RELAYER_FN_MAX_FEE ("add_device:30000000": per-function caps for calls that
+  create storage), ACCOUNTS_PER_DAY (200), ACCOUNT_MAX_FEE_STROOPS (30_000_000: an account
   deployment pays its storage rent), RELAYER_TRUST_PROXY=1 (use X-Forwarded-For's first
   address as the client; only behind your own proxy), RELAYER_CORS_ORIGIN
   (unset = no CORS headers; set to one browser origin, e.g. the sandbox),
@@ -54,6 +55,17 @@ def parse_allowed(spec: str) -> dict[str, frozenset[str]]:
     if not allowed:
         raise ValueError("SPONSOR_ALLOWED is empty")
     return allowed
+
+
+def parse_fee_caps(spec: str) -> dict[str, int]:
+    """'fn:stroops,fn:stroops' -> {fn: stroops} (per-function fee caps)."""
+    out: dict[str, int] = {}
+    for part in filter(None, (p.strip() for p in spec.split(","))):
+        fn, _, cap = part.partition(":")
+        if not fn or not cap.isdigit():
+            raise ValueError(f"bad RELAYER_FN_MAX_FEE entry: {part!r}")
+        out[fn.strip()] = int(cap)
+    return out
 
 
 def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimiter | None = None,
@@ -150,6 +162,7 @@ def cli() -> None:
         allowed=parse_allowed(env["SPONSOR_ALLOWED"]),
         max_fee_stroops=int(env.get("RELAYER_MAX_FEE_STROOPS", "1000000")),
         account_max_fee_stroops=int(env.get("ACCOUNT_MAX_FEE_STROOPS", "30000000")),
+        function_max_fee=parse_fee_caps(env.get("RELAYER_FN_MAX_FEE", "add_device:30000000")),
     )
     host, port = env.get("RELAYER_HOST", "127.0.0.1"), int(env.get("RELAYER_PORT", "8787"))
     sys.stderr.write(f"constella-relayer pool of {len(relayer.keypairs)} on {host}:{port}\n")

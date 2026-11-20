@@ -30,3 +30,12 @@ def test_cors_is_opt_in_and_limited_to_one_origin():
             assert r.headers.get("Access-Control-Allow-Origin") == expected
             assert json.loads(r.read())["ok"] is True
         srv.shutdown()
+
+
+def test_per_function_fee_caps_parse_and_reject_garbage():
+    import pytest
+    from constella_relayer.server import parse_fee_caps
+    assert parse_fee_caps("add_device:30000000") == {"add_device": 30_000_000}
+    assert parse_fee_caps("") == {}
+    with pytest.raises(ValueError):
+        parse_fee_caps("add_device:lots")

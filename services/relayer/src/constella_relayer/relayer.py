@@ -59,6 +59,7 @@ class Relayer:
         inclusion_fee: int = 100,
         timeout_seconds: int = 30,
         account_max_fee_stroops: int = 30_000_000,
+        function_max_fee: dict[str, int] | None = None,
     ):
         if max_fee_stroops <= inclusion_fee:
             raise ValueError("max_fee_stroops must exceed the inclusion fee")
@@ -73,6 +74,9 @@ class Relayer:
         # Deploying an account pays its storage rent (~1.8 XLM on a local
         # network, measured): its own cap, so user calls stay tightly capped.
         self.account_max_fee = account_max_fee_stroops
+        # Calls that create storage pay its rent up front (measured on testnet:
+        # add_device ~2.37 XLM): their own caps; every other call keeps max_fee.
+        self.function_max_fee = dict(function_max_fee or {})
         self.inclusion_fee = inclusion_fee
         self.timeout = timeout_seconds
         self.relayer_addresses = frozenset(k.public_key for k in keypairs)
@@ -143,7 +147,7 @@ class Relayer:
 
     def submit(self, func_b64: str, auth_b64: list[str]) -> Submitted:
         v = validate(func_b64, auth_b64, self.allowed, self.relayer_addresses)
-        return self._sponsor(v.host_function, v.auth, v.user, v.contract, v.function)
+        return self._sponsor(v.host_function, v.auth, v.user, v.contract, v.function, self.function_max_fee.get(v.function))
 
     def _read(self, contract: str, fn: str, args: list[xdr.SCVal]):
         source = self.keypairs[0].public_key
