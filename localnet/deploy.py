@@ -35,9 +35,9 @@ def struct(fields: dict) -> xdr.SCVal:
 
 
 class Net:
-    def __init__(self, rpc: str, friendbot: str, passphrase: str):
-        if passphrase != STANDALONE:
-            sys.exit("deploy.py is for a LOCAL network only")
+    def __init__(self, rpc: str, friendbot: str, passphrase: str, allowed: tuple = (STANDALONE,)):
+        if passphrase not in allowed:
+            sys.exit(f"refusing network {passphrase!r}: this deployer allows only {allowed}")
         self.server = SorobanServer(rpc)
         self.friendbot = friendbot
         self.passphrase = passphrase
@@ -45,7 +45,9 @@ class Net:
     def fund(self, kp: Keypair) -> None:
         for _ in range(30):
             try:
-                with urllib.request.urlopen(f"{self.friendbot}?addr={kp.public_key}", timeout=30):
+                req = urllib.request.Request(f"{self.friendbot}?addr={kp.public_key}",
+                                             headers={"User-Agent": "Mozilla/5.0 (compatible; stellar-deploy)"})
+                with urllib.request.urlopen(req, timeout=30):
                     return
             except Exception:
                 time.sleep(3)
