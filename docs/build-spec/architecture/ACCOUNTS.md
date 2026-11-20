@@ -62,6 +62,12 @@ For users who don't own XLM and don't want to think about blockchain, this is a 
 
 The relayer exposes `POST /accounts {"owner_key": hex}`: it builds the call itself (never client-supplied), pays through the normal sponsored path (whitelist, enforcing simulation, `record_sponsored_op` against the on-chain daily budget), and limits abuse per client IP per day (3) and globally per day (200). **Cost:** deploying an account pays its storage rent - **~1.82 XLM measured on a local network** (re-measure on testnet) - so account creation has its own fee cap (`ACCOUNT_MAX_FEE_STROOPS`, 3 XLM) separate from user calls (0.1 XLM). This is a real per-user acquisition cost.
 
+### One account, several devices (implemented `33b35bc`, `aca65a1`, `35b4019`)
+
+`contracts/device-registry`: `add_device(account, device_key, name)` is authorized by the **account** (its owner passkey signs) and adds a context rule whose **only** signer is the new device's passkey (OpenZeppelin requires every signer of a policy-less rule, so each device has its own rule and signs alone), and records `device key -> (account, rule id)` for sign-in on that device. The account guard (S4) keeps device management on the owner rule: an added device can deposit / redeem / withdraw but cannot add or remove devices. Pairing: the first device opens a code at the relayer (`/pair/start`), the new device joins with its public key (`/pair/join`), both screens show the same 6-character check code, the first device approves. Cost on testnet: ~2.37 XLM per device (storage rent), sponsored under a per-function relayer cap. Proven with real signatures on the live local stack and in two browsers on the live testnet site.
+
+Sign-in on any device: "Sign in with an existing passkey" asks the device for any passkey it holds for the site, recovers the P-256 public key from the signature, and finds the account via `account_factory.account_of` or `device_registry.device_of`.
+
 ## Fee Sponsorship Architecture
 
 ```
