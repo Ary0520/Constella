@@ -5,7 +5,7 @@
  */
 import { xdr } from "@stellar/stellar-sdk";
 import { Chain, Config, Passkey, sv, thesis } from "./chain";
-import { createPasskey, createTestPasskey } from "./passkey";
+import { createPasskey, createTestPasskey, discoverPasskey, getAssertion, recoverPublicKeys } from "./passkey";
 import { addUsdcTrustline, connectWallet, friendbotFund, WalletSigner, walletInvoke, walletStatus } from "./wallet";
 
 const ONE = 10_000_000n;
@@ -117,8 +117,9 @@ function layout() {
 
   <section><h2>2. Passkey account (zero XLM; created by the relayer, A2)</h2>
     <div id="acct"></div>
-    <button id="create">Create with this device (Windows Hello / Touch ID)</button>
-    <button id="createPhone">Create with phone / security key</button>
+    <button id="create">Create - use THIS device (fingerprint / face / screen lock)</button>
+    <button id="createPhone">Create - use ANOTHER device (scan a QR code with your phone)</button>
+    <button id="signin">Sign in with an existing passkey</button>
     <button id="createTest">Create a test passkey (in this browser - local testing only)</button>
     <button id="faucet">Get 1,000 test USDC</button>
     <button id="forget">Start over with a new passkey</button></section>
@@ -164,6 +165,7 @@ function layout() {
   $("refresh").onclick = () => refresh();
   $("create").onclick = () => act("create passkey account", () => createAccount("platform"));
   $("createPhone").onclick = () => act("create passkey account", () => createAccount("cross-platform"));
+  $("signin").onclick = () => act("sign in with an existing passkey", signIn);
   $("createTest").onclick = () => act("create test passkey account", async () => {
     if (loadAccount()) throw new Error("this browser already has an account - use 'Start over with a new passkey' first");
     const t = await createTestPasskey();
@@ -238,6 +240,41 @@ async function createAccount(where: "platform" | "cross-platform") {
   return finishSetup(pending);
 }
 
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+
+/** Find the account of ANY passkey this device holds for this site: the
+ * device lists its passkeys; the public key is recovered from the signature
+ * and the account factory says which key owns an account. Also a diagnostic:
+ * "no passkey" means this device is not storing one for this site. */
+async function signIn() {
+  if (loadAccount()?.address) throw new Error("this browser already has an account - use 'Start over with a new passkey' first");
+  let found;
+  try {
+    found = await discoverPasskey();
+  } catch (e: any) {
+    throw new Error(`this device returned no passkey for ${location.hostname} (${e?.name ?? e}). If you created one on a phone, open this page ON that phone and use "Sign in", or create a new one with "use THIS device".`);
+  }
+  for (const pk of found.candidates) {
+    const acct = await chain.view(cfg.contracts.account_factory, "account_of", [sv.bytes(pk)]);
+    if (acct) {
+      const address = typeof acct === "string" ? acct : String(acct);
+      saveAccount({ credentialId: found.id, publicKey: pk, address, attachment: "existing" });
+      return { signed_in: address };
+    }
+  }
+  // A passkey with no account yet (an unfinished earlier attempt): a second
+  // signature pins down the exact key, then setup finishes with it.
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const a2 = await getAssertion(found.id, challenge);
+  const clientHash = new Uint8Array(await crypto.subtle.digest("SHA-256", a2.clientDataJSON as BufferSource));
+  const second = (await recoverPublicKeys(new Uint8Array([...a2.authenticatorData, ...clientHash]), a2.signature)).map(hex);
+  const key = found.candidates.find((k) => second.includes(hex(k)));
+  if (!key) throw new Error("could not determine this passkey's public key");
+  const pending: Passkey = { credentialId: found.id, publicKey: key, address: "", attachment: "existing" };
+  saveAccount(pending);
+  return finishSetup(pending);
+}
+
 async function finishSetup(a: Passkey) {
   const hex = Array.from(a.publicKey, (b) => b.toString(16).padStart(2, "0")).join("");
   const out = await chain.relayer("/accounts", { owner_key: hex });
@@ -302,7 +339,7 @@ async function refresh() {
         chain.view(cfg.assets.USDC, "balance", [sv.addr(a.address)]), chain.view(c.vault, "balance", [sv.addr(a.address)]),
         chain.view(c.vault, "get_claim", [sv.addr(a.address), sv.addr(cfg.assets.EURC)]),
       ]);
-      const where = a.testKey ? "this browser (TEST passkey - local testing only, no prompt)" : a.attachment === "platform" ? "this device (Windows Hello / Touch ID)" : a.attachment === "cross-platform" ? "a phone or security key" : "unknown (created before this was recorded)";
+      const where = a.testKey ? "this browser (TEST passkey - local testing only, no prompt)" : a.attachment === "existing" ? "the device you signed in with" : a.attachment === "platform" ? "this device (Windows Hello / Touch ID)" : a.attachment === "cross-platform" ? "a phone or security key" : "unknown (created before this was recorded)";
       $("acct").innerHTML = `<div class="mono">account ${a.address}</div><div>USDC ${fmt(usdc)} · vault shares ${fmt(shares)} · XLM: none needed</div>
         <div>passkey stored on: <b>${where}</b>${a.transports?.length ? ` (${a.transports.join(", ")})` : ""} - signing needs that same passkey</div>`;
       $("claims").innerHTML = `open EURC claim for this account: <b>${fmt(claim)}</b> units ${BigInt(claim) > 0n ? "(the keeper settles it once EURC is priced again)" : ""}`;

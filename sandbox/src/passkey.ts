@@ -181,3 +181,55 @@ export async function testAssertion(jwk: JsonWebKey, challenge: Uint8Array, rpId
   const raw = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, msg as BufferSource));
   return { authenticatorData, clientDataJSON, signature: rawToDer(raw) };
 }
+
+// ------------------------------------------- sign in with an existing passkey
+// A WebAuthn assertion does not carry the public key, but an ECDSA P-256
+// signature lets us recover the (at most two) public keys that could have
+// produced it. The account factory then tells us which key owns an account
+// (account_of). This finds accounts created on another device / earlier try.
+const P = 0xffffffff00000001000000000000000000000000ffffffffffffffffffffffffn;
+const A_ = P - 3n;
+const B_ = 0x5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604bn;
+const N_ = 0xffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551n;
+const G: [bigint, bigint] = [0x6b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296n, 0x4fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5n];
+type Pt = [bigint, bigint] | null;
+const mod = (a: bigint, m: bigint) => ((a % m) + m) % m;
+function inv(a: bigint, m: bigint): bigint { let [r0, r1, s0, s1] = [mod(a, m), m, 1n, 0n]; while (r1) { const q = r0 / r1; [r0, r1] = [r1, r0 - q * r1]; [s0, s1] = [s1, s0 - q * s1]; } return mod(s0, m); }
+function add(p: Pt, q: Pt): Pt {
+  if (!p) return q; if (!q) return p;
+  if (p[0] === q[0] && mod(p[1] + q[1], P) === 0n) return null;
+  const l = p[0] === q[0] && p[1] === q[1] ? mod(3n * p[0] * p[0] + A_, P) * inv(2n * p[1], P) : mod(q[1] - p[1], P) * inv(q[0] - p[0], P);
+  const x = mod(l * l - p[0] - q[0], P);
+  return [x, mod(l * (p[0] - x) - p[1], P)];
+}
+function mul(k: bigint, p: Pt): Pt { let r: Pt = null; let a = p; while (k > 0n) { if (k & 1n) r = add(r, a); a = add(a, a); k >>= 1n; } return r; }
+function sqrtP(a: bigint): bigint { let r = 1n, b = mod(a, P), e = (P + 1n) / 4n; while (e) { if (e & 1n) r = mod(r * b, P); b = mod(b * b, P); e >>= 1n; } return r; }
+const hexOf = (n: bigint) => n.toString(16).padStart(64, "0");
+
+/** Candidate public keys (65-byte uncompressed) for a DER signature over SHA-256(msg). */
+export async function recoverPublicKeys(msg: Uint8Array, der: Uint8Array): Promise<Uint8Array[]> {
+  const rs = derToLowS(der); // low-S form: recovery covers both parities anyway
+  const r = BigInt("0x" + toHex(rs.slice(0, 32))), s = BigInt("0x" + toHex(rs.slice(32)));
+  const e = BigInt("0x" + toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", msg as BufferSource))));
+  const out: Uint8Array[] = [];
+  const y2 = mod(r ** 3n + A_ * r + B_, P), y0 = sqrtP(y2);
+  if (mod(y0 * y0, P) !== y2) return out;
+  for (const y of [y0, P - y0]) {
+    const Rp: Pt = [r, y];
+    const Q = mul(inv(r, N_), add(mul(s, Rp), mul(mod(-e, N_), G)));
+    if (Q) out.push(fromHex("04" + hexOf(Q[0]) + hexOf(Q[1])));
+  }
+  return out;
+}
+
+/** Ask the device for ANY passkey it holds for this site (no allow-list).
+ * Returns the credential id, the assertion, and the candidate public keys. */
+export async function discoverPasskey(): Promise<{ id: string; candidates: Uint8Array[] }> {
+  const challenge = crypto.getRandomValues(new Uint8Array(32));
+  const cred = (await navigator.credentials.get({ publicKey: { challenge, userVerification: "required", rpId: location.hostname } })) as PublicKeyCredential;
+  const r = cred.response as AuthenticatorAssertionResponse;
+  const authData = new Uint8Array(r.authenticatorData), client = new Uint8Array(r.clientDataJSON);
+  const clientHash = new Uint8Array(await crypto.subtle.digest("SHA-256", client as BufferSource));
+  const candidates = await recoverPublicKeys(new Uint8Array([...authData, ...clientHash]), new Uint8Array(r.signature));
+  return { id: b64u(new Uint8Array(cred.rawId)), candidates };
+}

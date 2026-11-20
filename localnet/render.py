@@ -15,6 +15,9 @@ env = {
     "SPONSOR_ALLOWED": f'{ct["vault"]}:deposit,redeem,withdraw,redeem_frozen', "ACCOUNT_FACTORY_ID": ct["account_factory"],
     "RELAYER_HOST": "0.0.0.0", "RELAYER_PORT": "8787", "RELAYER_CORS_ORIGIN": "http://localhost:5173",
     "ACCOUNTS_PER_IP_PER_DAY": "50",
+    # The local quickstart network charges ~35x testnet resource fees once its
+    # storage grows (measured: deposit 0.74 vs 0.02 XLM); local cap only.
+    "RELAYER_MAX_FEE_STROOPS": "20000000",
     # keeper
     "KEEPER_SECRET": sec["keeper"], "KEEPER_VAULTS": ct["vault"], "KEEPER_INTERVAL_SECONDS": "20",
     "KEEPER_STATE_FILE": "/state/keeper_state.json",
