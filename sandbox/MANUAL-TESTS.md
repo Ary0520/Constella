@@ -31,14 +31,14 @@ version). Then select **Constella local** as the active network. xBull also supp
 
 | # | Step | Expected |
 |---|---|---|
-| P1 | Click **Create passkey account**; complete Windows Hello or the phone QR flow | Status "create passkey account: done" within ~10 s; section 2 shows `account C...`, USDC 0, "XLM: none needed" |
+| P1 | Click **Create with this device (Windows Hello)** (recommended locally) - or **Create with phone / security key** | Status "create passkey account: done" within ~10 s; section 2 shows `account C...`, USDC 0, "XLM: none needed" |
 | P2 | Reload the page | The same account is still shown |
 | P3 | (Recovery) Start P1 in a fresh browser profile, and while the status says "...relayer needs a few seconds", reload the page | Section 2 says "Passkey saved, account setup unfinished"; clicking **Create passkey account** finishes it **without** a new passkey prompt-to-create |
 | P4 | Click **Get 1,000 test USDC** | USDC 1000.0000 |
 | P5 | Section 3: **Sign in with: passkey**; Deposit **200** | Passkey prompt; then USDC 800, vault shares ~200; no XLM asked of you at any point |
 | P6 | Wait ~20-30 s, watch the overview | EURC sleeve "held" goes from 0 to a positive amount (keeper rebalanced to 85/15) |
 | P7 | Redeem **50** shares | Passkey prompt; shares drop by 50, USDC rises by ~50 |
-| P8 | Click **Forget this browser's account** | Section 2 says "no account in this browser yet" (the account still exists on chain) |
+| P8 | Click **Start over with a new passkey** | Section 2 says "no account in this browser yet" (the account still exists on chain) |
 
 ## W. Stellar wallet (you sign in your wallet and pay the XLM fee)
 
@@ -81,26 +81,6 @@ version). Then select **Constella local** as the active network. xBull also supp
 | C3 | **Unpause vault** | Overview "running"; deposits work again |
 | C4 | **List factory vaults** | "none yet" (factory vaults are created later in the product) |
 
-## E. Edge cases and refusals
-
-| # | Step | Expected |
-|---|---|---|
-| E1 | Deposit **more USDC than you hold** (e.g. 999999) | Status bar shows a failure; balances unchanged |
-| E2 | Deposit **0** or a negative amount | Failure; nothing changes |
-| E3 | Redeem **more shares than you hold** | Failure; nothing changes |
-| E4 | With **no account and no wallet**, click Deposit | Status: "create a passkey account first" (passkey mode) or "connect a Stellar wallet first" (wallet mode) |
-| E5 | Wallet mode, skip the trustline (fresh wallet), then Get test USDC | Failure (a classic account cannot hold USDC without a trustline) |
-| E6 | Passkey: start a deposit, then **cancel** the passkey prompt | Status shows a failure; nothing is charged, nothing changes |
-| E7 | Two different browsers (or a private window) | Each has its own passkey account; balances are separate |
-
-## S. Services working together (optional, terminal)
-
-| # | Step | Expected |
-|---|---|---|
-| S1 | `docker compose -f localnet/docker-compose.yml logs -f keeper` during P5/W6 | A `"rebalanced"` line after a deposit; `"settled"` after F4 |
-| S2 | `docker compose -f localnet/docker-compose.yml logs mailsink` after C2 (pause) | An email `ALERT: vault ... is PAUSED`; after C3 a `RESOLVED` email (within ~30 s) |
-| S3 | `curl localhost:8787/health` and `curl localhost:8790/health` | `{"ok": true, ...}` from both |
-
 ## Finish
 
 `localnet/down.sh` stops everything and forgets the local chain (the next `up.sh` starts fresh: create a
@@ -108,3 +88,10 @@ new passkey account then - your old one only existed on the old chain).
 
 Automated equivalents (run by the engineer): `npm test`, `npm run test:stack` (both identities on the
 live stack), `npm run test:browser` (headless Chromium with a virtual passkey).
+
+## Troubleshooting
+
+- **Phone says "no passkeys" when signing a deposit:** the account was created with a passkey that is not on
+  that phone (e.g. from an earlier unfinished attempt). Section 2 shows where the passkey is stored. Click
+  **Start over with a new passkey**, then create with **this device (Windows Hello)** - signing then happens
+  locally, no QR code.

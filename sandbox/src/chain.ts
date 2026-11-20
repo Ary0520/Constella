@@ -80,7 +80,8 @@ export class Chain {
   /** Zero-XLM user call: relayer prepares the auth entries, the PASSKEY signs
    * them in this browser, the relayer pays and submits. */
   async sponsored(account: Passkey, contract: string, fn: string, args: xdr.ScVal[],
-                  assert: (credentialId: string, challenge: Uint8Array) => Promise<Assertion> = getAssertion): Promise<any> {
+                  assert: (credentialId: string, challenge: Uint8Array) => Promise<Assertion> =
+                    (id, ch) => getAssertion(id, ch, account.transports ?? [])): Promise<any> {
     const func = funcB64(contract, fn, args);
     const { auth, latest_ledger } = await this.relayer("/prepare", { func });
     const rule = Number(await this.view(account.address, "get_owner_rule"));
@@ -96,7 +97,7 @@ export class Chain {
   }
 }
 
-export interface Passkey { credentialId: string; publicKey: Uint8Array; address: string }
+export interface Passkey { credentialId: string; publicKey: Uint8Array; address: string; attachment?: string; transports?: string[] }
 
 function contractCall(contract: string, fn: string, args: xdr.ScVal[]) {
   // The same host function the relayer receives.

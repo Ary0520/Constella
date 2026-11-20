@@ -94,9 +94,10 @@ function layout() {
 
   <section><h2>2. Passkey account (zero XLM; created by the relayer, A2)</h2>
     <div id="acct"></div>
-    <button id="create">Create passkey account</button>
+    <button id="create">Create with this device (Windows Hello / Touch ID)</button>
+    <button id="createPhone">Create with phone / security key</button>
     <button id="faucet">Get 1,000 test USDC</button>
-    <button id="forget">Forget this browser's account</button></section>
+    <button id="forget">Start over with a new passkey</button></section>
 
   <section><h2>2b. Stellar wallet (Freighter/Varial, xBull, LOBSTR, Albedo, Hana, ...)</h2>
     <p>A classic Stellar account: you sign in your wallet and pay the XLM network fee yourself. Same vault, same shares.</p>
@@ -137,7 +138,8 @@ function layout() {
     <button id="vaults">List factory vaults</button> <div id="vaultList"></div></section>`;
 
   $("refresh").onclick = () => refresh();
-  $("create").onclick = () => act("create passkey account", createAccount);
+  $("create").onclick = () => act("create passkey account", () => createAccount("platform"));
+  $("createPhone").onclick = () => act("create passkey account", () => createAccount("cross-platform"));
   $("faucet").onclick = () => act("faucet", async () => {
     const a = need();
     return chain.invokeAs("issuer", cfg.assets.USDC, "mint", [sv.addr(a.address), sv.i128(1_000n * ONE)]);
@@ -179,14 +181,15 @@ function need(): Passkey {
   return a;
 }
 
-async function createAccount() {
+async function createAccount(where: "platform" | "cross-platform") {
   const existing = loadAccount();
   if (existing && !existing.address) return finishSetup(existing);
-  const pk = await createPasskey(`constella-${Date.now()}`);
+  if (existing) throw new Error("this browser already has an account - use 'Start over with a new passkey' first");
+  const pk = await createPasskey(`constella-${Date.now()}`, where);
   // Save the passkey BEFORE asking the relayer: if the page reloads or the
   // request is interrupted, "Finish setup" retries (creation is idempotent:
   // the address is derived from the key). First real-browser test lost it.
-  const pending: Passkey = { credentialId: pk.id, publicKey: pk.publicKey, address: "" };
+  const pending: Passkey = { credentialId: pk.id, publicKey: pk.publicKey, address: "", attachment: pk.attachment, transports: pk.transports };
   saveAccount(pending);
   return finishSetup(pending);
 }
@@ -248,14 +251,16 @@ async function refresh() {
 
     const a = loadAccount();
     if (a && !a.address) {
-      $("acct").innerHTML = `<b>Passkey saved, account setup unfinished.</b> Click "Create passkey account" to finish (no new passkey is created).`;
+      $("acct").innerHTML = `<b>Passkey saved, account setup unfinished.</b> Click either Create button to finish (no new passkey is created), or "Start over with a new passkey".`;
       $("claims").textContent = "";
     } else if (a) {
       const [usdc, shares, claim] = await Promise.all([
         chain.view(cfg.assets.USDC, "balance", [sv.addr(a.address)]), chain.view(c.vault, "balance", [sv.addr(a.address)]),
         chain.view(c.vault, "get_claim", [sv.addr(a.address), sv.addr(cfg.assets.EURC)]),
       ]);
-      $("acct").innerHTML = `<div class="mono">account ${a.address}</div><div>USDC ${fmt(usdc)} · vault shares ${fmt(shares)} · XLM: none needed</div>`;
+      const where = a.attachment === "platform" ? "this device (Windows Hello / Touch ID)" : a.attachment === "cross-platform" ? "a phone or security key" : "unknown (created before this was recorded)";
+      $("acct").innerHTML = `<div class="mono">account ${a.address}</div><div>USDC ${fmt(usdc)} · vault shares ${fmt(shares)} · XLM: none needed</div>
+        <div>passkey stored on: <b>${where}</b>${a.transports?.length ? ` (${a.transports.join(", ")})` : ""} - signing needs that same passkey</div>`;
       $("claims").innerHTML = `open EURC claim for this account: <b>${fmt(claim)}</b> units ${BigInt(claim) > 0n ? "(the keeper settles it once EURC is priced again)" : ""}`;
     } else {
       $("acct").textContent = "no account in this browser yet";

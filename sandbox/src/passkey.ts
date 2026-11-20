@@ -104,29 +104,39 @@ export function attachSignature(input: ReturnType<typeof signingInput>, verifier
 // ----------------------------------------------------------- WebAuthn (browser)
 const b64u = (b: Uint8Array) => btoa(String.fromCharCode(...b)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
-/** Register a platform passkey; returns its id and 65-byte uncompressed P-256 key. */
-export async function createPasskey(name: string): Promise<{ id: string; publicKey: Uint8Array }> {
+export type Where = "platform" | "cross-platform";
+
+/** Register a passkey on THIS device (Windows Hello / Touch ID) or on a phone
+ * / security key. Returns its id, 65-byte uncompressed P-256 key, where it
+ * lives and its transports (so signing asks only that authenticator). */
+export async function createPasskey(name: string, where: Where = "platform"):
+    Promise<{ id: string; publicKey: Uint8Array; attachment: string; transports: string[] }> {
   const cred = (await navigator.credentials.create({
     publicKey: {
       challenge: crypto.getRandomValues(new Uint8Array(32)),
       rp: { name: "Constella sandbox", id: location.hostname },
       user: { id: crypto.getRandomValues(new Uint8Array(16)), name, displayName: name },
       pubKeyCredParams: [{ type: "public-key", alg: -7 }], // ES256 = P-256
-      authenticatorSelection: { userVerification: "required", residentKey: "preferred" },
+      authenticatorSelection: { userVerification: "required", residentKey: "preferred", authenticatorAttachment: where },
     },
   })) as PublicKeyCredential;
   const resp = cred.response as AuthenticatorAttestationResponse;
   const spki = new Uint8Array(resp.getPublicKey()!); // SubjectPublicKeyInfo: last 65 bytes = 0x04||X||Y
   const publicKey = spki.slice(spki.length - 65);
   if (publicKey[0] !== 0x04) throw new Error("unexpected public key format");
-  return { id: b64u(new Uint8Array(cred.rawId)), publicKey };
+  const transports = typeof resp.getTransports === "function" ? resp.getTransports() : [];
+  return { id: b64u(new Uint8Array(cred.rawId)), publicKey, attachment: (cred as any).authenticatorAttachment ?? where, transports };
 }
 
 /** Ask the passkey to sign `challenge` (user present + verified). */
-export async function getAssertion(credentialId: string, challenge: Uint8Array): Promise<Assertion> {
+export async function getAssertion(credentialId: string, challenge: Uint8Array, transports: string[] = []): Promise<Assertion> {
   const raw = Uint8Array.from(atob(credentialId.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
+  // Transports recorded at creation route the request to the RIGHT device
+  // (e.g. "internal" = Windows Hello, no phone QR code).
+  const allow: any = { type: "public-key", id: raw };
+  if (transports.length) allow.transports = transports;
   const cred = (await navigator.credentials.get({
-    publicKey: { challenge, allowCredentials: [{ type: "public-key", id: raw }], userVerification: "required", rpId: location.hostname },
+    publicKey: { challenge, allowCredentials: [allow], userVerification: "required", rpId: location.hostname },
   })) as PublicKeyCredential;
   const r = cred.response as AuthenticatorAssertionResponse;
   return { authenticatorData: new Uint8Array(r.authenticatorData), clientDataJSON: new Uint8Array(r.clientDataJSON), signature: new Uint8Array(r.signature) };
