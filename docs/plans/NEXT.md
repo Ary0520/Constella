@@ -18,7 +18,7 @@ every thesis becomes the same basket, and a drafted policy cannot become the use
 
 | # | Step | Why now | Done when |
 |---|---|---|---|
-| 1 | Fix OPEN-ISSUES #1 (device rule can reach recovery) and #3 (policy hash: placeholder admin, band 500 vs 200) | Safety and correctness; small | Red tests pass; hash == exact on-chain terms |
+| 1 | ✅ DONE 24 Nov: OPEN-ISSUES #1 (device rule can reach recovery) and #3 (policy hash) fixed, live on testnet API/console; factory WASM activation due 25 Nov 19:01 UTC | Safety and correctness; small | Red tests pass; hash == exact on-chain terms |
 | 2 | Fee model (owner decision pending): per-vault fee cap in the contract, tiers from the founding doc | Contract change; easier before more vaults exist | Fee = min(profit share above HWM, tier cap x AUM x time); cap per vault, hard ceiling enforced |
 | 3 | **Thesis -> your own vault, end to end**: draft -> review -> passkey signs -> factory creates a private vault -> `bind_policy` with the user as owner -> deposit | Makes the AI do real work; the first "it's Constella" moment | On testnet, a typed thesis produces a live vault the user owns, enforcing that thesis |
 | 4 | **Real thesis-driven optimiser**: profiles out, constraints from the thesis (currency split, liquidity floor, issuer caps, liquidity tiers), HRP default, over every active registry asset | The founding doc's core | Different theses give different, explained baskets; infeasible ones say why |
@@ -32,4 +32,5 @@ every thesis becomes the same basket, and a drafted policy cannot become the use
 ## Mainnet track (after the above)
 External audit; multisig admin (threshold policy) + KMS keys; SEP-57 gated share class + KYC reuse
 (needed for BENJI, USDY, Spiko); issuer mint/redeem adapters; indexing and treasury reporting; partner
-SDK (W-addresses after Bell); watchdog email; capped mainnet beta.
+SDK (W-addresses: Bell passed 23 Nov 2026 - test a W destination against our sdk-28 vault first); ML-DSA admin
+verifier once soroban-sdk 30 is stable; watchdog email; capped mainnet beta. See RESEARCH-UPDATES section 1.

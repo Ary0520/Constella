@@ -1,7 +1,7 @@
 # Living Research & Ecosystem Updates Log
 
 > Tracked intelligence and ecosystem changes occurring after the foundational research document (dated 30 October 2026). All agents must check here for current figures.  
-> **Last Verified:** 15 November 2026
+> **Last Verified:** 24 November 2026 (Bell section); 15 November 2026 (others)
 
 ---
 
@@ -11,12 +11,19 @@
 |---|---|---|---|
 | Core v30.0.0 Release | 16 Oct 2026 | ✅ Complete | Includes CAP-84, CAP-87, CAP-88 |
 | Testnet Upgrade Vote | 03 Nov 2026, 17:00 UTC | ✅ Passed | Testnet successfully running Protocol 30 |
-| **Mainnet Upgrade Vote** | **23 Nov 2026, 17:00 UTC** | ⏳ **PENDING (9 days)** | Validator coordination underway |
+| **Mainnet Upgrade Vote** | **23 Nov 2026, 17:00 UTC** | ✅ **Passed** | Mainnet ledger 65633432 closed 17:00:06Z on protocol 30 (Horizon: core 30.0.0). Testnet switched at ledger 5540313, 3 Nov 17:00:05Z. Verified from ledger data 23 Nov; no SDF announcement yet at that time |
 
-### Impact on Constella Build
-- v1 core implementation remains strictly decoupled from Bell.
-- Client SDKs (`@stellar/stellar-sdk`) and contract crates (`soroban-sdk`) must be updated to v30-compatible builds immediately to prevent parsing errors when CAP-88 millisecond timestamps go live.
-- W-Address omnibus accounts and ML-DSA signature support are scheduled as additive Phase 2 modules following the Nov 23 vote.
+### What Protocol 30 changed (verified 24 Nov 2026)
+- **CAP-84 W-addresses (muxed contract accounts):** new `SCAddress` arm = contract id + u64 id. Valid only as a transfer DESTINATION (SAC `transfer` `to`; not `mint`, not `transfer_from`, never a source, never a storage key, rejected where a plain `Address` is expected). Events carry the C address plus `to_muxed_id`. OZ 0.8.0 fungible `transfer` already takes `MuxedAddress` and our vault emits `to_muxed_id` (MuxedTransfer).
+- **CAP-87 ML-DSA:** host fns `verify_sig_ml_dsa_44/65/87` (FIPS 204 pure form, context string 0-255 B); soroban-sdk 30 `env.crypto().ml_dsa_44_verify(...)`. Keys 1312/1952/2592 B, signatures 2420/3309/4627 B. Transaction envelopes stay Ed25519.
+- **CAP-88 millisecond close time:** ledger header change; Soroban `ledger_timestamp` stays in seconds.
+- Sources: stellar.org/blog/developers/bell-protocol-30-upgrade-guide; stellar/stellar-protocol core CAPs; Horizon mainnet/testnet ledgers.
+
+### Impact on Constella Build (24 Nov 2026)
+- **Nothing breaks:** contracts built with soroban-sdk 28 keep running; our clients are already P30-ready: `@stellar/stellar-sdk` 17.4.0 (W support needs >= 17.3.0; Wallets Kit 2.8.0 dedupes to 17.4.0), Python `stellar-sdk` 17.0.1, stellar-cli 30.0.1.
+- **soroban-sdk 30 is still rc** (30.0.0-rc.1, 21 Oct) - needed only to call ML-DSA. OpenZeppelin stellar-contracts has no release after 0.8.0 and no ML-DSA verifier.
+- **W-address partner omnibus** (founding doc 4.8): additive Phase 2 module; first a testnet test that our sdk-28 vault credits a W destination correctly (unverified).
+- **ML-DSA admin keys for treasury vaults** (founding doc 4.8): needs our own verifier contract on soroban-sdk 30 stable; signatures 2.4-4.6 KB raise resource fees. Planned for the mainnet track.
 
 ---
 
