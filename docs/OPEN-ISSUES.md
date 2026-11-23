@@ -5,6 +5,9 @@ open until a fix is merged **and** a test proves it. Keep this list current; del
 entry only in the commit that fixes it.
 
 Fixed: #1 (device rule could propose a recovery) - 24 Nov 2026, smart-account `RecoveryRequiresRecoveryRule`.
+**Pending rollout:** testnet account factory has the fixed WASM `284b9a9e…` proposed; run
+`python testnet/account_wasm.py activate` after 2026-11-25 19:01 UTC. Accounts created before then keep the old
+WASM (no upgrade path by design) - on mainnet every account will be created with the fixed code.
 
 | # | Severity | Issue | Where | Done when |
 |---|---|---|---|---|
