@@ -9,9 +9,11 @@
 //! sign in on its own later (even after its browser data is cleared).
 //!
 //! The account's own guard (audit S4) keeps account management on the OWNER
-//! rule: an added device can deposit / redeem / withdraw, but cannot add or
-//! remove devices or change the owner - a lost secondary device cannot lock
-//! the owner out. Only accounts deployed by the Constella account factory can
+//! rule: an added device can deposit / redeem / withdraw / transfer (its rule
+//! is `Default` scope, so it has full spending power), but cannot add or
+//! remove devices, change the owner, or propose a recovery (only the guardian
+//! rule scoped to the account may; OPEN-ISSUES #1, fixed 24 Nov 2026) - a lost
+//! secondary device cannot lock the owner out. Only accounts deployed by the Constella account factory can
 //! register devices, and a key that already owns an account (or is already a
 //! device) is refused, so lookups are unambiguous.
 
