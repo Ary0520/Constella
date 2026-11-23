@@ -100,6 +100,10 @@ pub enum AccError {
     RecoveryNotReady = 7,
     /// The proposed key already belongs to the owner rule.
     AlreadyOwner = 8,
+    /// Only a rule scoped to this account (the guardian recovery rule,
+    /// `CallContract(self)`) may propose a recovery; a `Default` rule such as
+    /// a device rule may not (OPEN-ISSUES #1).
+    RecoveryRequiresRecoveryRule = 9,
 }
 
 #[contracttype]
@@ -166,14 +170,27 @@ impl CustomAccountInterface for SmartAccountContract {
         // Audit S4: a call to this account's own functions authorized under
         // any rule other than the owner rule may only propose a recovery.
         // (do_check_auth has already checked one rule id per context.)
+        //
+        // OPEN-ISSUES #1: and only a rule scoped to THIS account (the guardian
+        // recovery rule, `CallContract(self)`) may propose it. OpenZeppelin
+        // lets a `Default` rule authorize any context, so without this check a
+        // device rule (Default, added by the device registry) could start a
+        // takeover of the owner key.
         let me = e.current_contract_address();
         let owner = owner_rule_id(&e);
         let propose = Symbol::new(&e, "propose_recovery");
+        let recovery_scope = ContextRuleType::CallContract(me.clone());
         for (i, context) in auth_contexts.iter().enumerate() {
             if let Context::Contract(ContractContext { contract, fn_name, .. }) = context {
                 let rule_id = signatures.context_rule_ids.get_unchecked(i as u32);
-                if contract == me && rule_id != owner && fn_name != propose {
+                if contract != me || rule_id == owner {
+                    continue;
+                }
+                if fn_name != propose {
                     panic_with_error!(&e, AccError::ManagementRequiresOwner);
+                }
+                if oz::get_context_rule(&e, rule_id).context_type != recovery_scope {
+                    panic_with_error!(&e, AccError::RecoveryRequiresRecoveryRule);
                 }
             }
         }
