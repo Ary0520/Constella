@@ -1,13 +1,25 @@
 """
 Thesis Engine Step 6: Sign (signer.py)
-Assembles canonical policy specifications, performs deterministic RFC 8785 canonical
-JSON serialization, and computes the 32-byte SHA-256 hash for Soroban on-chain anchoring.
+Assembles the canonical policy, serializes it as canonical JSON and computes the
+32-byte SHA-256 hash anchored on chain by `bind_policy`.
+
+OPEN-ISSUES #3 (fixed 24 Nov 2026):
+* the policy names the REAL owner - the account that signs `register_policy`
+  (a G account or a C smart account; never a placeholder, never a muxed W
+  address, which cannot sign);
+* the on-chain `bind_policy` terms are derived from the canonical policy
+  (`onchain_terms`), so what is hashed is exactly what is enforced;
+* canonical JSON is RFC 8785 (JCS) compatible because floats are refused: for
+  integers, strings, booleans and null with ASCII keys, sorted keys plus
+  compact separators produce the JCS serialization.
 """
 
 from datetime import datetime, timezone
 import hashlib
 import json
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+from stellar_sdk import StrKey
 
 from src.models import (
     AssetCandidate,
@@ -23,12 +35,27 @@ from src.models import (
 )
 
 
+# Execution limits written into every policy (and enforced on chain from it).
+MAX_SLIPPAGE_BPS = 50
+REBALANCE_BAND_BPS = 200
+
+
+def validate_owner(address: str) -> str:
+    """A policy owner must be able to sign: a G account or a C contract account."""
+    if not isinstance(address, str) or not (
+        StrKey.is_valid_ed25519_public_key(address) or StrKey.is_valid_contract(address)
+    ):
+        raise ValueError(f"invalid policy owner address: {address!r}")
+    return address
+
+
 def assemble_canonical_policy(
     policy_draft: PolicyDraft,
     opt_result: OptimizationResult,
     candidates: List[AssetCandidate],
     basket_name: str = "cRUNWAY",
-    admin_address: str = "GBADMIN1234567890",
+    *,
+    owner: str,
     multisig_signers: Optional[List[str]] = None,
     multisig_threshold: int = 1,
     numeraire: str = "USDC",
@@ -79,8 +106,8 @@ def assemble_canonical_policy(
         max_issuer_weight_bps=int(round(policy_draft.max_issuer_weight * 10000)),
         max_single_asset_weight_bps=int(round(policy_draft.max_single_asset_weight * 10000)),
         min_liquidity_sleeve_bps=int(round(policy_draft.min_liquidity_sleeve * 10000)),
-        max_slippage_bps=50,
-        rebalance_band_bps=500,
+        max_slippage_bps=MAX_SLIPPAGE_BPS,
+        rebalance_band_bps=REBALANCE_BAND_BPS,
     )
 
     eligibility = CanonicalEligibility(
@@ -89,9 +116,10 @@ def assemble_canonical_policy(
         share_class="open",
     )
 
-    signers = multisig_signers if multisig_signers is not None else [admin_address]
+    validate_owner(owner)
+    signers = [validate_owner(a) for a in multisig_signers] if multisig_signers is not None else [owner]
     admin = CanonicalAdmin(
-        admin_address=admin_address,
+        admin_address=owner,
         multisig_threshold=multisig_threshold,
         multisig_signers=signers,
     )
@@ -111,14 +139,38 @@ def assemble_canonical_policy(
     return CanonicalPolicy(**policy_kwargs)
 
 
+def onchain_terms(policy: CanonicalPolicy) -> Dict:
+    """The exact `bind_policy` arguments enforced on chain for this policy."""
+    c = policy.constraints
+    sleeves = [{"asset_id": s.asset_id, "target_weight_bps": s.target_weight_bps,
+                "min_band_bps": max(0, s.target_weight_bps - s.band_bps),
+                "max_band_bps": min(10_000, s.target_weight_bps + s.band_bps), "sleeve_type": s.sleeve_type}
+               for s in policy.sleeves]
+    return {"min_liquidity_sleeve_bps": c.min_liquidity_sleeve_bps, "max_single_asset_bps": c.max_single_asset_weight_bps,
+            "max_issuer_bps": c.max_issuer_weight_bps, "max_slippage_bps": c.max_slippage_bps,
+            "rebalance_band_bps": c.rebalance_band_bps, "sleeves": sleeves}
+
+
+def _jcs_safe(value, path: str = "$") -> None:
+    if isinstance(value, float):
+        raise ValueError(f"canonical policy must not contain floats ({path})")
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if not isinstance(k, str) or not k.isascii():
+                raise ValueError(f"canonical policy keys must be ASCII strings ({path})")
+            _jcs_safe(v, f"{path}.{k}")
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            _jcs_safe(v, f"{path}[{i}]")
+
+
 def to_canonical_json(policy: CanonicalPolicy) -> str:
     """
-    Serializes a CanonicalPolicy object into deterministic RFC 8785 canonical JSON:
-    - Lexicographically sorted keys at all nested levels
-    - Compact separators (',', ':') with no whitespace
-    - Deterministic UTF-8 string encoding
+    Canonical JSON (RFC 8785 compatible, see module doc): sorted keys at every
+    level, compact separators, UTF-8, and no floats (refused, never rounded).
     """
-    data = policy.model_dump(mode="json")
+    data = policy.model_dump(mode="json", warnings=False)
+    _jcs_safe(data)
     return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 

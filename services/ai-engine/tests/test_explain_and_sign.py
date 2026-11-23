@@ -139,9 +139,9 @@ def test_t16_canonical_json_determinism():
     )
 
     admin = CanonicalAdmin(
-        admin_address="GBADMIN1234567890",
+        admin_address="GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
         multisig_threshold=2,
-        multisig_signers=["GBADMIN1234567890", "GBSIGNER21234567890"],
+        multisig_signers=["GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR", "GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U"],
     )
 
     policy = CanonicalPolicy(
@@ -196,8 +196,8 @@ def test_t17_policy_hash_bytes_and_hex():
         opt_result=opt_result,
         candidates=candidates,
         basket_name="cSAFE",
-        admin_address="GBADMINTEST1234567890",
-        multisig_signers=["GBADMINTEST1234567890"],
+        owner="GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+        multisig_signers=["GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"],
         multisig_threshold=1,
     )
 
@@ -249,8 +249,8 @@ def test_t18_full_pipeline_end_to_end():
         opt_result=opt_result,
         candidates=candidates,
         basket_name="cDAO_RUNWAY",
-        admin_address="GBDAOADMIN1234567890",
-        multisig_signers=["GBDAOADMIN1234567890", "GBDAOSIGNER21234567890"],
+        owner="GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR",
+        multisig_signers=["GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR", "GCATS5YOVB6ROX2WUNKGNQ2MP3GMXDMKSG2O4N5CLX3A6W4PZGZZI55U"],
         multisig_threshold=2,
     )
     envelope = prepare_signing_envelope(canonical)
@@ -349,8 +349,8 @@ def test_t20_canonical_policy_sleeve_sorting_determinism():
         algorithm_used="HRP",
     )
 
-    p1 = assemble_canonical_policy(policy_draft, opt_result_1, candidates, created_at="2026-11-14T00:00:00Z")
-    p2 = assemble_canonical_policy(policy_draft, opt_result_2, candidates, created_at="2026-11-14T00:00:00Z")
+    p1 = assemble_canonical_policy(policy_draft, opt_result_1, candidates, owner="GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR", created_at="2026-11-14T00:00:00Z")
+    p2 = assemble_canonical_policy(policy_draft, opt_result_2, candidates, owner="GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR", created_at="2026-11-14T00:00:00Z")
 
     assert to_canonical_json(p1) == to_canonical_json(p2)
     assert [s.asset_id for s in p1.sleeves] == ["FRANKLIN_BENJI", "SPIKO_USD", "USDC"]

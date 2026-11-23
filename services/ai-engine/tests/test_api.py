@@ -32,8 +32,10 @@ def call(base, path, body=None):
 
 def test_a_thesis_becomes_a_signed_policy_with_exact_on_chain_terms(base):
     status, out, headers = call(base, "/thesis", {"text": "Keep a safe runway in dollars, at least 10% instant cash.",
-                                                  "jurisdiction": "DE", "investor_class": "retail"})
+                                                  "jurisdiction": "DE", "investor_class": "retail",
+                                                  "owner": "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"})
     assert status == 200, out
+    assert out["signable"] is True and out["policy"]["admin"]["admin_address"] == "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
     assert headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
     alloc = out["allocation"]
     assert alloc["profile"] == "cash_reserve" and alloc["numeraire"] == "USDC"

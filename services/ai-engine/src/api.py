@@ -2,9 +2,10 @@
 HTTP API for the thesis engine (used by the sandbox console and, later, the
 real frontend). stdlib only.
 
-  POST /thesis   {"text", "jurisdiction", "investor_class", "use_llm"?}
+  POST /thesis   {"text", "jurisdiction", "investor_class", "owner"?, "use_llm"?}
        -> draft, allocation, simulation, explanation (+ optional AI summary),
-          canonical policy + hash, and the exact on-chain bind_policy terms.
+          the exact on-chain bind_policy terms, and - only when `owner` (the
+          signing G/C address) is given - the canonical policy + its hash.
           422 {"error": "INFEASIBLE", "reasons", "nearest"?} when the rules
           cannot all hold (the optimizer fails closed).
   GET  /registry?jurisdiction=..&investor_class=..  -> assets + why not eligible
@@ -31,27 +32,14 @@ from src.explainer import generate_explanation
 from src.optimizer import InfeasibleAllocation, optimize_portfolio
 from src.parser import parse_thesis
 from src.retriever import AssetRegistry, retrieve_candidates
-from src.signer import assemble_canonical_policy, compute_policy_hash
+from src.signer import assemble_canonical_policy, compute_policy_hash, onchain_terms, validate_owner
 from src.simulator import simulate_portfolio
 
 MAX_BODY = 16 * 1024
-DEFAULT_SLIPPAGE_BPS = 50
-DEFAULT_REBALANCE_BAND_BPS = 200
 
 
-def bind_terms(draft, canonical, numeraire: str) -> Dict:
-    """The on-chain bind_policy arguments matching the signed policy."""
-    sleeves = []
-    for s in canonical.sleeves:
-        kind = "numeraire" if s.asset_id == numeraire else s.sleeve_type
-        sleeves.append({"asset_id": s.asset_id, "target_weight_bps": s.target_weight_bps,
-                        "min_band_bps": max(0, s.target_weight_bps - s.band_bps),
-                        "max_band_bps": min(10_000, s.target_weight_bps + s.band_bps), "sleeve_type": kind})
-    return {"min_liquidity_sleeve_bps": round(draft.min_liquidity_sleeve * 10_000),
-            "max_single_asset_bps": round(draft.max_single_asset_weight * 10_000),
-            "max_issuer_bps": round(draft.max_issuer_weight * 10_000),
-            "max_slippage_bps": DEFAULT_SLIPPAGE_BPS, "rebalance_band_bps": DEFAULT_REBALANCE_BAND_BPS,
-            "sleeves": sleeves}
+# Only used to derive preview terms; never hashed or returned (see Engine.thesis).
+_PREVIEW_OWNER = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 
 
 class Engine:
@@ -76,6 +64,12 @@ class Engine:
         text = body.get("text")
         if not isinstance(text, str) or not text.strip() or len(text) > 4000:
             return 400, {"error": "INVALID_TEXT", "detail": "1-4000 characters"}
+        owner = body.get("owner")
+        if owner is not None:
+            try:
+                validate_owner(owner)
+            except ValueError:
+                return 400, {"error": "INVALID_OWNER", "detail": "a G account or C smart-account address"}
         jur = str(body.get("jurisdiction", "")).strip()
         cls = str(body.get("investor_class", "retail")).strip()
         if not jur:
@@ -103,13 +97,16 @@ class Engine:
         if body.get("use_llm") and self.llm_factory:
             from src.thesis_llm import explain_llm
             summary, ai_note = explain_llm(draft, opt, exp, cands, self.llm_factory())
-        canonical = assemble_canonical_policy(draft, opt, cands)
-        hex_hash, _ = compute_policy_hash(canonical)
+        # OPEN-ISSUES #3: the hash commits to the real owner and to exactly the
+        # terms enforced on chain. Without an owner the response is a preview:
+        # the same terms, but no signable hash.
+        canonical = assemble_canonical_policy(draft, opt, cands, owner=owner or _PREVIEW_OWNER)
+        hex_hash = compute_policy_hash(canonical)[0] if owner else None
         return 200, {
             "parse_source": source, "ai_note": ai_note, "draft": draft.model_dump(), "allocation": opt.model_dump(),
             "simulation": sim.model_dump(), "explanation": exp.model_dump(), "ai_summary": summary,
-            "policy": json.loads(canonical.model_dump_json()), "policy_hash": hex_hash,
-            "bind_policy": bind_terms(draft, canonical, opt.numeraire),
+            "policy": json.loads(canonical.model_dump_json()) if owner else None, "policy_hash": hex_hash,
+            "signable": bool(owner), "bind_policy": onchain_terms(canonical),
             "ineligible": reg.eligibility(jur, cls),
         }
 

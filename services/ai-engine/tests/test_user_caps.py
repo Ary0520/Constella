@@ -79,7 +79,7 @@ def test_the_users_caps_reach_the_policy_they_sign():
     thesis = "Safe runway: 10% instant liquidity, max 20% per issuer, no single asset above 15%, rest in dollar t-bills."
     p = parse_thesis(thesis, jurisdiction="EU", investor_class="professional")
     cands = retrieve_candidates(p, fixture_registry())
-    signed = assemble_canonical_policy(p, optimize_portfolio(p, cands), cands, created_at="2026-11-17T00:00:00Z")
+    signed = assemble_canonical_policy(p, optimize_portfolio(p, cands), cands, owner="GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR", created_at="2026-11-17T00:00:00Z")
     assert signed.constraints.max_issuer_weight_bps == 2000
     assert signed.constraints.max_single_asset_weight_bps == 1500
 

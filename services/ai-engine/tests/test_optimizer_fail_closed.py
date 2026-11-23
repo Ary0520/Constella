@@ -131,7 +131,7 @@ def test_the_signed_policy_declares_the_vault_currency_for_the_chain():
     p = retail(currency_exposure={})
     c = cands(p)
     r = optimize_portfolio(p, c)
-    signed = assemble_canonical_policy(p, r, c, created_at="2026-11-17T00:00:00Z")
+    signed = assemble_canonical_policy(p, r, c, owner="GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR", created_at="2026-11-17T00:00:00Z")
     kinds = {s.asset_id: s.sleeve_type for s in signed.sleeves}
     assert kinds["USDC"] == "numeraire"
     assert all(k != "numeraire" for a, k in kinds.items() if a != "USDC")
@@ -144,4 +144,4 @@ def test_the_signer_refuses_assets_outside_the_candidates():
     r = optimize_portfolio(p, c)
     r.weights_bps = {**r.weights_bps, "FRANKLIN_BENJI": 1}
     with pytest.raises(ValueError):
-        assemble_canonical_policy(p, r, c, created_at="2026-11-17T00:00:00Z")
+        assemble_canonical_policy(p, r, c, owner="GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR", created_at="2026-11-17T00:00:00Z")
