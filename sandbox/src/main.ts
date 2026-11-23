@@ -353,8 +353,13 @@ async function finishSetup(a: Passkey) {
 }
 
 async function runThesis() {
+  // OPEN-ISSUES #3: the policy hash commits to the account that will sign it
+  // (passkey smart account, else the connected wallet); without one the API
+  // returns a preview with no signable hash.
+  const owner = loadAccount()?.address ?? wallet?.address;
   const body = { text: $<HTMLTextAreaElement>("thesis").value, jurisdiction: $<HTMLInputElement>("jur").value,
-                 investor_class: $<HTMLSelectElement>("cls").value, use_llm: $<HTMLInputElement>("llm").checked };
+                 investor_class: $<HTMLSelectElement>("cls").value, use_llm: $<HTMLInputElement>("llm").checked,
+                 ...(owner ? { owner } : {}) };
   const { status, out } = await thesis(cfg, body);
   if (status !== 200) {
     $("thesisOut").innerHTML = `<p><b>${out.error}</b></p><pre>${JSON.stringify(out.reasons ?? out, null, 1)}</pre>`;
@@ -369,7 +374,8 @@ async function runThesis() {
     ${out.ai_summary ? `<p><b>AI summary:</b> ${out.ai_summary.summary}</p>` : ""}
     <p><b>Warnings:</b> ${(out.explanation.issuer_concentration_warnings as string[]).join("<br>") || "none"}</p>
     <p><b>Needs your confirmation:</b> ${(out.explanation.ambiguity_clarifications as string[]).join("<br>") || "nothing"}</p>
-    <p>policy hash <span class="mono">${out.policy_hash}</span></p>
+    <p>${out.signable ? `policy hash for <span class="mono">${out.policy.admin.admin_address}</span>: <span class="mono">${out.policy_hash}</span>`
+                      : "<i>Preview only: create or connect an account to get a policy you can sign.</i>"}</p>
     <details><summary>exact on-chain bind_policy terms</summary><pre>${JSON.stringify(out.bind_policy, null, 1)}</pre></details>
     <details><summary>not eligible for this user</summary><pre>${JSON.stringify(out.ineligible, null, 1)}</pre></details>`;
   return out.policy_hash;
