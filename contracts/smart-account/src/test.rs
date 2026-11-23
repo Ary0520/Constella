@@ -944,3 +944,87 @@ fn f1_auth_digest_vectors_match_the_python_client() {
     let d2 = AuthDigestPreimage { account, signature_payload: payload, context_rule_ids: vec![&env, 3u32] }.digest(&env);
     assert_eq!(hex(d2), "d506511b29a2196dba8d9145cfa66841c45e54ba8a9298e5683a608cb008859b");
 }
+
+// -------------------------------------------------------------------------
+// OPEN-ISSUES #1: a device rule (Default scope, added by the device registry)
+// must not be able to start a recovery. Only a rule scoped to this account
+// (CallContract(self), the guardian recovery rule) may propose one.
+// -------------------------------------------------------------------------
+mod device_recovery {
+    use super::*;
+
+    /// What `constella-device-registry::add_device` installs: a Default rule
+    /// with one external passkey signer and no policies.
+    fn add_device_rule(a: &Acct, device: &KeyPair) -> u32 {
+        let env = &a.env;
+        let signers = vec![env, ext(env, &a.verifier, device)];
+        let policies: Map<Address, Val> = Map::new(env);
+        let name = String::from_str(env, "phone");
+        sign_self_call(a, &[&a.owner], a.owner_rule, "add_context_rule",
+            (ContextRuleType::Default, name.clone(), None::<u32>, signers.clone(), policies.clone()).into_val(env));
+        a.client.add_context_rule(&ContextRuleType::Default, &name, &None, &signers, &policies).id
+    }
+
+    #[test]
+    fn a_device_rule_cannot_propose_a_recovery() {
+        let a = deploy();
+        let env = &a.env;
+        let device = generate_keypair(env);
+        let rule = add_device_rule(&a, &device);
+        let thief_key = ext(env, &a.verifier, &generate_keypair(env));
+
+        // Real __check_auth on the bare context.
+        let p = payload(env, b"device-recovery");
+        let r = check(&a, &p, auth_payload(&a, &p, &[rule], &[&device]), vec![env, call_ctx(env, &a.id, "propose_recovery")]);
+        assert!(r.is_err(), "a device rule authorized propose_recovery");
+
+        // Real signed entry, end to end: nothing becomes pending.
+        sign_self_call(&a, &[&device], rule, "propose_recovery", (thief_key.clone(),).into_val(env));
+        assert!(a.client.try_propose_recovery(&thief_key).is_err());
+        assert!(a.client.get_pending_recovery().is_none());
+    }
+
+    #[test]
+    fn a_default_rule_with_a_threshold_policy_cannot_propose_either() {
+        // The scope, not the number of signers, decides: a Default M-of-N rule
+        // is a spending rule, not a recovery rule.
+        let a = deploy();
+        let env = &a.env;
+        let (d1, d2) = (generate_keypair(env), generate_keypair(env));
+        let signers = vec![env, ext(env, &a.verifier, &d1), ext(env, &a.verifier, &d2)];
+        let mut policies: Map<Address, Val> = Map::new(env);
+        policies.set(a.policy.clone(), SimpleThresholdAccountParams { threshold: 2 }.into_val(env));
+        let name = String::from_str(env, "two-devices");
+        sign_self_call(&a, &[&a.owner], a.owner_rule, "add_context_rule",
+            (ContextRuleType::Default, name.clone(), None::<u32>, signers.clone(), policies.clone()).into_val(env));
+        let rule = a.client.add_context_rule(&ContextRuleType::Default, &name, &None, &signers, &policies).id;
+        let p = payload(env, b"default-mofn");
+        let r = check(&a, &p, auth_payload(&a, &p, &[rule], &[&d1, &d2]), vec![env, call_ctx(env, &a.id, "propose_recovery")]);
+        assert!(r.is_err(), "a Default M-of-N rule authorized propose_recovery");
+    }
+
+    #[test]
+    fn a_device_rule_still_cannot_manage_the_account() {
+        let a = deploy();
+        let env = &a.env;
+        let device = generate_keypair(env);
+        let rule = add_device_rule(&a, &device);
+        let p = payload(env, b"device-manage");
+        for f in ["add_signer", "remove_signer", "add_context_rule", "remove_context_rule", "cancel_recovery", "execute_recovery"] {
+            let r = check(&a, &p, auth_payload(&a, &p, &[rule], &[&device]), vec![env, call_ctx(env, &a.id, f)]);
+            assert!(r.is_err(), "a device rule authorized `{f}`");
+        }
+    }
+
+    #[test]
+    fn the_guardian_recovery_rule_can_still_propose() {
+        let a = deploy();
+        let env = &a.env;
+        let (g1, g2) = (generate_keypair(env), generate_keypair(env));
+        let rec = add_recovery(&a, &[&g1, &g2], 2);
+        let new_owner = ext(env, &a.verifier, &generate_keypair(env));
+        sign_self_call(&a, &[&g1, &g2], rec, "propose_recovery", (new_owner.clone(),).into_val(env));
+        a.client.propose_recovery(&new_owner);
+        assert_eq!(a.client.get_pending_recovery().unwrap().new_owner, new_owner);
+    }
+}
