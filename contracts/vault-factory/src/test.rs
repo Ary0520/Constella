@@ -514,3 +514,62 @@ mod with_policy {
         assert!(b.memory_bytes_cost() < 41_943_040, "mem {}", b.memory_bytes_cost());
     }
 }
+
+// -------------------------------------------------------------------------
+// Step 4: thesis baskets on chain.
+// (a) A vault values its own currency at face value and everything else with
+//     the NAV oracle, whose prices are in the oracle's BASE asset. A vault
+//     whose currency is not that base would add two units together, so the
+//     factory refuses it (euro vaults wait for a euro-based feed).
+// (b) A registry cash asset that is NOT the vault currency (EURC next to
+//     USDC) is held as an oracle-priced foreign-currency sleeve, never at
+//     face value - the vault allows exactly one cash sleeve, its own.
+// -------------------------------------------------------------------------
+mod basket_on_chain {
+    use super::*;
+    use constella_vault_strategy::SleeveType as VaultSleeve;
+
+    fn add_eurc(f: &F) -> Address {
+        let eurc = f.env.register_stellar_asset_contract_v2(Address::generate(&f.env)).address();
+        AssetRegistryClient::new(&f.env, &f.registry).add_asset(&AssetEntry {
+            contract_address: eurc.clone(), asset_id: Symbol::new(&f.env, "EURC"), issuer: Symbol::new(&f.env, "CIRCLE"),
+            sleeve_type: SleeveType::Cash, liquidity_tier: 0, permissionless: true,
+            oracle_sources: vec![&f.env, Symbol::new(&f.env, "EURC_A"), Symbol::new(&f.env, "EURC_B")],
+            eligible_jurisdictions: vec![&f.env], blocked_jurisdictions: vec![&f.env], investor_classes_required: vec![&f.env],
+            is_active: true, added_at: 0 });
+        eurc
+    }
+
+    #[test]
+    fn a_vault_currency_other_than_the_oracle_base_is_refused() {
+        let f = setup();
+        let eurc = add_eurc(&f);
+        let c = Address::generate(&f.env);
+        let mut p = params(&f, &c, 40);
+        p.performance_fee_bps = DEFAULT_FEE;
+        p.numeraire = eurc;
+        assert_eq!(f.factory.try_create_vault(&c, &p), Err(Ok(FactoryError::NumeraireNotOracleBase.into())));
+        assert_eq!(f.factory.vault_count(), 0);
+    }
+
+    #[test]
+    fn a_second_cash_asset_is_an_oracle_priced_sleeve() {
+        let f = setup();
+        let eurc = add_eurc(&f);
+        let c = Address::generate(&f.env);
+        let mut p = params(&f, &c, 41);
+        p.performance_fee_bps = DEFAULT_FEE;
+        let target = |id: &str, w: u32, kind: &str| PolicySleeveTarget { asset_id: Symbol::new(&f.env, id), target_weight_bps: w,
+            min_band_bps: w.saturating_sub(200), max_band_bps: w + 200, sleeve_type: Symbol::new(&f.env, kind) };
+        let terms = PolicyTerms { policy_hash: BytesN::from_array(&f.env, &[9; 32]), min_liquidity_sleeve_bps: 1000,
+            max_single_asset_bps: 4000, max_issuer_bps: 4000, max_slippage_bps: 50, rebalance_band_bps: 200,
+            sleeves: vec![&f.env, target("USDC", 6700, "numeraire"), target("EURC", 3300, "cash")] };
+        let vault = f.factory.create_vault_with_policy(&c, &p, &terms);
+        let sl = StrategyVaultClient::new(&f.env, &vault).get_sleeves();
+        let e = sl.iter().find(|s| s.contract_address == eurc).unwrap();
+        let u = sl.iter().find(|s| s.contract_address == f.usdc).unwrap();
+        assert_eq!(u.sleeve_type, VaultSleeve::CashStable);
+        assert_eq!(e.sleeve_type, VaultSleeve::EurSovereign, "priced by the oracle, never at face value");
+        assert_eq!(e.target_weight_bps, 3300);
+    }
+}
