@@ -13,7 +13,7 @@ constella-contracts/
 ├── registry/           # Asset registry — the closed universe
 ├── policy/             # Policy storage and validation
 ├── vault-strategy/     # Shared strategy vault (SEP-56)
-├── vault-factory/      # Deploys private vault instances ✅ built (D-C, `ac597cd`)
+├── vault-factory/      # Deploys private vault instances ✅ built (D-C, `ac597cd`); D-O fee; step 3: create_vault_with_policy, vault index
 ├── vault-private/      # Per-institution vault = vault-strategy WASM deployed by the factory (no separate crate)
 ├── nav-oracle/         # NAV computation and circuit breakers
 ├── keeper/             # Rebalance proposer and TTL extender
@@ -493,3 +493,31 @@ Data: { relevant fields, timestamp }
 | `VAULT_INITIALIZED` / `SLEEVES_UPDATED` / `CAPS_LOWERED` | Vault configured at deployment / layout changed / caps lowered |
 | `UPGRADE_PROPOSED` / `UPGRADE_CANCELLED` | Timelocked upgrade lifecycle (audit W3) |
 | `UPGRADE` | WASM upgraded |
+
+
+## Step 3 additions (24 Nov 2026)
+
+### vault-factory
+```rust
+fn create_vault_with_policy(env: Env, creator: Address, params: VaultParams, terms: PolicyTerms) -> Address
+    // creator signs once; creator == params.admin == params.pause_authority (else InvalidParams);
+    // deploy (shared deploy_vault: bounds, D-O fee rule, creator-bound address, indexes), then
+    // vault.bind_policy(owner = creator) -> policy.register_policy (same auth tree),
+    // vault.set_sleeves built from the registry (address, sleeve type, liquidity tier; inactive or
+    // unknown asset -> AssetNotRegistered = 6), vault.set_keeper(settings.keeper),
+    // vault.propose_router(Soroswap, settings.router) when set. Any failure reverts everything.
+fn vault_count(env: Env) -> u32                       // append-only global index
+fn vault_at(env: Env, index: u32) -> Option<Address>
+fn set_default_fee(env: Env, fee_bps: u32)           // D-O: admin; <= 10 % of profit; future vaults only
+// FactorySettings gains default_fee_bps (D-O), keeper, router (Option).
+```
+Measured on testnet: within 400M instructions / 40 MiB; fee 0.11-5.96 XLM (the higher with archived code restored).
+
+### fee-sponsor
+```rust
+fn trust_factory(env: Env, factory: Address) -> Result<(), SponsorError>   // admin; <= MAX_TRUSTED_FACTORIES (4)
+fn untrust_factory(env: Env, factory: Address) -> Result<(), SponsorError> // admin
+fn get_trusted_factories(env: Env) -> Vec<Address>
+// is_whitelisted(target) = explicit whitelist OR any trusted factory's is_vault(target).
+// Errors: FactoryAlreadyTrusted = 16, FactoryNotTrusted = 17, TooManyFactories = 18.
+```

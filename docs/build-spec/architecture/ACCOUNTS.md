@@ -87,6 +87,7 @@ User Account
 - Sponsor account has daily spend limits
 - Rate limits on fee-bumps per user
 - Minimum trust: fee sponsorship is for vault interactions only
+- Users' own vaults (step 3, 24 Nov 2026): the fee-sponsor trusts vaults proven by a registered Constella factory (`trust_factory`, `is_vault`); the relayer allows only `deposit`, `redeem`, `withdraw`, `redeem_frozen` on such a vault (`SPONSOR_VAULT_FUNCTIONS`) and pays only if the on-chain check holds. The one-signature setup `vault_factory.create_vault_with_policy` is sponsored with its own fee cap (7 XLM; it deploys a contract).
 - Monitor for unusual fee patterns; alert if limits approached
 
 **Cost modeling:**
