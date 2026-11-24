@@ -127,6 +127,10 @@ pub enum DataKey {
     Vault(Address),
     /// creator -> vaults
     VaultsOf(Address),
+    /// Step 3: number of vaults ever created (instance; append-only index).
+    VaultCount,
+    /// Step 3: index -> vault (persistent, renewed on write).
+    VaultAt(u32),
 }
 
 #[contractevent(topics = ["VAULT_CREATED"], data_format = "vec")]
@@ -238,6 +242,11 @@ impl VaultFactory {
         env.storage().persistent().extend_ttl(&DataKey::Vault(vault.clone()), TTL_THRESHOLD, TTL_EXTEND_TO);
         mine.push_back(vault.clone());
         env.storage().persistent().set(&DataKey::VaultsOf(creator.clone()), &mine);
+        // Step 3: global append-only index for services (keeper, relayer).
+        let n: u32 = env.storage().instance().get(&DataKey::VaultCount).unwrap_or(0);
+        env.storage().persistent().set(&DataKey::VaultAt(n), &vault);
+        env.storage().persistent().extend_ttl(&DataKey::VaultAt(n), TTL_THRESHOLD, TTL_EXTEND_TO);
+        env.storage().instance().set(&DataKey::VaultCount, &(n + 1));
         env.storage().persistent().extend_ttl(&DataKey::VaultsOf(creator.clone()), TTL_THRESHOLD, TTL_EXTEND_TO);
         extend(&env);
         VaultCreated { creator, vault: vault.clone(), wasm_hash: s.vault_wasm_hash }.publish(&env);
@@ -255,6 +264,16 @@ impl VaultFactory {
 
     pub fn vaults_of(env: Env, creator: Address) -> Vec<Address> {
         env.storage().persistent().get(&DataKey::VaultsOf(creator)).unwrap_or_else(|| Vec::new(&env))
+    }
+
+    /// Step 3: number of vaults this factory has created.
+    pub fn vault_count(env: Env) -> u32 {
+        env.storage().instance().get(&DataKey::VaultCount).unwrap_or(0)
+    }
+
+    /// Step 3: the `index`-th vault created (0-based), in creation order.
+    pub fn vault_at(env: Env, index: u32) -> Option<Address> {
+        env.storage().persistent().get(&DataKey::VaultAt(index))
     }
 
     pub fn get_settings(env: Env) -> FactorySettings {
