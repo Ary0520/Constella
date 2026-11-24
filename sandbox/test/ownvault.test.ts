@@ -15,7 +15,11 @@ const bind = {
 };
 const HASH = "ab".repeat(32);
 
-const keys = (v: xdr.ScVal) => v.map()!.map((e) => e.key().sym().toString());
+// stellar-sdk 17: XDR values are plain objects (property access, no getters).
+const X = (v: xdr.ScVal) => v as any;
+const symOf = (k: any) => new TextDecoder().decode(k.sym.bytes);
+const keys = (v: xdr.ScVal): string[] => X(v).map.map((e: any) => symOf(e.key));
+const field = (v: xdr.ScVal, name: string) => X(v).map.find((e: any) => symOf(e.key) === name).val;
 
 describe("create_vault_with_policy arguments", () => {
   const args = createVaultArgs({ owner: OWNER, numeraire: USDC, feeBps: 1000, capUnits: 25_000n * 10_000_000n,
@@ -31,7 +35,7 @@ describe("create_vault_with_policy arguments", () => {
     const p = scValToNative(args[1]);
     expect([p.admin, p.pause_authority, p.numeraire, p.performance_fee_bps]).toEqual([OWNER, OWNER, USDC, 1000]);
     expect([p.tvl_cap, p.per_user_cap]).toEqual([250_000_000_000n, 250_000_000_000n]);
-    expect(args[1].map()!.find((e) => e.key().sym().toString() === "performance_fee_bps")!.val().switch().name).toBe("scvU32");
+    expect(field(args[1], "performance_fee_bps").type).toBe("scvU32");
   });
 
   it("encodes PolicyTerms exactly from the signed bind_policy terms", () => {
@@ -41,9 +45,9 @@ describe("create_vault_with_policy arguments", () => {
     expect(Buffer.from(t.policy_hash).toString("hex")).toBe(HASH);
     expect([t.min_liquidity_sleeve_bps, t.max_single_asset_bps, t.max_issuer_bps, t.max_slippage_bps, t.rebalance_band_bps])
       .toEqual([1000, 2500, 3000, 50, 200]);
-    const sleeves = args[2].map()!.find((e) => e.key().sym().toString() === "sleeves")!.val().vec()!;
+    const sleeves = field(args[2], "sleeves").vec;
     expect(keys(sleeves[0])).toEqual(["asset_id", "max_band_bps", "min_band_bps", "sleeve_type", "target_weight_bps"]);
-    expect(sleeves[1].map()!.find((e) => e.key().sym().toString() === "asset_id")!.val().switch().name).toBe("scvSymbol");
+    expect(field(sleeves[1], "asset_id").type).toBe("scvSymbol");
     expect(t.sleeves.map((s: any) => [s.asset_id, s.target_weight_bps, s.sleeve_type]))
       .toEqual([["BLEND_USDC_SUPPLY", 1500, "lending"], ["USDC", 8500, "numeraire"]]);
   });
