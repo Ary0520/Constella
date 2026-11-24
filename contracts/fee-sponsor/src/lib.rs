@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, Address, Env, Vec,
 };
 
 // Events (audit W4.1b: typed #[contractevent]s, byte-identical to the former
@@ -113,6 +113,39 @@ pub enum SponsorError {
     TooManyRelayers = 14,
     /// The address is not in the relayer set.
     NotARelayer = 15,
+    /// Step 3: the factory is already trusted.
+    FactoryAlreadyTrusted = 16,
+    /// Step 3: the factory is not trusted.
+    FactoryNotTrusted = 17,
+    /// Step 3: the trusted-factory list is full (MAX_TRUSTED_FACTORIES).
+    TooManyFactories = 18,
+}
+
+/// Step 3: at most this many trusted vault factories (each adds one
+/// cross-contract read to `is_whitelisted`).
+pub const MAX_TRUSTED_FACTORIES: u32 = 4;
+
+/// The one function of `constella-vault-factory` the sponsor reads: true only
+/// for contracts that factory deployed from its approved vault code.
+#[contractclient(name = "VaultFactoryClient")]
+pub trait VaultFactoryInterface {
+    fn is_vault(env: Env, vault: Address) -> bool;
+}
+
+/// Topics: [FACTORY_TRUSTED, admin]. Data: factory.
+#[contractevent(topics = ["FACTORY_TRUSTED"], data_format = "single-value")]
+pub struct FactoryTrusted {
+    #[topic]
+    pub admin: Address,
+    pub factory: Address,
+}
+
+/// Topics: [FACTORY_UNTRUSTED, admin]. Data: factory.
+#[contractevent(topics = ["FACTORY_UNTRUSTED"], data_format = "single-value")]
+pub struct FactoryUntrusted {
+    #[topic]
+    pub admin: Address,
+    pub factory: Address,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -152,6 +185,8 @@ pub enum DataKey {
     /// Audit F1b / decision D-I: the bounded set of relayer accounts allowed
     /// to record sponsored operations (a pool, so throughput scales).
     Relayers,
+    /// Step 3: vault factories whose `is_vault` contracts are sponsorable.
+    TrustedFactories,
 }
 
 /// Audit F1a: TTLs (in ledgers, ~5 s each). Per-user stats live in their own
@@ -283,10 +318,48 @@ impl FeeSponsorContract {
 
     /// Check if target contract is approved for fee sponsorship
     pub fn is_whitelisted(env: Env, target: Address) -> bool {
-        env.storage()
-            .instance()
-            .get(&DataKey::Whitelisted(target))
-            .unwrap_or(false)
+        if env.storage().instance().get(&DataKey::Whitelisted(target.clone())).unwrap_or(false) {
+            return true;
+        }
+        // Step 3: a vault proven by a trusted Constella factory.
+        let factories: Vec<Address> = env.storage().instance().get(&DataKey::TrustedFactories).unwrap_or_else(|| Vec::new(&env));
+        factories.iter().any(|f| VaultFactoryClient::new(&env, &f).is_vault(&target))
+    }
+
+    /// Step 3: trust a Constella vault factory - every contract it proves
+    /// (`is_vault`) becomes sponsorable. Admin only; bounded.
+    pub fn trust_factory(env: Env, factory: Address) -> Result<(), SponsorError> {
+        let config = Self::require_admin(&env)?;
+        let mut list: Vec<Address> = env.storage().instance().get(&DataKey::TrustedFactories).unwrap_or_else(|| Vec::new(&env));
+        if list.contains(&factory) {
+            return Err(SponsorError::FactoryAlreadyTrusted);
+        }
+        if list.len() >= MAX_TRUSTED_FACTORIES {
+            return Err(SponsorError::TooManyFactories);
+        }
+        list.push_back(factory.clone());
+        env.storage().instance().set(&DataKey::TrustedFactories, &list);
+        extend_instance(&env);
+        FactoryTrusted { admin: config.admin, factory }.publish(&env);
+        Ok(())
+    }
+
+    /// Step 3: stop trusting a factory (its vaults lose sponsorship at once).
+    pub fn untrust_factory(env: Env, factory: Address) -> Result<(), SponsorError> {
+        let config = Self::require_admin(&env)?;
+        let list: Vec<Address> = env.storage().instance().get(&DataKey::TrustedFactories).unwrap_or_else(|| Vec::new(&env));
+        let Some(i) = list.first_index_of(&factory) else { return Err(SponsorError::FactoryNotTrusted) };
+        let mut list = list;
+        list.remove(i);
+        env.storage().instance().set(&DataKey::TrustedFactories, &list);
+        extend_instance(&env);
+        FactoryUntrusted { admin: config.admin, factory }.publish(&env);
+        Ok(())
+    }
+
+    /// Step 3: the trusted vault factories.
+    pub fn get_trusted_factories(env: Env) -> Vec<Address> {
+        env.storage().instance().get(&DataKey::TrustedFactories).unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Validate whether an operation is eligible for fee sponsorship (stateless check against limits)
