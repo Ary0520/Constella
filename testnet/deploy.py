@@ -119,7 +119,8 @@ def main() -> None:
             net.invoke(admin, sponsor, "add_relayer", [A(keys[r].public_key)])
         state["sponsor_configured"] = True; save()
     once("vault_factory", lambda: net.deploy(admin, H("vault_factory"), [A(admin.public_key), scval.to_bytes(H("vault_strategy")), A(registry),
-                                                                         A(oracle), A(policy), A(admin.public_key), I128(1_000_000 * ONE)]))
+                                                                         A(oracle), A(policy), A(admin.public_key), I128(1_000_000 * ONE),
+                                                                         U32(1000)]  # D-O: Constella's default fee, 10 % of profit (D-D)))
     collateral = once("collateral_oracle", lambda: net.deploy(admin, H("collateral_oracle"), [A(admin.public_key), A(oracle)]))
     if not state.get("collateral_listed"):
         net.invoke(admin, collateral, "list_vault", [A(vault)])

@@ -201,7 +201,8 @@ def main() -> None:
     for r in ("relayer1", "relayer2"):
         net.invoke(admin, sponsor, "add_relayer", [A(keys[r].public_key)])
     vault_factory = net.deploy(admin, h["vault_factory"], [A(admin.public_key), scval.to_bytes(h["vault_strategy"]), A(registry),
-                                                           A(oracle), A(policy), A(admin.public_key), I128(1_000_000 * ONE)])
+                                                           A(oracle), A(policy), A(admin.public_key), I128(1_000_000 * ONE),
+                                                                         U32(1000)]  # D-O: Constella's default fee, 10 % of profit (D-D))
     collateral = net.deploy(admin, h["collateral_oracle"], [A(admin.public_key), A(oracle)])
     net.invoke(admin, collateral, "list_vault", [A(vault)])
     log("account factory", account_factory, "sponsor", sponsor, "vault factory", vault_factory, "collateral feed", collateral)
