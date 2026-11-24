@@ -54,6 +54,20 @@ version). Then select **Constella local** as the active network. xBull also supp
 | W8 | Reject the wallet popup on any action | Status bar shows a "failed" message; nothing changes on chain |
 | W9 | Reload the page | Wallet panel says "not connected" (reconnect with W1 - by design in this console) |
 
+## V. Your own vault from a thesis (step 3)
+
+| # | Step | Expected |
+|---|---|---|
+| V1 | With a passkey account (section 2) and test USDC: section 4, keep the default thesis, **Draft policy** | A table (USDC 85 %, Blend 15 %), "policy hash for C...: ..." with YOUR account, and a **Create my vault from this policy** button |
+| V2 | Click **Create my vault from this policy** | ONE passkey prompt; status "create my vault: done"; section 3's Vault selector now shows **My vault 1: C...** |
+| V3 | Overview | "vault C... (your own vault)", sleeves USDC 85 % / BLEND_USDC_SUPPLY 15 % |
+| V4 | Section 3: Deposit **50** into My vault 1 | Passkey prompt; vault shares 50; "XLM: none needed" |
+| V5 | Wait ~2-4 min, refresh | BLEND_USDC_SUPPLY "held" becomes positive (Constella's keeper rebalanced YOUR vault to the signed targets) |
+| V6 | Same with **Sign in with: Stellar wallet** (section 2b ready) | Wallet popup for the create call; you pay the XLM fee; same result |
+| V7 | Draft a policy without any account, or connect another account and click create | Preview only (no button) / "this draft was made for another account" |
+
+Automated: `npm run test:browser` (own-vault.cjs) and `python testnet/e2e_own_vault.py --wait 300`.
+
 ## F. Frozen asset -> claim -> keeper settles (both identities)
 
 | # | Step | Expected |
