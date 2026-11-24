@@ -113,14 +113,23 @@ def main() -> None:
             net.invoke(admin, sponsor, "whitelist_contract", [A(registry_dev)])
         state["device_registry_whitelisted"] = True; save()
     if not state.get("sponsor_configured"):
-        for target in (vault, account_factory, registry_dev):
-            net.invoke(admin, sponsor, "whitelist_contract", [A(target)])
+        # c.get("vault_blend"): the canonical Cash Reserve vault (testnet/blend.py),
+        # created by an earlier factory, so it is whitelisted explicitly.
+        for target in dict.fromkeys(t for t in (vault, account_factory, registry_dev, c.get("vault_blend")) if t):
+            if net.view(sponsor, "is_whitelisted", [A(target)], admin.public_key) is not True:  # resumable
+                net.invoke(admin, sponsor, "whitelist_contract", [A(target)])
         for r in ("relayer1", "relayer2"):
             net.invoke(admin, sponsor, "add_relayer", [A(keys[r].public_key)])
         state["sponsor_configured"] = True; save()
     once("vault_factory", lambda: net.deploy(admin, H("vault_factory"), [A(admin.public_key), scval.to_bytes(H("vault_strategy")), A(registry),
                                                                          A(oracle), A(policy), A(admin.public_key), I128(1_000_000 * ONE),
                                                                          U32(1000), A(keys["keeper"].public_key), A(SOROSWAP_ROUTER)]))
+    # Step 3: the sponsor pays for the one-signature vault setup on the factory,
+    # and trusts every vault the factory proves (users' own vaults).
+    if not state.get("sponsor_trusts_factory"):
+        net.invoke(admin, sponsor, "whitelist_contract", [A(c["vault_factory"])])
+        net.invoke(admin, sponsor, "trust_factory", [A(c["vault_factory"])])
+        state["sponsor_trusts_factory"] = True; save()
     collateral = once("collateral_oracle", lambda: net.deploy(admin, H("collateral_oracle"), [A(admin.public_key), A(oracle)]))
     if not state.get("collateral_listed"):
         net.invoke(admin, collateral, "list_vault", [A(vault)])
