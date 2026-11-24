@@ -22,6 +22,9 @@ struct F {
     usdc: Address,
     usdc_admin: token::StellarAssetClient<'static>,
     registry: Address,
+    tbill: Address,
+    keeper: Address,
+    router: Address,
 }
 
 fn setup() -> F {
@@ -46,13 +49,32 @@ fn setup() -> F {
         is_active: true,
         added_at: 0,
     });
+    // A second, non-cash registry asset so a basket can hold more than USDC.
+    let tbill = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    AssetRegistryClient::new(&env, &registry).add_asset(&AssetEntry {
+        contract_address: tbill.clone(),
+        asset_id: Symbol::new(&env, "TBILL"),
+        issuer: Symbol::new(&env, "FUNDCO"),
+        sleeve_type: SleeveType::UsdGovFund,
+        liquidity_tier: 1,
+        permissionless: true,
+        oracle_sources: vec![&env, Symbol::new(&env, "TBILL_A"), Symbol::new(&env, "TBILL_B")],
+        eligible_jurisdictions: vec![&env],
+        blocked_jurisdictions: vec![&env],
+        investor_classes_required: vec![&env],
+        is_active: true,
+        added_at: 0,
+    });
     let oracle = env.register(NavOracle, (admin.clone(), usdc.clone(), 7u32, 300u32));
     let policy = env.register(PolicyContract, (admin.clone(), oracle.clone()));
     let hash = env.deployer().upload_contract_wasm(VAULT_WASM);
     let treasury = Address::generate(&env);
-    let factory = env.register(VaultFactory, (admin, hash, registry.clone(), oracle, policy, treasury, MAX_TVL, DEFAULT_FEE));
+    let keeper = Address::generate(&env);
+    let router = Address::generate(&env);
+    let factory = env.register(VaultFactory, (admin, hash, registry.clone(), oracle, policy, treasury, MAX_TVL, DEFAULT_FEE,
+                                              keeper.clone(), Some(router.clone())));
     let usdc_admin = token::StellarAssetClient::new(&env, &usdc);
-    F { env: env.clone(), factory: VaultFactoryClient::new(&env, &factory), usdc, usdc_admin, registry }
+    F { env: env.clone(), factory: VaultFactoryClient::new(&env, &factory), usdc, usdc_admin, registry, tbill, keeper, router }
 }
 
 fn params(f: &F, owner: &Address, salt: u8) -> VaultParams {
@@ -284,7 +306,7 @@ mod protocol_fee {
         let f = setup();
         let s = f.factory.get_settings();
         f.env.register(VaultFactory, (s.admin, s.vault_wasm_hash, s.registry, s.oracle, s.policy, s.treasury,
-                                      MAX_TVL, MAX_PERFORMANCE_FEE_BPS + 1));
+                                      MAX_TVL, MAX_PERFORMANCE_FEE_BPS + 1, s.keeper, s.router));
     }
 }
 
@@ -321,5 +343,163 @@ mod index {
         p.tvl_cap = MAX_TVL + 1;
         assert!(f.factory.try_create_vault(&c, &p).is_err());
         assert_eq!(f.factory.vault_count(), 0);
+    }
+}
+
+// -------------------------------------------------------------------------
+// Step 3: a signed thesis becomes the creator's own live vault in ONE
+// transaction under ONE signature: deploy, bind the policy (creator = owner),
+// sleeves from the registry, Constella's keeper and router.
+// -------------------------------------------------------------------------
+mod with_policy {
+    use super::*;
+    use constella_policy::PolicyContractClient;
+    use constella_vault_strategy::TradeRoute;
+    use soroban_sdk::testutils::AuthorizedFunction;
+
+    fn target(f: &F, id: &str, w: u32, lo: u32, hi: u32, kind: &str) -> PolicySleeveTarget {
+        PolicySleeveTarget { asset_id: Symbol::new(&f.env, id), target_weight_bps: w, min_band_bps: lo, max_band_bps: hi,
+                             sleeve_type: Symbol::new(&f.env, kind) }
+    }
+
+    fn terms(f: &F) -> PolicyTerms {
+        PolicyTerms {
+            policy_hash: BytesN::from_array(&f.env, &[7; 32]),
+            min_liquidity_sleeve_bps: 1000,
+            max_single_asset_bps: 2500,
+            max_issuer_bps: 3000,
+            max_slippage_bps: 50,
+            rebalance_band_bps: 200,
+            sleeves: vec![&f.env, target(f, "USDC", 8500, 8300, 8700, "numeraire"), target(f, "TBILL", 1500, 1300, 1700, "usd_gov_fund")],
+        }
+    }
+
+    fn own(f: &F, c: &Address, salt: u8) -> VaultParams {
+        let mut p = params(f, c, salt);
+        p.performance_fee_bps = DEFAULT_FEE;
+        p
+    }
+
+    #[test]
+    fn one_call_creates_a_fully_configured_vault_owned_by_the_creator() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let t = terms(&f);
+        let vault = f.factory.create_vault_with_policy(&c, &own(&f, &c, 30), &t);
+        let v = StrategyVaultClient::new(&f.env, &vault);
+        // Policy bound: the creator is the owner, the signed hash and terms are on chain.
+        let policy = PolicyContractClient::new(&f.env, &f.factory.get_settings().policy);
+        let cfg = policy.get_policy_config(&vault).unwrap();
+        assert_eq!((cfg.owner.clone(), cfg.policy_hash.clone()), (c.clone(), t.policy_hash.clone()));
+        assert_eq!((cfg.min_liquidity_sleeve_bps, cfg.rebalance_band_bps), (1000, 200));
+        // Sleeves built from the registry, equal to the signed targets.
+        let sl = v.get_sleeves();
+        assert_eq!(sl.len(), 2);
+        let usdc = sl.iter().find(|s| s.contract_address == f.usdc).unwrap();
+        let tbill = sl.iter().find(|s| s.contract_address == f.tbill).unwrap();
+        assert_eq!((usdc.target_weight_bps, tbill.target_weight_bps), (8500, 1500));
+        assert_eq!(tbill.liquidity_tier, 1, "liquidity tier from the registry");
+        assert_eq!(usdc.asset_id, String::from_str(&f.env, "USDC"));
+        // Constella's keeper and router; the creator is admin and pause authority.
+        assert_eq!(v.get_keeper(), Some(f.keeper.clone()));
+        assert_eq!(v.get_router(&TradeRoute::Soroswap), Some(f.router.clone()));
+        let vc = v.get_config();
+        assert_eq!((vc.admin.clone(), vc.pause_authority.clone()), (c.clone(), c.clone()));
+        // Indexed and usable at once.
+        assert_eq!(f.factory.vault_at(&0), Some(vault.clone()));
+        assert!(f.factory.is_vault(&vault));
+        f.usdc_admin.mint(&c, &(100 * ONE));
+        assert_eq!(v.deposit(&(100 * ONE), &c, &c, &c), 100 * ONE);
+    }
+
+    #[test]
+    fn the_creator_signs_once_for_every_step() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let vault = f.factory.create_vault_with_policy(&c, &own(&f, &c, 31), &terms(&f));
+        let auths = f.env.auths();
+        let mine: std::vec::Vec<_> = auths.iter().filter(|(a, _)| *a == c).collect();
+        assert_eq!(mine.len(), 1, "one authorization tree for the creator");
+        let root = &mine[0].1;
+        let name = |inv: &soroban_sdk::testutils::AuthorizedInvocation| match &inv.function {
+            AuthorizedFunction::Contract((addr, f, _)) => (addr.clone(), f.to_string()),
+            _ => panic!("unexpected"),
+        };
+        assert_eq!(name(root), (f.factory.address.clone(), "create_vault_with_policy".into()));
+        let subs: std::vec::Vec<_> = root.sub_invocations.iter().map(|s| name(s)).collect();
+        for fname in ["bind_policy", "set_sleeves", "set_keeper", "propose_router"] {
+            assert!(subs.contains(&(vault.clone(), fname.into())), "{fname} covered by the one signature");
+        }
+        let bind = root.sub_invocations.iter().find(|s| name(s).1 == "bind_policy").unwrap();
+        assert!(bind.sub_invocations.iter().any(|s| name(s).1 == "register_policy"), "owner consent inside the same tree");
+    }
+
+    #[test]
+    fn the_creator_must_be_the_vaults_admin_and_pause_authority() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let other = Address::generate(&f.env);
+        let mut p = own(&f, &c, 32);
+        p.admin = other.clone();
+        assert_eq!(f.factory.try_create_vault_with_policy(&c, &p, &terms(&f)), Err(Ok(FactoryError::InvalidParams.into())));
+        let mut p = own(&f, &c, 32);
+        p.pause_authority = other;
+        assert_eq!(f.factory.try_create_vault_with_policy(&c, &p, &terms(&f)), Err(Ok(FactoryError::InvalidParams.into())));
+        assert_eq!(f.factory.vault_count(), 0);
+    }
+
+    #[test]
+    fn sleeves_must_be_active_registry_assets() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let mut t = terms(&f);
+        t.sleeves = vec![&f.env, target(&f, "USDC", 8500, 8300, 8700, "numeraire"), target(&f, "NOPE", 1500, 1300, 1700, "lending")];
+        assert_eq!(f.factory.try_create_vault_with_policy(&c, &own(&f, &c, 33), &t), Err(Ok(FactoryError::AssetNotRegistered.into())));
+        assert_eq!(f.factory.vault_count(), 0);
+    }
+
+    #[test]
+    fn a_policy_the_vault_rejects_rolls_everything_back() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let mut t = terms(&f);
+        // Targets that do not sum to 100 %: the vault's own set_sleeves refuses.
+        t.sleeves = vec![&f.env, target(&f, "USDC", 8000, 7800, 8200, "numeraire"), target(&f, "TBILL", 1500, 1300, 1700, "usd_gov_fund")];
+        assert!(f.factory.try_create_vault_with_policy(&c, &own(&f, &c, 34), &t).is_err());
+        assert_eq!(f.factory.vault_count(), 0);
+        assert!(f.factory.vaults_of(&c).is_empty());
+    }
+
+    #[test]
+    fn the_fee_rule_and_creator_authorization_still_apply() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let mut p = own(&f, &c, 35);
+        p.performance_fee_bps = 0;
+        let t = terms(&f);
+        f.env.mock_auths(&[MockAuth { address: &c, invoke: &MockAuthInvoke { contract: &f.factory.address,
+            fn_name: "create_vault_with_policy", args: (c.clone(), p.clone(), t.clone()).into_val(&f.env), sub_invokes: &[] } }]);
+        assert!(f.factory.try_create_vault_with_policy(&c, &p, &t).is_err(), "creator alone cannot set Constella's fee");
+        // A stranger cannot create a vault in someone else's name.
+        let mallory = Address::generate(&f.env);
+        let p = own(&f, &c, 36);
+        f.env.mock_auths(&[MockAuth { address: &mallory, invoke: &MockAuthInvoke { contract: &f.factory.address,
+            fn_name: "create_vault_with_policy", args: (c.clone(), p.clone(), t.clone()).into_val(&f.env), sub_invokes: &[] } }]);
+        assert!(f.factory.try_create_vault_with_policy(&c, &p, &t).is_err());
+    }
+
+    #[test]
+    fn the_whole_setup_fits_the_network_limits() {
+        // Testnet limits read 24 Nov 2026 (`stellar network settings`):
+        // 400M instructions, 40 MiB memory per transaction.
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let p = own(&f, &c, 37);
+        let t = terms(&f);
+        f.env.cost_estimate().budget().reset_default();
+        f.factory.create_vault_with_policy(&c, &p, &t);
+        let b = f.env.cost_estimate().budget();
+        assert!(b.cpu_instruction_cost() < 400_000_000, "cpu {}", b.cpu_instruction_cost());
+        assert!(b.memory_bytes_cost() < 41_943_040, "mem {}", b.memory_bytes_cost());
     }
 }
