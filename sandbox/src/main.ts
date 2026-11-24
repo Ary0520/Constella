@@ -7,6 +7,7 @@ import { xdr } from "@stellar/stellar-sdk";
 import { Chain, Config, Passkey, sv, thesis } from "./chain";
 import { createPasskey, createTestPasskey, discoverPasskey, getAssertion, recoverPublicKeys } from "./passkey";
 import { addUsdcTrustline, connectWallet, friendbotFund, WalletSigner, walletInvoke, walletStatus } from "./wallet";
+import { createVaultArgs } from "./ownvault";
 
 const ONE = 10_000_000n;
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -73,15 +74,27 @@ let chain: Chain;
 let wallet: WalletSigner | null = null; // in memory: reconnect after a reload
 const mode = (): "passkey" | "wallet" => ((document.querySelector('input[name="who"]:checked') as HTMLInputElement)?.value as any) ?? "passkey";
 
+// Step 3: which vault section 3 acts on - the shared Cash Reserve or one of
+// the user's own vaults (created from a signed policy, section 4).
+const TARGET_KEY = "constella-sandbox-target";
+function target(): string {
+  const sel = document.getElementById("target") as HTMLSelectElement | null;
+  if (sel?.value) return sel.value;
+  try { return localStorage.getItem(TARGET_KEY) || cfg.contracts.vault; } catch { return cfg.contracts.vault; }
+}
+function setTarget(v: string) { try { localStorage.setItem(TARGET_KEY, v); } catch { /* private mode */ } }
+/** The signable draft from section 4 (policy, hash, bind_policy terms). */
+let lastDraft: any = null;
+
 /** Who acts: the passkey account (relayer pays) or the wallet (user pays). */
-function actor(): { address: string; call: (fn: string, args: xdr.ScVal[]) => Promise<unknown> } {
+function actor(contract: string = target()): { address: string; call: (fn: string, args: xdr.ScVal[]) => Promise<unknown> } {
   if (mode() === "wallet") {
     if (!wallet) throw new Error("connect a Stellar wallet first (section 2b)");
     const w = wallet;
-    return { address: w.address, call: (fn, args) => walletInvoke(chain, w, cfg.contracts.vault, fn, args) };
+    return { address: w.address, call: (fn, args) => walletInvoke(chain, w, contract, fn, args) };
   }
   const a = need();
-  return { address: a.address, call: (fn, args) => chain.sponsored(a, cfg.contracts.vault, fn, args) };
+  return { address: a.address, call: (fn, args) => chain.sponsored(a, contract, fn, args) };
 }
 const userArgs = (amount: bigint, who: string) => [sv.i128(amount), sv.addr(who), sv.addr(who), sv.addr(who)];
 const ACCOUNT_KEY = "constella-sandbox-account";
@@ -140,6 +153,7 @@ function layout() {
   <section><h2>3. Deposit / redeem</h2>
     Sign in with: <label><input type="radio" name="who" value="passkey" checked/> passkey (relayer pays, zero XLM)</label>
     <label><input type="radio" name="who" value="wallet"/> Stellar wallet (you pay the XLM fee)</label><br/>
+    Vault: <select id="target"></select><br/>
     USDC <input id="dep" value="100" size="8"/> <button id="deposit">Deposit</button>
     shares <input id="red" value="10" size="8"/> <button id="redeem">Redeem</button>
     <p>The keeper rebalances to the signed targets within ~20 s (watch the overview).</p></section>
@@ -168,6 +182,7 @@ function layout() {
     <button id="vaults">List factory vaults</button> <div id="vaultList"></div></section>`;
 
   $("refresh").onclick = () => refresh();
+  $("target").onchange = () => { setTarget(target()); refresh(); };
   $("create").onclick = () => act("create passkey account", () => createAccount("platform"));
   $("createPhone").onclick = () => act("create passkey account", () => createAccount("cross-platform"));
   $("signin").onclick = () => act("sign in with an existing passkey", signIn);
@@ -195,7 +210,7 @@ function layout() {
   });
   $("redeem").onclick = () => act("redeem", async () => {
     const u = actor(); const sh = toUnits($<HTMLInputElement>("red").value);
-    const have = BigInt(await chain.view(cfg.contracts.vault, "balance", [sv.addr(u.address)]).catch(() => 0));
+    const have = BigInt(await chain.view(target(), "balance", [sv.addr(u.address)]).catch(() => 0));
     if (have < sh) throw new Error(`you hold ${fmt(have)} vault shares, so you cannot redeem ${fmt(sh)}. Deposit first, or redeem less.`);
     return u.call("redeem", userArgs(sh, u.address));
   });
@@ -378,16 +393,64 @@ async function runThesis() {
                       : "<i>Preview only: create or connect an account to get a policy you can sign.</i>"}</p>
     <details><summary>exact on-chain bind_policy terms</summary><pre>${JSON.stringify(out.bind_policy, null, 1)}</pre></details>
     <details><summary>not eligible for this user</summary><pre>${JSON.stringify(out.ineligible, null, 1)}</pre></details>`;
+  lastDraft = out;
+  if (out.signable && cfg.contracts.vault_factory) {
+    $("thesisOut").insertAdjacentHTML("beforeend", `<p><button id="mkVault">Create my vault from this policy</button>
+      <i>one signature: deploys your private vault, binds this exact policy with you as owner, sets Constella's keeper.
+      Fee: Constella's default (10 % of profit, never above 0.20 %/yr). Cap 25,000 USDC.</i></p>`);
+    $("mkVault").onclick = () => act("create my vault", createOwnVault);
+  }
   return out.policy_hash;
+}
+
+/** Step 3: fill the vault selector - the shared vault plus the acting
+ * identity's own factory vaults (vault_factory.vaults_of). */
+async function refreshTargets() {
+  const sel = document.getElementById("target") as HTMLSelectElement | null;
+  if (!sel || !cfg.contracts.vault_factory) return;
+  const who = mode() === "wallet" ? wallet?.address : loadAccount()?.address;
+  const own: string[] = who ? (await chain.view(cfg.contracts.vault_factory, "vaults_of", [sv.addr(who)]).catch(() => [])).map(String) : [];
+  const want = target();
+  sel.innerHTML = [`<option value="${cfg.contracts.vault}">Constella Cash Reserve (shared)</option>`,
+                   ...own.map((v, i) => `<option value="${v}">My vault ${i + 1}: ${short(v)}</option>`)].join("");
+  sel.value = [cfg.contracts.vault, ...own].includes(want) ? want : cfg.contracts.vault;
+}
+
+/** Step 3: the signed draft becomes the user's own live vault - one call,
+ * one signature (vault_factory.create_vault_with_policy). */
+async function createOwnVault() {
+  const d = lastDraft;
+  if (!d?.signable) throw new Error("draft a policy first (create or connect an account so the draft is signable)");
+  const u = actor(cfg.contracts.vault_factory);
+  if (d.policy.admin.admin_address !== u.address) {
+    throw new Error("this draft was made for another account - draft the policy again with the account selected in section 3");
+  }
+  const settings = await chain.view(cfg.contracts.vault_factory, "get_settings");
+  const salt = crypto.getRandomValues(new Uint8Array(32));
+  const name = String(d.policy.basket_name || "My basket");
+  const before: string[] = (await chain.view(cfg.contracts.vault_factory, "vaults_of", [sv.addr(u.address)]).catch(() => [])).map(String);
+  await u.call("create_vault_with_policy", createVaultArgs({
+    owner: u.address, numeraire: cfg.assets.USDC, feeBps: Number(settings.default_fee_bps),
+    capUnits: 25_000n * 10_000_000n, name, symbol: name.replace(/[^A-Za-z]/g, "").slice(0, 8).toUpperCase() || "BASKET",
+    salt, bind: d.bind_policy, policyHashHex: d.policy_hash,
+  }));
+  const after: string[] = (await chain.view(cfg.contracts.vault_factory, "vaults_of", [sv.addr(u.address)])).map(String);
+  const created = after.find((v) => !before.includes(v));
+  if (!created) throw new Error("the vault was not created");
+  setTarget(created);
+  await refreshTargets();
+  return { vault: created, policy_hash: d.policy_hash };
 }
 
 async function refresh() {
   const c = cfg.contracts;
   try {
+    await refreshTargets();
+    const V = target();
     const [cons, dep, total, supply, sleeves, paused, hwm, history, eurc] = await Promise.all([
-      chain.view(c.vault, "get_nav_conservative"), chain.view(c.vault, "get_nav_deposit"), chain.view(c.vault, "total_assets"),
-      chain.view(c.vault, "total_supply"), chain.view(c.vault, "get_sleeves"), chain.view(c.vault, "is_paused"),
-      chain.view(c.vault, "get_high_water_mark"), chain.view(c.vault, "get_nav_history"),
+      chain.view(V, "get_nav_conservative"), chain.view(V, "get_nav_deposit"), chain.view(V, "total_assets"),
+      chain.view(V, "total_supply"), chain.view(V, "get_sleeves"), chain.view(V, "is_paused"),
+      chain.view(V, "get_high_water_mark"), chain.view(V, "get_nav_history"),
       chain.view(c.oracle, "asset_price", [sv.addr(cfg.assets.EURC)]),
     ]);
     const realized = history.length >= 2
@@ -402,7 +465,7 @@ async function refresh() {
         <tr><td>high-water mark (D-D fee)</td><td>${fmt(hwm)}</td></tr>
         <tr><td>EURC price (oracle)</td><td>${eurc ? fmt(eurc.price) : "NONE (frozen or stale)"}</td></tr>
         <tr><td>realised return (on-chain NAV history, A3)</td><td>${realized}</td></tr>
-        <tr><td>vault</td><td>${paused ? "PAUSED" : "running"}</td></tr>
+        <tr><td>vault</td><td><span class="mono">${short(V)}</span> ${V === c.vault ? "(shared Cash Reserve)" : "(your own vault)"} · ${paused ? "PAUSED" : "running"}</td></tr>
       </table>
       <table><tr><th>sleeve</th><th>target</th><th>held (units)</th><th>contract</th></tr>${rows}</table>`;
 
@@ -412,8 +475,8 @@ async function refresh() {
       $("claims").textContent = "";
     } else if (a) {
       const [usdc, shares, claim] = await Promise.all([
-        chain.view(cfg.assets.USDC, "balance", [sv.addr(a.address)]), chain.view(c.vault, "balance", [sv.addr(a.address)]),
-        chain.view(c.vault, "get_claim", [sv.addr(a.address), sv.addr(cfg.assets.EURC)]),
+        chain.view(cfg.assets.USDC, "balance", [sv.addr(a.address)]), chain.view(V, "balance", [sv.addr(a.address)]),
+        chain.view(V, "get_claim", [sv.addr(a.address), sv.addr(cfg.assets.EURC)]),
       ]);
       const where = a.testKey ? "this browser (TEST passkey - local testing only, no prompt)" : a.attachment === "existing" ? "the device you signed in with" : a.attachment === "platform" ? "this device (Windows Hello / Touch ID)" : a.attachment === "cross-platform" ? "a phone or security key" : "unknown (created before this was recorded)";
       $("acct").innerHTML = `<div class="mono">account ${a.address}</div><div>USDC ${fmt(usdc)} · vault shares ${fmt(shares)} · XLM: none needed</div>
@@ -430,8 +493,8 @@ async function refresh() {
     }
     if (wallet) {
       const ws = await walletStatus(chain, wallet.address);
-      const shares = ws.exists ? await chain.view(c.vault, "balance", [sv.addr(wallet.address)]) : 0;
-      const claim = ws.exists ? await chain.view(c.vault, "get_claim", [sv.addr(wallet.address), sv.addr(cfg.assets.EURC)]) : 0;
+      const shares = ws.exists ? await chain.view(V, "balance", [sv.addr(wallet.address)]) : 0;
+      const claim = ws.exists ? await chain.view(V, "get_claim", [sv.addr(wallet.address), sv.addr(cfg.assets.EURC)]) : 0;
       const todo = !ws.exists ? "Next: fund the account (friendbot)." : !ws.hasTrustline ? "Next: add the USDC trustline." : ws.usdc === 0n ? "Next: get test USDC." : "Ready.";
       $("wallet").innerHTML = `<div class="mono">${wallet.label} ${wallet.address}</div>
         <div>account ${ws.exists ? "exists" : "NOT FUNDED"} · XLM ${fmt(ws.xlm)} · USDC trustline ${ws.hasTrustline ? "yes" : "NO"} · USDC ${fmt(ws.usdc)}
