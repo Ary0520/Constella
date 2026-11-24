@@ -8,7 +8,9 @@ Keeper loop. Per vault, per tick:
   5. settle queued frozen-sleeve claims (`settle_claim` is permissionless
      and pays only the holder); a claim that cannot settle yet is retried.
 Config (env): CONSTELLA_RPC_URL, CONSTELLA_NETWORK_PASSPHRASE, KEEPER_SECRET,
-KEEPER_VAULTS (comma-separated), KEEPER_INTERVAL_SECONDS (300), KEEPER_ONCE,
+KEEPER_VAULTS (comma-separated), KEEPER_FACTORIES (comma-separated vault
+factories whose index - vault_count / vault_at - lists users' own vaults;
+step 3), KEEPER_INTERVAL_SECONDS (300), KEEPER_ONCE,
 KEEPER_DRY_RUN, KEEPER_STATE_FILE, KEEPER_DEADLINE_SECONDS (300),
 KEEPER_TTL_MIN_DAYS (20), KEEPER_TTL_EXTEND_DAYS (30).
 
@@ -25,7 +27,7 @@ import json
 import os
 import sys
 import time
-from typing import Dict
+from typing import Any, Callable, Dict, List
 
 from stellar_sdk import scval, xdr
 
@@ -185,6 +187,31 @@ def raise_cash_for_claim(chain: Chain, vault: str, asset: str, owed: int) -> Dic
     return {"raised_at_least": need, **chain.submit(vault, "rebalance", prop)}
 
 
+def discover_vaults(read: Callable[..., Any], static: List[str], factories: List[str], state: Dict) -> List[str]:
+    """Step 3: the static vaults, then every vault in each factory's
+    append-only index. Seen vaults are remembered in `state`, so each tick
+    reads only `vault_count` plus the new entries; a factory that cannot be
+    read keeps its known vaults. (The keeper still acts only on vaults whose
+    keeper it is - see rebalance_vault.)"""
+    known = state.setdefault("factory_vaults", {})
+    for f in factories:
+        seen = known.setdefault(f, [])
+        try:
+            n = int(read(f, "vault_count"))
+            for i in range(len(seen), n):
+                v = read(f, "vault_at", scval.to_uint32(i))
+                if v is None:
+                    break
+                seen.append(getattr(v, "address", str(v)))
+        except Exception as e:
+            log(action="discover-error", factory=f, reason=f"{type(e).__name__}: {str(e)[:200]}")
+    out: List[str] = []
+    for v in list(static) + [v for f in factories for v in known.get(f, [])]:
+        if v not in out:
+            out.append(v)
+    return out
+
+
 def tick(chain: Chain, vaults, state: Dict, dry_run: bool, deadline_s: int,
          ttl_min_days: int = 20, ttl_extend_days: int = 30) -> None:
     for v in vaults:
@@ -205,11 +232,14 @@ def tick(chain: Chain, vaults, state: Dict, dry_run: bool, deadline_s: int,
 
 def cli() -> None:
     env = os.environ
-    for k in ("CONSTELLA_RPC_URL", "CONSTELLA_NETWORK_PASSPHRASE", "KEEPER_SECRET", "KEEPER_VAULTS"):
+    for k in ("CONSTELLA_RPC_URL", "CONSTELLA_NETWORK_PASSPHRASE", "KEEPER_SECRET"):
         if not env.get(k):
             sys.exit(f"missing {k}")
+    if not env.get("KEEPER_VAULTS") and not env.get("KEEPER_FACTORIES"):
+        sys.exit("missing KEEPER_VAULTS and KEEPER_FACTORIES")
     chain = Chain(env["CONSTELLA_RPC_URL"], env["CONSTELLA_NETWORK_PASSPHRASE"], env["KEEPER_SECRET"])
-    vaults = [v.strip() for v in env["KEEPER_VAULTS"].split(",") if v.strip()]
+    vaults = [v.strip() for v in env.get("KEEPER_VAULTS", "").split(",") if v.strip()]
+    factories = [f.strip() for f in env.get("KEEPER_FACTORIES", "").split(",") if f.strip()]
     state_file = env.get("KEEPER_STATE_FILE", "keeper_state.json")
     dry = env.get("KEEPER_DRY_RUN") == "1"
     deadline_s = int(env.get("KEEPER_DEADLINE_SECONDS", "300"))
@@ -222,10 +252,10 @@ def cli() -> None:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         sys.exit("another keeper process holds the lock")
-    log(action="start", keeper=chain.keeper, vaults=vaults, dry_run=dry)
+    log(action="start", keeper=chain.keeper, vaults=vaults, factories=factories, dry_run=dry)
     while True:
         state = load_state(state_file)
-        tick(chain, vaults, state, dry, deadline_s, int(env.get("KEEPER_TTL_MIN_DAYS", "20")),
+        tick(chain, discover_vaults(chain.read, vaults, factories, state), state, dry, deadline_s, int(env.get("KEEPER_TTL_MIN_DAYS", "20")),
              int(env.get("KEEPER_TTL_EXTEND_DAYS", "30")))
         save_state(state_file, state)
         if env.get("KEEPER_ONCE") == "1":
