@@ -66,7 +66,7 @@ def test_t05_hrp_and_constrained_weights_sum_and_caps():
         non_num_issuers[by[asset_id].issuer] = non_num_issuers.get(by[asset_id].issuer, 0.0) + weight
     for issuer, weight in non_num_issuers.items():
         assert weight <= policy.max_issuer_weight + 1e-9, f"issuer {issuer} {weight} above the cap (vault currency excluded)"
-    assert result.weights["USDC"] >= 0.85
+    assert result.weights["USDC"] >= policy.min_liquidity_sleeve - 1e-9  # D-P: the thesis's cash floor, not a fixed 85 %
 
     # 4. Liquidity floor (>= 10%)
     cash_weight = result.sleeve_weights.get("cash", 0.0)
@@ -124,11 +124,10 @@ def test_t07_redemption_ladder_breakdown():
     total_ladder = ladder.instant_pct + ladder.within_24h_pct + ladder.within_1w_pct + ladder.illiquid_pct
     assert abs(total_ladder - 1.0) < 1e-4, f"Ladder sum {total_ladder} != 1.0"
 
-    # D-A Cash Reserve: >= 85 % sits in instant vault currency; the rest (EUR
-    # T-bills here) redeems within 24h. (The old >= 60 % within-24h expectation
-    # described T-bill-heavy baskets, not a Phase-1 profile.)
-    assert ladder.instant_pct >= 0.85
-    assert ladder.within_24h_pct <= 0.15
+    # D-P (step 4): the founding doc's journey 1 is a T-bill-heavy basket again
+    # - the cash floor is instant, the T-bill funds redeem within 24h.
+    assert ladder.instant_pct >= policy.min_liquidity_sleeve - 1e-9
+    assert ladder.within_24h_pct >= 0.60
     assert ladder.illiquid_pct == 0.0
 
 
@@ -156,12 +155,12 @@ def test_t08_stress_simulations_depeg_and_freeze():
     assert sim_report.depeg_stress.nav_impact_pct < 0.0
     assert sim_report.depeg_stress.nav_impact_pct >= -0.05  # cannot exceed 5% total drawdown
 
-    # Issuer freeze: the honest D-A disclosure - a Circle freeze traps the USDC
-    # vault currency too (the issuer cap exempts it, the risk does not go away).
-    circle = opt_result.issuer_weights["CIRCLE"]
-    assert circle >= 0.85
-    assert abs(sim_report.issuer_freeze_stress.trapped_liquidity_pct - circle) < 1e-4
-    assert "CIRCLE" in sim_report.issuer_freeze_stress.description
+    # Issuer freeze hits the LARGEST issuer, vault currency included (the issuer
+    # cap exempts USDC, the risk does not go away - D-A disclosure).
+    top, weight = max(opt_result.issuer_weights.items(), key=lambda kv: kv[1])
+    assert opt_result.issuer_weights["CIRCLE"] >= policy.min_liquidity_sleeve - 1e-9
+    assert abs(sim_report.issuer_freeze_stress.trapped_liquidity_pct - weight) < 1e-4
+    assert top in sim_report.issuer_freeze_stress.description
 
 
 def test_t09_mandatory_legal_disclaimer():
@@ -228,7 +227,7 @@ def test_t10_hrp_with_historical_returns_dataframe():
         non_num_issuers[by[asset_id].issuer] = non_num_issuers.get(by[asset_id].issuer, 0.0) + weight
     for issuer, weight in non_num_issuers.items():
         assert weight <= policy.max_issuer_weight + 1e-9, f"issuer {issuer} {weight} above the cap (vault currency excluded)"
-    assert result.weights["USDC"] >= 0.85
+    assert result.weights["USDC"] >= policy.min_liquidity_sleeve - 1e-9  # D-P: the thesis's cash floor, not a fixed 85 %
 
 
 

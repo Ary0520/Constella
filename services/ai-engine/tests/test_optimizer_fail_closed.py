@@ -24,7 +24,7 @@ def test_retail_cash_reserve_keeps_85_percent_usdc_and_at_most_15_percent_lendin
     p = retail(target_yield_orientation="maximize")
     c = cands(p)
     r = optimize_portfolio(p, c)
-    assert r.profile == "cash_reserve" and r.numeraire == "USDC"
+    assert r.profile == "thesis" and r.numeraire == "USDC"  # D-P: a plain USD cash thesis still gives 85/15
     assert r.weights_bps["USDC"] >= 8500
     assert r.weights_bps["BLEND_USDC_SUPPLY"] <= 1500
     assert r.weights_bps["BLEND_USDC_SUPPLY"] > 0, "yield-seeking uses the lending room"
@@ -49,9 +49,9 @@ def test_a_conflicting_currency_split_is_explained_with_the_nearest_valid_mix():
     c = cands(p)
     with pytest.raises(InfeasibleAllocation) as e:
         optimize_portfolio(p, c)
-    assert any("conflicts with the cash reserve profile" in r for r in e.value.reasons)
+    assert any("cannot be met under your limits" in r and "per-asset cap" in r for r in e.value.reasons)
     near = e.value.nearest
-    assert near.weights_bps["USDC"] >= 8500 and check_allocation(near.weights_bps, p, c, "USDC", soft=False) == []
+    assert near.weights_bps["EURC"] <= 2500 and check_allocation(near.weights_bps, p, c, "USDC", soft=False) == []
 
 
 def test_a_currency_with_no_eligible_asset_is_reported():
@@ -66,13 +66,14 @@ def test_without_the_vault_currency_there_is_no_allocation_at_all():
     no_usdc = [x for x in cands(p) if x.asset_id != "USDC"]
     with pytest.raises(InfeasibleAllocation) as e:
         optimize_portfolio(p, no_usdc)
-    assert e.value.nearest is None and "USDC" in e.value.reasons[0]
+    # A USD thesis never falls back to an unrequested currency (EURC) as vault currency.
+    assert e.value.nearest is None and "USD" in e.value.reasons[0]
 
 
-def test_unknown_profiles_are_refused():
+def test_an_explicit_vault_currency_that_is_not_available_is_refused():
     p = retail()
-    with pytest.raises(ValueError):
-        optimize_portfolio(p, cands(p), profile="yolo")
+    with pytest.raises(InfeasibleAllocation):
+        optimize_portfolio(p, cands(p), numeraire="NOT_A_CANDIDATE")
 
 
 def test_the_final_check_catches_every_rule():
@@ -100,19 +101,14 @@ def test_the_vault_currency_is_exempt_from_both_concentration_caps():
     assert r.weights["USDC"] > 0.30 and r.issuer_weights["CIRCLE"] > 0.30, "exempt, governed by profile + floor"
 
 
-def test_the_lending_cap_binds_in_a_profile_where_the_currency_floor_does_not_imply_it(monkeypatch):
-    # Under Cash Reserve, USDC >= 85 % already implies lending <= 15 %. A
-    # future profile (e.g. "Yield") has a lower currency floor, so the
-    # lending cap must bind on its own.
-    from src import optimizer
-    monkeypatch.setitem(optimizer.PROFILES, "test_low_floor", optimizer.Profile(min_numeraire=0.50, max_lending=0.15))
-    p = retail(target_yield_orientation="maximize", currency_exposure={})
+def test_each_lending_pool_is_capped_even_when_the_cash_floor_is_low():
+    # D-P: the 15 % per-pool cap (D-A, one audited pool) binds on its own - a
+    # 5 % floor and a yield-maximising thesis still cannot lend more.
+    p = retail(target_yield_orientation="maximize", min_liquidity_sleeve=0.05)
     c = cands(p)
-    r = optimize_portfolio(p, c, profile="test_low_floor")
-    assert r.weights_bps["BLEND_USDC_SUPPLY"] <= 1500
-    assert r.weights_bps["USDC"] >= 5000
-    assert check_allocation(r.weights_bps, p, c, "USDC", profile="test_low_floor") == []
-
+    r = optimize_portfolio(p, c)
+    assert 0 < r.weights_bps["BLEND_USDC_SUPPLY"] <= 1500
+    assert check_allocation({**r.weights_bps, "BLEND_USDC_SUPPLY": 1501, "USDC": r.weights_bps["USDC"] - 1}, p, c, "USDC", soft=False)
 
 def test_the_vault_currency_risk_is_disclosed_not_called_within_the_cap():
     from src.explainer import generate_explanation

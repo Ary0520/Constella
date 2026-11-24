@@ -38,7 +38,7 @@ def test_a_thesis_becomes_a_signed_policy_with_exact_on_chain_terms(base):
     assert out["signable"] is True and out["policy"]["admin"]["admin_address"] == "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
     assert headers["Access-Control-Allow-Origin"] == "http://localhost:5173"
     alloc = out["allocation"]
-    assert alloc["profile"] == "cash_reserve" and alloc["numeraire"] == "USDC"
+    assert alloc["profile"] == "thesis" and alloc["numeraire"] == "USDC"
     assert alloc["weights_bps"]["USDC"] >= 8500
     bind = out["bind_policy"]
     kinds = {s["asset_id"]: s["sleeve_type"] for s in bind["sleeves"]}
