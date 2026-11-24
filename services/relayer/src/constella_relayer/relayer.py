@@ -60,6 +60,7 @@ class Relayer:
         timeout_seconds: int = 30,
         account_max_fee_stroops: int = 30_000_000,
         function_max_fee: dict[str, int] | None = None,
+        vault_functions: frozenset[str] = frozenset(),
     ):
         if max_fee_stroops <= inclusion_fee:
             raise ValueError("max_fee_stroops must exceed the inclusion fee")
@@ -70,6 +71,7 @@ class Relayer:
         self.keypairs = list(keypairs)
         self.sponsor = sponsor_contract
         self.allowed = allowed
+        self.vault_functions = vault_functions
         self.max_fee = max_fee_stroops
         # Deploying an account pays its storage rent (~1.8 XLM on a local
         # network, measured): its own cap, so user calls stay tightly capped.
@@ -135,7 +137,8 @@ class Relayer:
             raise Rejected("NOT_A_CONTRACT_CALL", str(host_fn.type))
         contract = Address.from_xdr_sc_address(host_fn.invoke_contract.contract_address).address
         function = host_fn.invoke_contract.function_name.sc_symbol.decode()
-        if function not in self.allowed.get(contract, frozenset()):
+        if function not in self.allowed.get(contract, frozenset()) and not (
+                contract not in self.allowed and function in self.vault_functions):
             raise Rejected("FUNCTION_NOT_ALLOWED", f"{contract}.{function}")
         source = self.keypairs[0].public_key
         seq = self.server.load_account(source).sequence
@@ -146,7 +149,9 @@ class Relayer:
         return {"auth": list(sim.results[0].auth or []), "latest_ledger": sim.latest_ledger}
 
     def submit(self, func_b64: str, auth_b64: list[str]) -> Submitted:
-        v = validate(func_b64, auth_b64, self.allowed, self.relayer_addresses)
+        v = validate(func_b64, auth_b64, self.allowed, self.relayer_addresses, self.vault_functions)
+        # Calls marked needs_chain_proof rely on _sponsor's on-chain
+        # is_whitelisted check (factory-proven vault), which runs for every call.
         return self._sponsor(v.host_function, v.auth, v.user, v.contract, v.function, self.function_max_fee.get(v.function))
 
     def _read(self, contract: str, fn: str, args: list[xdr.SCVal]):

@@ -14,6 +14,8 @@ Configuration (environment only - the secret is never logged):
   RELAYER_SECRETS (comma-separated pool, D-I; each must be in the fee-sponsor's
   relayer set) or RELAYER_SECRET (pool of one),
   SPONSOR_CONTRACT_ID, SPONSOR_ALLOWED ("C...:deposit,redeem;C...:fn"),
+  SPONSOR_VAULT_FUNCTIONS ("deposit,redeem,withdraw,redeem_frozen": also allowed on
+  any vault the fee-sponsor proves via a trusted factory; empty = off),
   RELAYER_MAX_FEE_STROOPS (default 1_000_000), RELAYER_HOST, RELAYER_PORT,
   ACCOUNT_FACTORY_ID (enables /accounts, audit A2), ACCOUNTS_PER_IP_PER_DAY (3),
   RELAYER_FN_MAX_FEE ("add_device:30000000": per-function caps for calls that
@@ -55,6 +57,18 @@ def parse_allowed(spec: str) -> dict[str, frozenset[str]]:
     if not allowed:
         raise ValueError("SPONSOR_ALLOWED is empty")
     return allowed
+
+
+# Step 3: the only functions that may be sponsored on users' own factory
+# vaults (new addresses, proven on chain by a trusted factory).
+VAULT_USER_FUNCTIONS = frozenset({"deposit", "redeem", "withdraw", "redeem_frozen"})
+
+
+def parse_vault_functions(spec: str) -> frozenset[str]:
+    names = frozenset(f.strip() for f in spec.split(",") if f.strip())
+    if names - VAULT_USER_FUNCTIONS:
+        raise ValueError(f"SPONSOR_VAULT_FUNCTIONS may only contain {sorted(VAULT_USER_FUNCTIONS)}")
+    return names
 
 
 def parse_fee_caps(spec: str) -> dict[str, int]:
@@ -163,6 +177,7 @@ def cli() -> None:
         max_fee_stroops=int(env.get("RELAYER_MAX_FEE_STROOPS", "1000000")),
         account_max_fee_stroops=int(env.get("ACCOUNT_MAX_FEE_STROOPS", "30000000")),
         function_max_fee=parse_fee_caps(env.get("RELAYER_FN_MAX_FEE", "add_device:30000000")),
+        vault_functions=parse_vault_functions(env.get("SPONSOR_VAULT_FUNCTIONS", "")),
     )
     host, port = env.get("RELAYER_HOST", "127.0.0.1"), int(env.get("RELAYER_PORT", "8787"))
     sys.stderr.write(f"constella-relayer pool of {len(relayer.keypairs)} on {host}:{port}\n")

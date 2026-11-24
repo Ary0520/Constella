@@ -10,7 +10,11 @@ authorize something - e.g. a token transfer out of the relayer's account.
 Rules (all must hold, otherwise `Rejected` with a stable code):
   1. `func` is valid XDR for an InvokeContract host function (no contract
      creation, no WASM upload).
-  2. The target contract and function are on the allow-list.
+  2. The target contract and function are on the allow-list - or (step 3)
+     the function is a vault user function (`vault_functions`) on any
+     contract; such a call is marked `needs_chain_proof` and the relayer
+     sponsors it only if the fee-sponsor's on-chain `is_whitelisted` holds,
+     i.e. the contract is a vault proven by a trusted Constella factory.
   3. There is at least one, and at most MAX_AUTH_ENTRIES, auth entries.
   4. Every auth entry uses address credentials - `ADDRESS`, `ADDRESS_V2`
      (CAP-71: the signed payload is bound to the address) or
@@ -55,6 +59,7 @@ class Validated:
     user: str
     host_function: xdr.HostFunction
     auth: list[xdr.SorobanAuthorizationEntry]
+    needs_chain_proof: bool = False
 
 
 def _decode(b64: str, limit: int, kind: str) -> bytes:
@@ -127,6 +132,7 @@ def validate(
     auth_b64: list[str],
     allowed: dict[str, frozenset[str]],
     relayer_addresses: frozenset[str],
+    vault_functions: frozenset[str] = frozenset(),
 ) -> Validated:
     """Validate a sponsored request. `allowed` maps contract IDs to the
     function names that may be sponsored; `relayer_addresses` are every
@@ -142,9 +148,12 @@ def validate(
     call = host_fn.invoke_contract
     contract = Address.from_xdr_sc_address(call.contract_address).address
     function = call.function_name.sc_symbol.decode()
+    needs_chain_proof = False
     if contract not in allowed:
-        raise Rejected("TARGET_NOT_ALLOWED", contract)
-    if function not in allowed[contract]:
+        if function not in vault_functions:
+            raise Rejected("TARGET_NOT_ALLOWED", contract)
+        needs_chain_proof = True
+    elif function not in allowed[contract]:
         raise Rejected("FUNCTION_NOT_ALLOWED", f"{contract}.{function}")
 
     if not isinstance(auth_b64, list) or not auth_b64:
@@ -181,4 +190,4 @@ def validate(
     ):
         raise Rejected("AUTH_MISMATCH", "auth[0] does not authorize this exact call")
     user = Address.from_xdr_sc_address(address_credentials(entries[0].credentials).address).address
-    return Validated(contract=contract, function=function, user=user, host_function=host_fn, auth=entries)
+    return Validated(contract=contract, function=function, user=user, host_function=host_fn, auth=entries, needs_chain_proof=needs_chain_proof)
