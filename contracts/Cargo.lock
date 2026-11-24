@@ -328,6 +328,7 @@ dependencies = [
  "constella-policy",
  "constella-registry",
  "constella-smart-account",
+ "constella-vault-factory",
  "constella-vault-strategy",
  "soroban-sdk",
 ]
