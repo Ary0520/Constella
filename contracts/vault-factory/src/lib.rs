@@ -63,7 +63,31 @@ pub enum FactoryError {
     TooManyVaults = 5,
     /// Step 3: a policy sleeve is not an active registry asset.
     AssetNotRegistered = 6,
+    /// Step 4: the vault currency must be the NAV oracle's base asset - a vault
+    /// values its own currency at face and every other sleeve in oracle
+    /// (base) units, so any other currency would add two units together.
+    NumeraireNotOracleBase = 7,
 }
+
+/// SEP-40 asset identifier (mirror of `constella_nav_oracle::Asset`).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum OracleAsset {
+    Stellar(Address),
+    Other(Symbol),
+}
+
+#[contractclient(name = "OracleBaseClient")]
+pub trait OracleBaseInterface {
+    fn base(env: Env) -> OracleAsset;
+}
+
+/// Registry sleeve-type code for cash, and the vault's oracle-priced
+/// foreign-currency sleeve (`SleeveType::EurSovereign`) a cash asset other
+/// than the vault currency is held as. EURC is the only such registry asset
+/// today; a registry currency field is needed before adding another.
+const REGISTRY_CASH: u32 = 0;
+const VAULT_FOREIGN_CASH: u32 = 2;
 
 /// Step 3: one signed policy sleeve (mirror of `constella_policy::SleeveTarget`
 /// / the vault's `PolicySleeveTargetRef`; contract types decode by field name).
@@ -259,6 +283,11 @@ fn deploy_vault(env: &Env, creator: &Address, params: VaultParams) -> Address {
     let env = env.clone();
     let creator = creator.clone();
     let s = settings(&env);
+    // Step 4: the vault currency must be the oracle's base (see the error).
+    match OracleBaseClient::new(&env, &s.oracle).base() {
+        OracleAsset::Stellar(base) if base == params.numeraire => {}
+        _ => panic_with_error!(&env, FactoryError::NumeraireNotOracleBase),
+    }
     if params.performance_fee_bps > MAX_PERFORMANCE_FEE_BPS
         || params.tvl_cap <= 0
         || params.per_user_cap <= 0
@@ -370,6 +399,7 @@ impl VaultFactory {
             panic_with_error!(&env, FactoryError::InvalidParams);
         }
         let s = settings(&env);
+        let numeraire = params.numeraire.clone();
         let vault = deploy_vault(&env, &creator, params);
         let registry = RegistryClient::new(&env, &s.registry);
         let mut sleeves: Vec<SleeveStateRef> = Vec::new(&env);
@@ -378,13 +408,16 @@ impl VaultFactory {
                 Some(e) if e.is_active => e,
                 _ => panic_with_error!(&env, FactoryError::AssetNotRegistered),
             };
+            let foreign_cash = entry.sleeve_type == REGISTRY_CASH && entry.contract_address != numeraire;
             sleeves.push_back(SleeveStateRef {
                 asset_id: symbol_string(&env, &entry.asset_id),
                 contract_address: entry.contract_address,
                 target_weight_bps: t.target_weight_bps,
                 band_bps: terms.rebalance_band_bps,
                 current_balance: 0,
-                sleeve_type: entry.sleeve_type,
+                // Step 4: a cash asset other than the vault currency is an
+                // oracle-priced foreign-currency sleeve, never valued at face.
+                sleeve_type: if foreign_cash { VAULT_FOREIGN_CASH } else { entry.sleeve_type },
                 liquidity_tier: entry.liquidity_tier,
             });
         }
