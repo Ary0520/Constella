@@ -34,9 +34,8 @@
 #![allow(clippy::too_many_arguments)]
 
 use soroban_sdk::{
-    contract, contracterror, contractevent, contractimpl, contracttype, ContractExecutable, panic_with_error,
-    xdr::ToXdr, Address, Bytes,
-    BytesN, Env, IntoVal, String, Val, Vec,
+    contract, contractclient, contracterror, contractevent, contractimpl, contracttype, ContractExecutable,
+    panic_with_error, xdr::ToXdr, Address, Bytes, BytesN, Env, FromVal, IntoVal, String, Symbol, SymbolStr, Val, Vec,
 };
 
 /// Same 48 h as the vault upgrade timelock, policy notice, recovery delay.
@@ -62,7 +61,86 @@ pub enum FactoryError {
     WasmChangeNotReady = 4,
     /// This creator reached MAX_VAULTS_PER_CREATOR.
     TooManyVaults = 5,
+    /// Step 3: a policy sleeve is not an active registry asset.
+    AssetNotRegistered = 6,
 }
+
+/// Step 3: one signed policy sleeve (mirror of `constella_policy::SleeveTarget`
+/// / the vault's `PolicySleeveTargetRef`; contract types decode by field name).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicySleeveTarget {
+    pub asset_id: Symbol,
+    pub target_weight_bps: u32,
+    pub min_band_bps: u32,
+    pub max_band_bps: u32,
+    pub sleeve_type: Symbol,
+}
+
+/// Step 3: the signed policy a creator binds to their new vault - exactly the
+/// `bind_policy` terms the AI engine derives from the hashed policy.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PolicyTerms {
+    pub policy_hash: BytesN<32>,
+    pub min_liquidity_sleeve_bps: u32,
+    pub max_single_asset_bps: u32,
+    pub max_issuer_bps: u32,
+    pub max_slippage_bps: u32,
+    pub rebalance_band_bps: u32,
+    pub sleeves: Vec<PolicySleeveTarget>,
+}
+
+/// Mirror of `constella_vault_strategy::SleeveState` (enum fields as u32).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SleeveStateRef {
+    pub asset_id: String,
+    pub contract_address: Address,
+    pub target_weight_bps: u32,
+    pub band_bps: u32,
+    pub current_balance: i128,
+    pub sleeve_type: u32,
+    pub liquidity_tier: u32,
+}
+
+/// Mirror of `constella_registry::AssetEntry` (sleeve type as u32; the
+/// registry and vault sleeve-type numbering is identical: 0 cash ... 6 XLM).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegistryAssetRef {
+    pub contract_address: Address,
+    pub asset_id: Symbol,
+    pub issuer: Symbol,
+    pub sleeve_type: u32,
+    pub liquidity_tier: u32,
+    pub permissionless: bool,
+    pub oracle_sources: Vec<Symbol>,
+    pub eligible_jurisdictions: Vec<Symbol>,
+    pub blocked_jurisdictions: Vec<Symbol>,
+    pub investor_classes_required: Vec<Symbol>,
+    pub is_active: bool,
+    pub added_at: u64,
+}
+
+#[contractclient(name = "RegistryClient")]
+pub trait RegistryInterface {
+    fn get_asset(env: Env, asset_id: Symbol) -> Option<RegistryAssetRef>;
+}
+
+/// The vault admin calls the factory makes on the creator's behalf (the
+/// creator's single signature covers them as sub-invocations).
+#[contractclient(name = "VaultClient")]
+pub trait VaultAdminInterface {
+    fn bind_policy(env: Env, owner: Address, policy_hash: BytesN<32>, min_liquidity_sleeve_bps: u32, max_single_asset_bps: u32,
+                   max_issuer_bps: u32, max_slippage_bps: u32, rebalance_band_bps: u32, sleeves: Vec<PolicySleeveTarget>);
+    fn set_sleeves(env: Env, sleeves: Vec<SleeveStateRef>);
+    fn set_keeper(env: Env, keeper: Address);
+    fn propose_router(env: Env, route: u32, router: Address);
+}
+
+/// `constella_vault_strategy::TradeRoute::Soroswap`.
+const ROUTE_SOROSWAP: u32 = 1;
 
 /// Mirror of `constella_vault_strategy::VaultConfig` (field names and types
 /// must match: contract types decode by field name).
@@ -109,6 +187,10 @@ pub struct FactorySettings {
     pub max_tvl_cap: i128,
     /// Decision D-O: Constella's fee for factory vaults (bps of profit).
     pub default_fee_bps: u32,
+    /// Step 3: Constella's keeper, set on vaults created with a policy.
+    pub keeper: Address,
+    /// Step 3: Soroswap router set on vaults created with a policy (if any).
+    pub router: Option<Address>,
 }
 
 #[contracttype]
@@ -171,6 +253,77 @@ fn extend(env: &Env) {
     env.storage().instance().extend_ttl(TTL_THRESHOLD, TTL_EXTEND_TO);
 }
 
+/// Shared by both creation paths: protocol bounds, the D-O fee rule, the
+/// creator-bound address, the per-creator and global indexes, the event.
+fn deploy_vault(env: &Env, creator: &Address, params: VaultParams) -> Address {
+    let env = env.clone();
+    let creator = creator.clone();
+    let s = settings(&env);
+    if params.performance_fee_bps > MAX_PERFORMANCE_FEE_BPS
+        || params.tvl_cap <= 0
+        || params.per_user_cap <= 0
+        || params.per_user_cap > params.tvl_cap
+    {
+        panic_with_error!(&env, FactoryError::InvalidParams);
+    }
+    // D-O: Constella's fee is Constella's to set. Anything but the default
+    // must be co-signed by the factory admin.
+    if params.performance_fee_bps != s.default_fee_bps {
+        s.admin.require_auth();
+    }
+    if params.tvl_cap > s.max_tvl_cap {
+        panic_with_error!(&env, FactoryError::TvlCapTooHigh);
+    }
+    let mut mine: Vec<Address> = env.storage().persistent().get(&DataKey::VaultsOf(creator.clone())).unwrap_or_else(|| Vec::new(&env));
+    if mine.len() >= MAX_VAULTS_PER_CREATOR {
+        panic_with_error!(&env, FactoryError::TooManyVaults);
+    }
+    // Address bound to the creator: SHA-256(creator XDR || salt).
+    let mut seed = Bytes::new(&env);
+    seed.append(&creator.clone().to_xdr(&env));
+    seed.append(&params.salt.clone().into());
+    let salt: BytesN<32> = env.crypto().sha256(&seed).into();
+    let config = VaultConfigRef {
+        admin: params.admin,
+        pause_authority: params.pause_authority,
+        numeraire: params.numeraire,
+        policy_contract: s.policy.clone(),
+        oracle_contract: s.oracle.clone(),
+        registry_contract: s.registry.clone(),
+        treasury: s.treasury.clone(),
+        performance_fee_bps: params.performance_fee_bps,
+        tvl_cap: params.tvl_cap,
+        per_user_cap: params.per_user_cap,
+    };
+    let args: Vec<Val> = (config, params.name, params.symbol, VAULT_DECIMALS).into_val(&env);
+    let vault = env.deployer().with_current_contract(salt)
+        .deploy_contract(ContractExecutable::Wasm(s.vault_wasm_hash.clone()), args);
+
+    env.storage().persistent().set(&DataKey::Vault(vault.clone()), &creator);
+    env.storage().persistent().extend_ttl(&DataKey::Vault(vault.clone()), TTL_THRESHOLD, TTL_EXTEND_TO);
+    mine.push_back(vault.clone());
+    env.storage().persistent().set(&DataKey::VaultsOf(creator.clone()), &mine);
+    // Step 3: global append-only index for services (keeper, relayer).
+    let n: u32 = env.storage().instance().get(&DataKey::VaultCount).unwrap_or(0);
+    env.storage().persistent().set(&DataKey::VaultAt(n), &vault);
+    env.storage().persistent().extend_ttl(&DataKey::VaultAt(n), TTL_THRESHOLD, TTL_EXTEND_TO);
+    env.storage().instance().set(&DataKey::VaultCount, &(n + 1));
+    env.storage().persistent().extend_ttl(&DataKey::VaultsOf(creator.clone()), TTL_THRESHOLD, TTL_EXTEND_TO);
+    extend(&env);
+    VaultCreated { creator, vault: vault.clone(), wasm_hash: s.vault_wasm_hash }.publish(&env);
+    vault
+}
+
+/// A registry asset ID as the vault's sleeve label (as `vault-strategy` does).
+fn symbol_string(env: &Env, sym: &Symbol) -> String {
+    let s: SymbolStr = SymbolStr::from_val(env, &sym.to_symbol_val());
+    let bytes: &[u8] = s.as_ref();
+    match core::str::from_utf8(bytes) {
+        Ok(text) => String::from_str(env, text),
+        Err(_) => panic_with_error!(env, FactoryError::AssetNotRegistered),
+    }
+}
+
 #[contract]
 pub struct VaultFactory;
 
@@ -186,72 +339,67 @@ impl VaultFactory {
         treasury: Address,
         max_tvl_cap: i128,
         default_fee_bps: u32,
+        keeper: Address,
+        router: Option<Address>,
     ) {
         if max_tvl_cap <= 0 || default_fee_bps > MAX_PERFORMANCE_FEE_BPS {
             panic_with_error!(&env, FactoryError::InvalidParams);
         }
-        let s = FactorySettings { admin, vault_wasm_hash, registry, oracle, policy, treasury, max_tvl_cap, default_fee_bps };
+        let s = FactorySettings { admin, vault_wasm_hash, registry, oracle, policy, treasury, max_tvl_cap, default_fee_bps,
+                                  keeper, router };
         env.storage().instance().set(&DataKey::Settings, &s);
     }
 
     /// Deploy a private vault for `creator` (who must sign). Returns its address.
     pub fn create_vault(env: Env, creator: Address, params: VaultParams) -> Address {
         creator.require_auth();
-        let s = settings(&env);
-        if params.performance_fee_bps > MAX_PERFORMANCE_FEE_BPS
-            || params.tvl_cap <= 0
-            || params.per_user_cap <= 0
-            || params.per_user_cap > params.tvl_cap
-        {
+        deploy_vault(&env, &creator, params)
+    }
+
+    /// Step 3: deploy a private vault and set it up from a signed policy in one
+    /// call - the creator signs once. The creator must be the vault's admin and
+    /// pause authority (a treasury with a separate multisig admin uses
+    /// `create_vault` and the vault's admin calls instead). Then, re-using the
+    /// vault's own checks: `bind_policy` (the creator is the policy owner),
+    /// `set_sleeves` built from the registry (address, sleeve type, liquidity
+    /// tier - never from the caller), Constella's keeper and router. Any
+    /// failure reverts everything.
+    pub fn create_vault_with_policy(env: Env, creator: Address, params: VaultParams, terms: PolicyTerms) -> Address {
+        creator.require_auth();
+        if params.admin != creator || params.pause_authority != creator {
             panic_with_error!(&env, FactoryError::InvalidParams);
         }
-        // D-O: Constella's fee is Constella's to set. Anything but the default
-        // must be co-signed by the factory admin.
-        if params.performance_fee_bps != s.default_fee_bps {
-            s.admin.require_auth();
+        let s = settings(&env);
+        let vault = deploy_vault(&env, &creator, params);
+        let registry = RegistryClient::new(&env, &s.registry);
+        let mut sleeves: Vec<SleeveStateRef> = Vec::new(&env);
+        for t in terms.sleeves.iter() {
+            let entry = match registry.get_asset(&t.asset_id) {
+                Some(e) if e.is_active => e,
+                _ => panic_with_error!(&env, FactoryError::AssetNotRegistered),
+            };
+            sleeves.push_back(SleeveStateRef {
+                asset_id: symbol_string(&env, &entry.asset_id),
+                contract_address: entry.contract_address,
+                target_weight_bps: t.target_weight_bps,
+                band_bps: terms.rebalance_band_bps,
+                current_balance: 0,
+                sleeve_type: entry.sleeve_type,
+                liquidity_tier: entry.liquidity_tier,
+            });
         }
-        if params.tvl_cap > s.max_tvl_cap {
-            panic_with_error!(&env, FactoryError::TvlCapTooHigh);
+        let v = VaultClient::new(&env, &vault);
+        v.bind_policy(&creator, &terms.policy_hash, &terms.min_liquidity_sleeve_bps, &terms.max_single_asset_bps,
+                      &terms.max_issuer_bps, &terms.max_slippage_bps, &terms.rebalance_band_bps, &terms.sleeves);
+        v.set_sleeves(&sleeves);
+        v.set_keeper(&s.keeper);
+        if let Some(router) = s.router {
+            v.propose_router(&ROUTE_SOROSWAP, &router);
         }
-        let mut mine: Vec<Address> = env.storage().persistent().get(&DataKey::VaultsOf(creator.clone())).unwrap_or_else(|| Vec::new(&env));
-        if mine.len() >= MAX_VAULTS_PER_CREATOR {
-            panic_with_error!(&env, FactoryError::TooManyVaults);
-        }
-        // Address bound to the creator: SHA-256(creator XDR || salt).
-        let mut seed = Bytes::new(&env);
-        seed.append(&creator.clone().to_xdr(&env));
-        seed.append(&params.salt.clone().into());
-        let salt: BytesN<32> = env.crypto().sha256(&seed).into();
-        let config = VaultConfigRef {
-            admin: params.admin,
-            pause_authority: params.pause_authority,
-            numeraire: params.numeraire,
-            policy_contract: s.policy.clone(),
-            oracle_contract: s.oracle.clone(),
-            registry_contract: s.registry.clone(),
-            treasury: s.treasury.clone(),
-            performance_fee_bps: params.performance_fee_bps,
-            tvl_cap: params.tvl_cap,
-            per_user_cap: params.per_user_cap,
-        };
-        let args: Vec<Val> = (config, params.name, params.symbol, VAULT_DECIMALS).into_val(&env);
-        let vault = env.deployer().with_current_contract(salt)
-            .deploy_contract(ContractExecutable::Wasm(s.vault_wasm_hash.clone()), args);
-
-        env.storage().persistent().set(&DataKey::Vault(vault.clone()), &creator);
-        env.storage().persistent().extend_ttl(&DataKey::Vault(vault.clone()), TTL_THRESHOLD, TTL_EXTEND_TO);
-        mine.push_back(vault.clone());
-        env.storage().persistent().set(&DataKey::VaultsOf(creator.clone()), &mine);
-        // Step 3: global append-only index for services (keeper, relayer).
-        let n: u32 = env.storage().instance().get(&DataKey::VaultCount).unwrap_or(0);
-        env.storage().persistent().set(&DataKey::VaultAt(n), &vault);
-        env.storage().persistent().extend_ttl(&DataKey::VaultAt(n), TTL_THRESHOLD, TTL_EXTEND_TO);
-        env.storage().instance().set(&DataKey::VaultCount, &(n + 1));
-        env.storage().persistent().extend_ttl(&DataKey::VaultsOf(creator.clone()), TTL_THRESHOLD, TTL_EXTEND_TO);
-        extend(&env);
-        VaultCreated { creator, vault: vault.clone(), wasm_hash: s.vault_wasm_hash }.publish(&env);
         vault
     }
+
+
 
     /// True only for contracts this factory deployed.
     pub fn is_vault(env: Env, vault: Address) -> bool {
