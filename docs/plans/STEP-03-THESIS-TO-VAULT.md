@@ -43,3 +43,13 @@ institution, with their own policy, admin accounts and share class").
 
 Done when: on testnet, a typed thesis produces a live vault the user owns, enforcing that thesis, with
 sponsored deposit and keeper rebalancing.
+
+## Result (24 Nov 2026) - done, live on testnet
+- Contracts: `create_vault_with_policy`, factory index, D-O default fee (vault-factory); trusted factories (fee-sponsor).
+  Gate each time: release 12/12, up to 355 workspace tests, clippy clean; every new rule mutation-tested.
+- Services: relayer `SPONSOR_VAULT_FUNCTIONS` (+ on-chain proof), keeper `KEEPER_FACTORIES` discovery.
+- Console: "Create my vault from this policy", own-vault selector.
+- Live proofs: `testnet/e2e_own_vault.py` (wallet path; AI-drafted policy, vault CAKHHEYC..., keeper rebalanced
+  it to 85 USDC / 15 Blend), `sandbox/e2e/own-vault.cjs` on the hosted console (passkey path, zero XLM,
+  vault CBED5JAW..., 50 USDC -> 50 shares).
+- Testnet: factory CAZLSNOH..., fee-sponsor CBGK2E2C... (previous kept as vault_factory_v2 / fee_sponsor_v1).
