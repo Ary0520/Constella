@@ -14,6 +14,7 @@ use soroban_sdk::{
 const VAULT_WASM: &[u8] = include_bytes!("../../target/wasm32v1-none/release/constella_vault_strategy.wasm");
 const ONE: i128 = 10_000_000;
 const MAX_TVL: i128 = 1_000_000 * ONE; // ROADMAP 3.2 beta cap, Rule 6
+const DEFAULT_FEE: u32 = 1_000; // D-D: 10 % of profit, Constella's fee for factory vaults
 
 struct F {
     env: Env,
@@ -49,7 +50,7 @@ fn setup() -> F {
     let policy = env.register(PolicyContract, (admin.clone(), oracle.clone()));
     let hash = env.deployer().upload_contract_wasm(VAULT_WASM);
     let treasury = Address::generate(&env);
-    let factory = env.register(VaultFactory, (admin, hash, registry.clone(), oracle, policy, treasury, MAX_TVL));
+    let factory = env.register(VaultFactory, (admin, hash, registry.clone(), oracle, policy, treasury, MAX_TVL, DEFAULT_FEE));
     let usdc_admin = token::StellarAssetClient::new(&env, &usdc);
     F { env: env.clone(), factory: VaultFactoryClient::new(&env, &factory), usdc, usdc_admin, registry }
 }
@@ -192,4 +193,97 @@ fn each_creator_has_a_bounded_index() {
     let mut p = params(&f, &c, 0xEE);
     p.salt = BytesN::from_array(&f.env, &[0xEE; 32]);
     assert_eq!(f.factory.try_create_vault(&c, &p), Err(Ok(FactoryError::TooManyVaults.into())));
+}
+
+// -------------------------------------------------------------------------
+// Decision D-O (24 Nov 2026): Constella's fee on a factory vault is set by
+// Constella (the factory admin), never by the creator - the pattern of Yearn
+// v3's factory-held protocol fee config with governance-set per-vault custom
+// fees. A creator gets the factory default; any other rate (a negotiated
+// Treasury-plan discount) needs the factory admin's co-signature. Changing
+// the default affects future vaults only; a vault's fee is fixed for life.
+// -------------------------------------------------------------------------
+mod protocol_fee {
+    use super::*;
+
+    fn creator_only(f: &F, creator: &Address, p: &VaultParams) {
+        f.env.mock_auths(&[MockAuth { address: creator, invoke: &MockAuthInvoke { contract: &f.factory.address,
+            fn_name: "create_vault", args: (creator.clone(), p.clone()).into_val(&f.env), sub_invokes: &[] } }]);
+    }
+
+    #[test]
+    fn a_creator_alone_gets_exactly_the_default_fee() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let mut p = params(&f, &c, 10);
+        p.performance_fee_bps = DEFAULT_FEE;
+        creator_only(&f, &c, &p);
+        let v = f.factory.create_vault(&c, &p);
+        assert_eq!(StrategyVaultClient::new(&f.env, &v).get_config().performance_fee_bps, DEFAULT_FEE);
+    }
+
+    #[test]
+    fn a_creator_alone_cannot_choose_constellas_fee() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        for fee in [0u32, 1, 500, DEFAULT_FEE - 1] {
+            let mut p = params(&f, &c, 11);
+            p.performance_fee_bps = fee;
+            creator_only(&f, &c, &p);
+            assert!(f.factory.try_create_vault(&c, &p).is_err(), "creator set Constella's fee to {fee}");
+        }
+        assert!(f.factory.vaults_of(&c).is_empty());
+    }
+
+    #[test]
+    fn a_custom_fee_needs_the_factory_admins_cosignature() {
+        let f = setup();
+        let admin = f.factory.get_settings().admin;
+        let c = Address::generate(&f.env);
+        let mut p = params(&f, &c, 12);
+        p.performance_fee_bps = 500; // Treasury plan: 5 % of profit
+        f.env.mock_auths(&[
+            MockAuth { address: &c, invoke: &MockAuthInvoke { contract: &f.factory.address,
+                fn_name: "create_vault", args: (c.clone(), p.clone()).into_val(&f.env), sub_invokes: &[] } },
+            MockAuth { address: &admin, invoke: &MockAuthInvoke { contract: &f.factory.address,
+                fn_name: "create_vault", args: (c.clone(), p.clone()).into_val(&f.env), sub_invokes: &[] } },
+        ]);
+        let v = f.factory.create_vault(&c, &p);
+        assert_eq!(StrategyVaultClient::new(&f.env, &v).get_config().performance_fee_bps, 500);
+    }
+
+    #[test]
+    fn the_default_changes_only_future_vaults_and_only_by_the_admin() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let mut p = params(&f, &c, 13);
+        p.performance_fee_bps = DEFAULT_FEE;
+        let before = f.factory.create_vault(&c, &p);
+        // A stranger cannot change it.
+        let stranger = Address::generate(&f.env);
+        f.env.mock_auths(&[MockAuth { address: &stranger, invoke: &MockAuthInvoke { contract: &f.factory.address,
+            fn_name: "set_default_fee", args: (700u32,).into_val(&f.env), sub_invokes: &[] } }]);
+        assert!(f.factory.try_set_default_fee(&700).is_err());
+        f.env.mock_all_auths();
+        // Never above the D-D ceiling.
+        assert_eq!(f.factory.try_set_default_fee(&(MAX_PERFORMANCE_FEE_BPS + 1)), Err(Ok(FactoryError::InvalidParams.into())));
+        f.factory.set_default_fee(&700);
+        assert_eq!(f.factory.get_settings().default_fee_bps, 700);
+        // Existing vault unchanged; a new creator-only vault gets the new default.
+        assert_eq!(StrategyVaultClient::new(&f.env, &before).get_config().performance_fee_bps, DEFAULT_FEE);
+        let mut q = params(&f, &c, 14);
+        q.performance_fee_bps = 700;
+        creator_only(&f, &c, &q);
+        let after = f.factory.create_vault(&c, &q);
+        assert_eq!(StrategyVaultClient::new(&f.env, &after).get_config().performance_fee_bps, 700);
+    }
+
+    #[test]
+    #[should_panic]
+    fn the_constructor_refuses_a_default_above_the_ceiling() {
+        let f = setup();
+        let s = f.factory.get_settings();
+        f.env.register(VaultFactory, (s.admin, s.vault_wasm_hash, s.registry, s.oracle, s.policy, s.treasury,
+                                      MAX_TVL, MAX_PERFORMANCE_FEE_BPS + 1));
+    }
 }
