@@ -422,16 +422,17 @@ mod with_policy {
         assert_eq!(mine.len(), 1, "one authorization tree for the creator");
         let root = &mine[0].1;
         let name = |inv: &soroban_sdk::testutils::AuthorizedInvocation| match &inv.function {
-            AuthorizedFunction::Contract((addr, f, _)) => (addr.clone(), f.to_string()),
+            AuthorizedFunction::Contract((addr, f, _)) => (addr.clone(), f.clone()),
             _ => panic!("unexpected"),
         };
-        assert_eq!(name(root), (f.factory.address.clone(), "create_vault_with_policy".into()));
-        let subs: std::vec::Vec<_> = root.sub_invocations.iter().map(|s| name(s)).collect();
+        let sym = |n: &str| Symbol::new(&f.env, n);
+        assert_eq!(name(root), (f.factory.address.clone(), sym("create_vault_with_policy")));
+        let subs: std::vec::Vec<_> = root.sub_invocations.iter().map(name).collect();
         for fname in ["bind_policy", "set_sleeves", "set_keeper", "propose_router"] {
-            assert!(subs.contains(&(vault.clone(), fname.into())), "{fname} covered by the one signature");
+            assert!(subs.contains(&(vault.clone(), sym(fname))), "{fname} covered by the one signature");
         }
-        let bind = root.sub_invocations.iter().find(|s| name(s).1 == "bind_policy").unwrap();
-        assert!(bind.sub_invocations.iter().any(|s| name(s).1 == "register_policy"), "owner consent inside the same tree");
+        let bind = root.sub_invocations.iter().find(|s| name(s).1 == sym("bind_policy")).unwrap();
+        assert!(bind.sub_invocations.iter().any(|s| name(s).1 == sym("register_policy")), "owner consent inside the same tree");
     }
 
     #[test]
@@ -455,6 +456,16 @@ mod with_policy {
         let mut t = terms(&f);
         t.sleeves = vec![&f.env, target(&f, "USDC", 8500, 8300, 8700, "numeraire"), target(&f, "NOPE", 1500, 1300, 1700, "lending")];
         assert_eq!(f.factory.try_create_vault_with_policy(&c, &own(&f, &c, 33), &t), Err(Ok(FactoryError::AssetNotRegistered.into())));
+        assert_eq!(f.factory.vault_count(), 0);
+    }
+
+    #[test]
+    fn a_deactivated_registry_asset_is_refused_by_the_factory() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        AssetRegistryClient::new(&f.env, &f.registry).deactivate_asset(&Symbol::new(&f.env, "TBILL"));
+        assert_eq!(f.factory.try_create_vault_with_policy(&c, &own(&f, &c, 38), &terms(&f)),
+                   Err(Ok(FactoryError::AssetNotRegistered.into())));
         assert_eq!(f.factory.vault_count(), 0);
     }
 
