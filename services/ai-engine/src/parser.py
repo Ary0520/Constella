@@ -25,6 +25,21 @@ DEFAULT_MAX_SINGLE_ASSET = 0.25
 # (not the one inside "22.5%").
 _CLAUSE_SPLIT = re.compile(r"[;,]|\.(?=\s|$)|\band\b|\bbut\b", re.IGNORECASE)
 _PCT = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+# Step 4: fraction words read as percentages ("hold a third in euro" is the
+# founding doc's own example). Word boundaries keep "behalf" etc. intact.
+_FRACTIONS = [
+    (re.compile(r"\btwo[\s-]+thirds\b", re.I), "66.67%"),
+    (re.compile(r"\bthree[\s-]+quarters\b", re.I), "75%"),
+    (re.compile(r"\b(?:a|one)[\s-]+third\b", re.I), "33.33%"),
+    (re.compile(r"\b(?:a|one)[\s-]+quarter\b", re.I), "25%"),
+    (re.compile(r"\b(?:a|one)?[\s-]*half\b", re.I), "50%"),
+]
+
+
+def _fractions_as_percent(text: str) -> str:
+    for rx, pct in _FRACTIONS:
+        text = rx.sub(pct, text)
+    return text
 _MAX_WORDS = re.compile(r"no more than|not more than|at most|\bmax(?:imum)?\b|\bup to\b|\bcap(?:ped)?\b|\blimit(?:ed)?\b|\babove\b|\bover\b|\bceiling\b|<=|≤")
 _MIN_WORDS = re.compile(r"at least|\bminimum\b|\bmin\b|no less than|not less than")
 _ISSUER = re.compile(r"\bissuers?\b")
@@ -63,7 +78,7 @@ def parse_thesis(
     3. Flags unsupported assets outside the closed registry in ambiguities.
     4. Applies conservative fallback parameters and confidence penalties for vague inputs.
     """
-    raw_text = thesis.strip()
+    raw_text = _fractions_as_percent(thesis.strip())
     text_lower = raw_text.lower()
     ambiguities: List[str] = []
     confidence: Dict[str, float] = {}
@@ -130,6 +145,16 @@ def parse_thesis(
     max_single_asset_weight = _resolve_cap(asset_caps, DEFAULT_MAX_SINGLE_ASSET, "single-asset", ambiguities, confidence,
                                            "max_single_asset_weight")
 
+    # Step 4: a partial split leaves the rest in the vault currency (USD by
+    # default; EUR when the dollar share is the one given) - "a third in euro"
+    # means two thirds in dollars, not "drop every dollar asset".
+    given = sum(currency_exposure.values())
+    if currency_exposure and given < 0.999:
+        rest = round(1.0 - given, 4)
+        if "USD" not in currency_exposure:
+            currency_exposure["USD"] = rest
+        elif "EUR" not in currency_exposure and any(t in text_lower for t in ["euro", "eur", "€"]):
+            currency_exposure["EUR"] = rest
     # Fallback for currency exposure if not parsed
     if currency_exposure:
         confidence["currency_exposure"] = 0.95
