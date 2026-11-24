@@ -51,7 +51,7 @@
 |---|---|---|---|
 | **Explorer** | Individuals & retail testers | Unlimited drafts & simulations, 1 active basket up to $25k | 10% of profit, max 0.20% / yr (No SaaS fee) |
 | **Pro** | Power users & angels | Unlimited baskets, custom rebalance bands, CSV exports | 10% of profit, max 0.20% / yr + $19 / month |
-| **Treasury** | Startups, DAOs, VC Funds, Foundations | Private vaults, multisig & ML-DSA, tax-lot accounting, API access | $199–$499 / mo + performance fee set per vault (≤ 10% of profit; e.g. 5% above $5M AUM) |
+| **Treasury** | Startups, DAOs, VC Funds, Foundations | Private vaults, multisig & ML-DSA, tax-lot accounting, API access | $199–$499 / mo + performance fee set per vault (≤ 10% of profit; e.g. 5% above $5M AUM). The rate is set by Constella: factory vaults get the default 10 %; a discount needs Constella's co-signature on `create_vault` (D-O) |
 | **Partner** | Wallets, Anchors, Fintechs | White-label UI, SDK access, W-address omnibus, priority routing | 30% of the performance fee shared with the partner (or flat enterprise licence) |
 | **Curator** | Strategy publishers | Public thesis publishing, distribution channel | Curator's share comes out of the 10% performance fee |
 
