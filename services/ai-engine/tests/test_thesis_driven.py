@@ -106,3 +106,50 @@ def test_every_result_passes_the_integer_exact_final_check():
                       ("Park 18 months of runway in dollar T-bill funds, at least 10% instant cash.", "professional")]:
         d, cands, r = run(text, cls=cls)
         assert check_allocation(r.weights_bps, d, cands, r.numeraire) == []
+
+
+# --- the optimiser's own liquidity and vault-currency rules (direct, with positive controls) ---
+from src.models import PolicyDraft  # noqa: E402
+
+
+def _asset(asset_id, issuer, sleeve, tier, pct):
+    from src.models import AssetCandidate, SleeveType
+    return AssetCandidate(asset_id=asset_id, display_name=asset_id, issuer=issuer, sleeve_type=SleeveType(sleeve), currency="USD",
+                          liquidity_tier=tier, permissionless=True, contract_address=fixture_address(asset_id),
+                          current_yield_pct=pct)
+
+
+def _cands(extra):
+    base = [a for a in fixture_registry().list_assets() if a.asset_id in {"USDC", "BLEND_USDC_SUPPLY"}]
+    return base + extra
+
+
+def _policy(horizon):
+    return PolicyDraft(jurisdiction="DE", investor_class="retail", currency_exposure={"USD": 1.0}, liquidity_horizon_hours=horizon,
+                       max_single_asset_weight=0.40, max_issuer_weight=0.40, min_liquidity_sleeve=0.10,
+                       target_yield_orientation="maximize", risk_tolerance="growth")
+
+
+def test_an_illiquid_asset_is_held_only_when_the_horizon_allows_a_month():
+    c = _cands([_asset("PRIVATE_CREDIT", "CREDCO", "yield_dollar", 3, 9.0)])
+    assert optimize_portfolio(_policy(24), c).weights_bps["PRIVATE_CREDIT"] == 0
+    assert optimize_portfolio(_policy(720), c).weights_bps["PRIVATE_CREDIT"] > 0  # control: the rule, not the data, blocks it
+    assert check_allocation({"USDC": 8000, "BLEND_USDC_SUPPLY": 1000, "PRIVATE_CREDIT": 1000}, _policy(24), c, "USDC", soft=False)
+
+
+def test_assets_slower_than_the_horizon_are_at_most_a_quarter():
+    c = _cands([_asset("WEEKLY_FUND", "FUNDCO", "usd_gov_fund", 2, 6.0)])
+    w = optimize_portfolio(_policy(24), c).weights_bps["WEEKLY_FUND"]
+    assert 0 < w <= 2500
+    assert optimize_portfolio(_policy(168), c).weights_bps["WEEKLY_FUND"] > 2500  # control: up to the 40 % cap
+    assert check_allocation({"USDC": 6000, "BLEND_USDC_SUPPLY": 1000, "WEEKLY_FUND": 3000}, _policy(24), c, "USDC", soft=False)
+
+
+def test_a_dollar_thesis_never_gets_a_euro_vault_currency():
+    reg = fixture_registry()
+    c = [a for a in reg.list_assets() if a.asset_id in {"EURC", "BLEND_USDC_SUPPLY"}]  # no USDC available
+    from src.optimizer import choose_numeraire
+    assert choose_numeraire(_policy(24), c) is None
+    with pytest.raises(InfeasibleAllocation) as e:
+        optimize_portfolio(_policy(24), c)
+    assert "USD" in e.value.reasons[0]
