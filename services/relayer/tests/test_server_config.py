@@ -39,3 +39,12 @@ def test_per_function_fee_caps_parse_and_reject_garbage():
     assert parse_fee_caps("") == {}
     with pytest.raises(ValueError):
         parse_fee_caps("add_device:lots")
+
+
+def test_vault_functions_parse_and_are_limited_to_vault_user_calls():
+    from constella_relayer.server import parse_vault_functions
+    assert parse_vault_functions("deposit, redeem,withdraw,redeem_frozen") == frozenset({"deposit", "redeem", "withdraw", "redeem_frozen"})
+    assert parse_vault_functions("") == frozenset()
+    for bad in ["set_keeper", "deposit,propose_upgrade", "transfer"]:
+        with pytest.raises(ValueError):
+            parse_vault_functions(bad)

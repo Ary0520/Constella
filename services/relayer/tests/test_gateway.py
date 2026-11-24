@@ -162,3 +162,49 @@ def test_delegate_trees_are_bounded():
     other = StrKey.encode_contract(os.urandom(32))
     many = [delegate(other) for _ in range(9)]
     assert code(func(c), [entry(c, kind="delegates", delegates=many)]) == "TOO_MANY_DELEGATES"
+
+
+# --- Step 3: users' own factory vaults (new addresses, not on the static list) ---
+VAULT_FNS = frozenset({"deposit", "redeem", "withdraw", "redeem_frozen"})
+OWN_VAULT = StrKey.encode_contract(os.urandom(32))
+
+
+def test_vault_user_functions_are_accepted_on_an_unlisted_contract_for_the_on_chain_proof():
+    # The gateway lets the vault user functions through on any contract; the
+    # relayer then requires the fee-sponsor's on-chain is_whitelisted, which
+    # holds only for vaults proven by a trusted Constella factory.
+    for fn in sorted(VAULT_FNS):
+        c = call(contract=OWN_VAULT, fn=fn)
+        v = validate(func(c), [entry(c)], ALLOWED, RELAYERS, vault_functions=VAULT_FNS)
+        assert (v.contract, v.function, v.needs_chain_proof) == (OWN_VAULT, fn, True)
+
+
+def test_statically_listed_calls_need_no_extra_proof():
+    c = call()
+    v = validate(func(c), [entry(c)], ALLOWED, RELAYERS, vault_functions=VAULT_FNS)
+    assert v.needs_chain_proof is False
+
+
+def test_other_functions_on_an_unlisted_contract_stay_refused():
+    for fn, args in [("set_keeper", [scval.to_address(USER)]), ("transfer", None), ("propose_upgrade", [scval.to_bytes(b"\0" * 32)])]:
+        c = call(contract=OWN_VAULT, fn=fn, args=args)
+        with pytest.raises(Rejected) as e:
+            validate(func(c), [entry(c)], ALLOWED, RELAYERS, vault_functions=VAULT_FNS)
+        assert e.value.code == "TARGET_NOT_ALLOWED"
+
+
+def test_unlisted_contracts_are_refused_when_no_vault_functions_are_configured():
+    c = call(contract=OWN_VAULT, fn="deposit")
+    assert code(func(c), [entry(c)]) == "TARGET_NOT_ALLOWED"
+
+
+def test_every_other_rule_still_applies_to_own_vault_calls():
+    pull = call(contract=OWN_VAULT, fn="deposit",
+                args=[scval.to_int128(500), scval.to_address(USER), scval.to_address(RELAYER), scval.to_address(USER)])
+    with pytest.raises(Rejected) as e:
+        validate(func(pull), [entry(pull)], ALLOWED, RELAYERS, vault_functions=VAULT_FNS)
+    assert e.value.code == "RELAYER_ADDRESS_IN_ARGS"
+    c = call(contract=OWN_VAULT, fn="deposit")
+    with pytest.raises(Rejected) as e:
+        validate(func(c), [entry(c, source_account=True)], ALLOWED, RELAYERS, vault_functions=VAULT_FNS)
+    assert e.value.code == "SOURCE_ACCOUNT_AUTH_FORBIDDEN"
