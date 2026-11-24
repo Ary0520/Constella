@@ -7,11 +7,17 @@
 //! * **Fixed by the factory** (a creator cannot choose them): the vault WASM,
 //!   the shared registry, NAV oracle and policy contracts, and the fee
 //!   treasury. A vault can never be pointed at a fake price feed or registry.
+//! * **Constella's fee (decision D-O)**: the performance fee paid to the
+//!   Constella treasury is the factory's `default_fee_bps` (<= 10 % of profit,
+//!   D-D). A creator alone can only take the default; any other rate (a
+//!   negotiated plan discount) needs the factory admin's co-signature, as in
+//!   Yearn v3's factory-held protocol fee config with governance per-vault
+//!   overrides. Changing the default affects future vaults only; a vault's
+//!   fee is fixed for its life (the vault has no fee setter).
 //! * **Chosen by the creator**, within protocol bounds: the vault admin and
 //!   pause authority (their own multisig / smart account), the numéraire (a
-//!   registered cash asset - the vault constructor enforces it), the
-//!   performance fee (<= 10 % of profit, D-D) and the caps (<= the factory's
-//!   `max_tvl_cap`, AGENT-RULES Rule 6).
+//!   registered cash asset - the vault constructor enforces it) and the caps
+//!   (<= the factory's `max_tvl_cap`, AGENT-RULES Rule 6).
 //!
 //! Addresses derive from SHA-256(creator || salt), so nobody can front-run or
 //! squat another creator's vault address. `is_vault` attests that a contract
@@ -101,6 +107,8 @@ pub struct FactorySettings {
     pub policy: Address,
     pub treasury: Address,
     pub max_tvl_cap: i128,
+    /// Decision D-O: Constella's fee for factory vaults (bps of profit).
+    pub default_fee_bps: u32,
 }
 
 #[contracttype]
@@ -135,6 +143,13 @@ pub struct VaultWasmProposed {
     pub effective_at: u64,
 }
 
+/// Topics [DEFAULT_FEE_SET]; data (previous_bps, new_bps). Future vaults only.
+#[contractevent(topics = ["DEFAULT_FEE_SET"], data_format = "vec")]
+pub struct DefaultFeeSet {
+    pub previous_bps: u32,
+    pub new_bps: u32,
+}
+
 #[contractevent(topics = ["VAULT_WASM_ACTIVATED"], data_format = "single-value")]
 pub struct VaultWasmActivated {
     pub wasm_hash: BytesN<32>,
@@ -166,11 +181,12 @@ impl VaultFactory {
         policy: Address,
         treasury: Address,
         max_tvl_cap: i128,
+        default_fee_bps: u32,
     ) {
-        if max_tvl_cap <= 0 {
+        if max_tvl_cap <= 0 || default_fee_bps > MAX_PERFORMANCE_FEE_BPS {
             panic_with_error!(&env, FactoryError::InvalidParams);
         }
-        let s = FactorySettings { admin, vault_wasm_hash, registry, oracle, policy, treasury, max_tvl_cap };
+        let s = FactorySettings { admin, vault_wasm_hash, registry, oracle, policy, treasury, max_tvl_cap, default_fee_bps };
         env.storage().instance().set(&DataKey::Settings, &s);
     }
 
@@ -184,6 +200,11 @@ impl VaultFactory {
             || params.per_user_cap > params.tvl_cap
         {
             panic_with_error!(&env, FactoryError::InvalidParams);
+        }
+        // D-O: Constella's fee is Constella's to set. Anything but the default
+        // must be co-signed by the factory admin.
+        if params.performance_fee_bps != s.default_fee_bps {
+            s.admin.require_auth();
         }
         if params.tvl_cap > s.max_tvl_cap {
             panic_with_error!(&env, FactoryError::TvlCapTooHigh);
@@ -238,6 +259,21 @@ impl VaultFactory {
 
     pub fn get_settings(env: Env) -> FactorySettings {
         settings(&env)
+    }
+
+    /// D-O: set Constella's default fee for FUTURE factory vaults. Admin only;
+    /// at most the D-D ceiling. Existing vaults keep their fee for life.
+    pub fn set_default_fee(env: Env, fee_bps: u32) {
+        let mut s = settings(&env);
+        s.admin.require_auth();
+        if fee_bps > MAX_PERFORMANCE_FEE_BPS {
+            panic_with_error!(&env, FactoryError::InvalidParams);
+        }
+        let previous_bps = s.default_fee_bps;
+        s.default_fee_bps = fee_bps;
+        env.storage().instance().set(&DataKey::Settings, &s);
+        extend(&env);
+        DefaultFeeSet { previous_bps, new_bps: fee_bps }.publish(&env);
     }
 
     /// Propose the WASM for FUTURE vaults; effective after 48 h. Admin only.
