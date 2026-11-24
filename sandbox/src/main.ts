@@ -405,15 +405,16 @@ async function runThesis() {
 
 /** Step 3: fill the vault selector - the shared vault plus the acting
  * identity's own factory vaults (vault_factory.vaults_of). */
-async function refreshTargets() {
+async function refreshTargets(prefer?: string) {
   const sel = document.getElementById("target") as HTMLSelectElement | null;
   if (!sel || !cfg.contracts.vault_factory) return;
   const who = mode() === "wallet" ? wallet?.address : loadAccount()?.address;
   const own: string[] = who ? (await chain.view(cfg.contracts.vault_factory, "vaults_of", [sv.addr(who)]).catch(() => [])).map(String) : [];
-  const want = target();
+  const want = prefer ?? target();
   sel.innerHTML = [`<option value="${cfg.contracts.vault}">Constella Cash Reserve (shared)</option>`,
                    ...own.map((v, i) => `<option value="${v}">My vault ${i + 1}: ${short(v)}</option>`)].join("");
   sel.value = [cfg.contracts.vault, ...own].includes(want) ? want : cfg.contracts.vault;
+  setTarget(sel.value);
 }
 
 /** Step 3: the signed draft becomes the user's own live vault - one call,
@@ -438,7 +439,7 @@ async function createOwnVault() {
   const created = after.find((v) => !before.includes(v));
   if (!created) throw new Error("the vault was not created");
   setTarget(created);
-  await refreshTargets();
+  await refreshTargets(created);
   return { vault: created, policy_hash: d.policy_hash };
 }
 
