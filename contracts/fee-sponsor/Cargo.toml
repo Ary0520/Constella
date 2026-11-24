@@ -18,3 +18,4 @@ constella-policy = { path = "../policy" }
 constella-nav-oracle = { path = "../nav-oracle" }
 constella-vault-strategy = { path = "../vault-strategy" }
 constella-smart-account = { path = "../smart-account" }
+constella-vault-factory = { path = "../vault-factory" }

@@ -549,3 +549,107 @@ fn f1c_the_relayer_pool_is_bounded() {
     assert_eq!(client.try_add_relayer(&Address::generate(&env)), Err(Ok(SponsorError::TooManyRelayers)));
     assert_eq!(client.get_relayers().len(), MAX_RELAYERS);
 }
+
+// -------------------------------------------------------------------------
+// Step 3: users' own vaults have new addresses, so a static whitelist cannot
+// sponsor them. The sponsor also trusts vaults PROVEN by a registered
+// Constella factory (`is_vault`: deployed by that factory from approved
+// code). Bounded, admin-managed; explicit whitelisting keeps working.
+// Real factory and real vault below, no doubles.
+// -------------------------------------------------------------------------
+mod trusted_factory {
+    use super::*;
+    use constella_nav_oracle::NavOracle;
+    use constella_policy::PolicyContract;
+    use constella_registry::{AssetEntry, AssetRegistry, AssetRegistryClient, SleeveType};
+    use constella_vault_factory::{VaultFactory, VaultFactoryClient, VaultParams};
+    use soroban_sdk::{testutils::{MockAuth, MockAuthInvoke}, vec, BytesN, IntoVal, String};
+
+    const VAULT_WASM: &[u8] = include_bytes!("../../target/wasm32v1-none/release/constella_vault_strategy.wasm");
+    const ONE: i128 = 10_000_000;
+
+    struct S { env: Env, sponsor: FeeSponsorContractClient<'static>, factory: VaultFactoryClient<'static>, vault: Address }
+
+    fn setup() -> S {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.cost_estimate().budget().reset_unlimited();
+        let admin = Address::generate(&env);
+        let usdc = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+        let registry = env.register(AssetRegistry, (admin.clone(),));
+        AssetRegistryClient::new(&env, &registry).add_asset(&AssetEntry {
+            contract_address: usdc.clone(), asset_id: Symbol::new(&env, "USDC"), issuer: Symbol::new(&env, "CIRCLE"),
+            sleeve_type: SleeveType::Cash, liquidity_tier: 0, permissionless: true,
+            oracle_sources: vec![&env, Symbol::new(&env, "USDC_BASE")], eligible_jurisdictions: vec![&env],
+            blocked_jurisdictions: vec![&env], investor_classes_required: vec![&env], is_active: true, added_at: 0 });
+        let oracle = env.register(NavOracle, (admin.clone(), usdc.clone(), 7u32, 300u32));
+        let policy = env.register(PolicyContract, (admin.clone(), oracle.clone()));
+        let hash = env.deployer().upload_contract_wasm(VAULT_WASM);
+        let factory_id = env.register(VaultFactory, (admin.clone(), hash, registry, oracle, policy, admin.clone(),
+                                                     1_000_000 * ONE, 1000u32, Address::generate(&env), None::<Address>));
+        let factory = VaultFactoryClient::new(&env, &factory_id);
+        let creator = Address::generate(&env);
+        let vault = factory.create_vault(&creator, &VaultParams {
+            admin: creator.clone(), pause_authority: creator.clone(), numeraire: usdc, performance_fee_bps: 1000,
+            tvl_cap: 1000 * ONE, per_user_cap: 1000 * ONE, name: String::from_str(&env, "Mine"),
+            symbol: String::from_str(&env, "MINE"), salt: BytesN::from_array(&env, &[1; 32]) });
+        let sponsor_id = env.register(FeeSponsorContract, (admin, 10u32, 50u32, 1_000_000u64));
+        S { env: env.clone(), sponsor: FeeSponsorContractClient::new(&env, &sponsor_id), factory, vault }
+    }
+
+    #[test]
+    fn a_vault_proven_by_a_trusted_factory_is_sponsorable() {
+        let s = setup();
+        let user = Address::generate(&s.env);
+        let stranger_contract = Address::generate(&s.env);
+        assert!(!s.sponsor.is_whitelisted(&s.vault), "not before the factory is trusted");
+        s.sponsor.trust_factory(&s.factory.address);
+        assert_eq!(s.sponsor.get_trusted_factories(), vec![&s.env, s.factory.address.clone()]);
+        assert!(s.sponsor.is_whitelisted(&s.vault));
+        assert_eq!(s.sponsor.try_validate_sponsorship(&user, &s.vault, &5000), Ok(Ok(())));
+        // A contract the factory did not deploy stays refused.
+        assert!(!s.sponsor.is_whitelisted(&stranger_contract));
+        assert_eq!(s.sponsor.try_validate_sponsorship(&user, &stranger_contract, &5000),
+                   Err(Ok(SponsorError::TargetNotWhitelisted)));
+        // Untrusting the factory removes the coverage at once.
+        s.sponsor.untrust_factory(&s.factory.address);
+        assert!(!s.sponsor.is_whitelisted(&s.vault));
+        assert!(s.sponsor.get_trusted_factories().is_empty());
+    }
+
+    #[test]
+    fn only_the_admin_manages_trusted_factories() {
+        let s = setup();
+        let mallory = Address::generate(&s.env);
+        s.env.mock_auths(&[MockAuth { address: &mallory, invoke: &MockAuthInvoke { contract: &s.sponsor.address,
+            fn_name: "trust_factory", args: (s.factory.address.clone(),).into_val(&s.env), sub_invokes: &[] } }]);
+        assert!(s.sponsor.try_trust_factory(&s.factory.address).is_err());
+        s.env.mock_all_auths();
+        s.sponsor.trust_factory(&s.factory.address);
+        s.env.mock_auths(&[MockAuth { address: &mallory, invoke: &MockAuthInvoke { contract: &s.sponsor.address,
+            fn_name: "untrust_factory", args: (s.factory.address.clone(),).into_val(&s.env), sub_invokes: &[] } }]);
+        assert!(s.sponsor.try_untrust_factory(&s.factory.address).is_err());
+        assert!(s.sponsor.is_whitelisted(&s.vault));
+    }
+
+    #[test]
+    fn the_trusted_factory_list_is_bounded_and_without_duplicates() {
+        let s = setup();
+        s.sponsor.trust_factory(&s.factory.address);
+        assert_eq!(s.sponsor.try_trust_factory(&s.factory.address), Err(Ok(SponsorError::FactoryAlreadyTrusted)));
+        for _ in 1..MAX_TRUSTED_FACTORIES {
+            s.sponsor.trust_factory(&Address::generate(&s.env));
+        }
+        assert_eq!(s.sponsor.try_trust_factory(&Address::generate(&s.env)), Err(Ok(SponsorError::TooManyFactories)));
+        assert_eq!(s.sponsor.try_untrust_factory(&Address::generate(&s.env)), Err(Ok(SponsorError::FactoryNotTrusted)));
+    }
+
+    #[test]
+    fn explicit_whitelisting_still_works_alongside() {
+        let s = setup();
+        let target = Address::generate(&s.env);
+        s.sponsor.whitelist_contract(&target);
+        s.sponsor.trust_factory(&s.factory.address);
+        assert!(s.sponsor.is_whitelisted(&target) && s.sponsor.is_whitelisted(&s.vault));
+    }
+}
