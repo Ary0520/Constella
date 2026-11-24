@@ -287,3 +287,39 @@ mod protocol_fee {
                                       MAX_TVL, MAX_PERFORMANCE_FEE_BPS + 1));
     }
 }
+
+// -------------------------------------------------------------------------
+// Step 3: a global, append-only index so services (keeper, relayer, console)
+// can find every factory vault without scanning events.
+// -------------------------------------------------------------------------
+mod index {
+    use super::*;
+
+    #[test]
+    fn every_factory_vault_is_indexed_in_creation_order() {
+        let f = setup();
+        assert_eq!(f.factory.vault_count(), 0);
+        assert_eq!(f.factory.vault_at(&0), None);
+        let (a, b) = (Address::generate(&f.env), Address::generate(&f.env));
+        let mut p = params(&f, &a, 20);
+        p.performance_fee_bps = DEFAULT_FEE;
+        let va = f.factory.create_vault(&a, &p);
+        let mut q = params(&f, &b, 21);
+        q.performance_fee_bps = DEFAULT_FEE;
+        let vb = f.factory.create_vault(&b, &q);
+        assert_eq!(f.factory.vault_count(), 2);
+        assert_eq!(f.factory.vault_at(&0), Some(va));
+        assert_eq!(f.factory.vault_at(&1), Some(vb));
+        assert_eq!(f.factory.vault_at(&2), None);
+    }
+
+    #[test]
+    fn a_failed_creation_is_not_indexed() {
+        let f = setup();
+        let c = Address::generate(&f.env);
+        let mut p = params(&f, &c, 22);
+        p.tvl_cap = MAX_TVL + 1;
+        assert!(f.factory.try_create_vault(&c, &p).is_err());
+        assert_eq!(f.factory.vault_count(), 0);
+    }
+}
