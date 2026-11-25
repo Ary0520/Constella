@@ -4,6 +4,7 @@
  * at face value, any other sleeve at units x oracle `asset_price` / 10^7,
  * rounded down. Nothing is estimated: an unpriced holding is shown as such.
  */
+import { scValToNative } from "@stellar/stellar-sdk";
 import { Chain, sv } from "./chain";
 
 export const DECIMALS = 7;
@@ -133,4 +134,40 @@ export function parseUnits(text: string): bigint {
   const units = BigInt(m[1] || "0") * ONE + BigInt((frac + "0".repeat(DECIMALS)).slice(0, DECIMALS));
   if (units <= 0n) throw new Error("Enter an amount above zero.");
   return units;
+}
+
+const LABELS: Record<string, string> = {
+  REBALANCE_COMPLETE: "Keeper rebalanced", deposit: "Deposit", withdraw: "Withdrawal",
+  FROZEN_REDEMPTION: "Redeemed while a price was unavailable", CLAIM_RECORDED: "Claim recorded", CLAIM_SETTLED: "Claim paid",
+  FEE_ACCRUAL: "Fee on profit", POLICY_BOUND: "Rules signed", VAULT_PAUSED: "Paused by its admin", VAULT_UNPAUSED: "Resumed",
+  CAPS_LOWERED: "Limits lowered", UPGRADE_PROPOSED: "Code change proposed (48 h notice)", UPGRADE: "Code changed",
+  UPGRADE_CANCELLED: "Code change cancelled", ROUTER_PROPOSED: "Trading route proposed", SLEEVES_UPDATED: "Holdings updated",
+};
+/** A person-facing label, or null for internal steps. */
+export const eventLabel = (topic: string): string | null => LABELS[topic] ?? null;
+
+export interface Activity { label: string; at: string; tx: string }
+
+/** Recent vault events the RPC still keeps (about a week on testnet). The RPC
+ * scans a bounded window per call, so walk back from the newest ledger. */
+export async function readActivity(chain: Chain, vault: string, limit = 12, windows = 12): Promise<Activity[]> {
+  const latest = (await chain.server.getLatestLedger()).sequence;
+  const out: Activity[] = [];
+  const W = 4_000;
+  for (let k = 1; k <= windows && out.length < limit; k++) {
+    const start = latest - k * W, end = start + W;
+    if (start < 1) break;
+    let res: any;
+    try {
+      res = await chain.server.getEvents({ startLedger: start, filters: [{ type: "contract", contractIds: [vault] }], limit: 200 } as any);
+    } catch { break; } // older than the RPC keeps
+    const page = (res.events ?? []).filter((e: any) => e.ledger >= start && e.ledger < end).reverse();
+    for (const e of page) {
+      let name: string | null = null;
+      try { const t = scValToNative(e.topic[0]); name = typeof t === "string" ? t : null; } catch { /* not a symbol */ }
+      const label = name ? eventLabel(name) : null;
+      if (label && out.length < limit) out.push({ label, at: e.ledgerClosedAt, tx: e.txHash });
+    }
+  }
+  return out;
 }
