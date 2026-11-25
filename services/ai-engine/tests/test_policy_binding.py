@@ -106,7 +106,7 @@ def _engine(monkeypatch):
     import src.api as api
     monkeypatch.setattr(api, "parse_thesis", lambda text, jurisdiction, investor_class: draft)
     monkeypatch.setattr(api, "retrieve_candidates", lambda d, reg: cands)
-    monkeypatch.setattr(api, "optimize_portfolio", lambda d, c: opt)
+    monkeypatch.setattr(api, "optimize_portfolio", lambda d, c, numeraire=None: opt)
     monkeypatch.setattr(api, "simulate_portfolio", lambda w, c, d: type("S", (), {"model_dump": lambda self: {}})())
     monkeypatch.setattr(api, "generate_explanation", lambda t, d, o, c: type("E", (), {"model_dump": lambda self: {}})())
     reg = type("R", (), {"eligibility": lambda self, j, c: []})()
