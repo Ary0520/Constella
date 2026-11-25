@@ -15,7 +15,10 @@ def test_an_empty_or_malformed_allow_list_is_refused(bad):
         parse_allowed(bad)
 
 
-def test_cors_is_opt_in_and_limited_to_one_origin():
+def test_cors_is_opt_in_and_answers_only_listed_origins():
+    """RELAYER_CORS_ORIGIN is a comma-separated allow-list (the console and the
+    product app). The response names the CALLER's origin only when listed
+    (Vary: Origin); an unlisted or missing origin gets no CORS header."""
     import json, threading, urllib.request
     from http.server import ThreadingHTTPServer
     from constella_relayer.server import make_handler
@@ -23,11 +26,17 @@ def test_cors_is_opt_in_and_limited_to_one_origin():
     class FakeRelayer:
         keypairs = []
 
-    for origin, expected in [(None, None), ("http://localhost:5173", "http://localhost:5173")]:
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(FakeRelayer(), cors_origin=origin))
+    app, console = "https://constella-app.vercel.app", "https://constella-sandbox.vercel.app"
+    cases = [(None, app, None), (f"{console},{app}", app, app), (f"{console}, {app}", console, console),
+             (f"{console},{app}", "https://evil.example", None), (f"{console},{app}", None, None)]
+    for allowed, origin, expected in cases:
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(FakeRelayer(), cors_origin=allowed))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        with urllib.request.urlopen(f"http://127.0.0.1:{srv.server_address[1]}/health") as r:
-            assert r.headers.get("Access-Control-Allow-Origin") == expected
+        req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/health", headers={"Origin": origin} if origin else {})
+        with urllib.request.urlopen(req) as r:
+            assert r.headers.get("Access-Control-Allow-Origin") == expected, (allowed, origin)
+            if allowed:
+                assert "Origin" in (r.headers.get("Vary") or "")
             assert json.loads(r.read())["ok"] is True
         srv.shutdown()
 
