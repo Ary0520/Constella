@@ -43,3 +43,14 @@ unchanged (passkey signing is byte-identical to the proven Python signer - test 
 | 10.8 | Deploy (new Vercel project, testnet config, no secrets), relayer CORS for its origin, all e2e on the hosted app, delete `sandbox/` | all flows pass on the hosted app |
 
 Mobile: every screen works at 390 px (also folds in OPEN-ISSUES #4's lesson for the landing hero).
+
+## Status - 25 Nov 2026: done (all slices)
+Live: https://constella-app-rho.vercel.app (Vercel project constella-app; `app/deploy.sh`). Relayer and thesis API
+CORS allow the app and the old console (comma-separated allow-lists, only a listed caller origin is answered).
+Browser e2e on the hosted app with REAL WebAuthn (Chromium virtual authenticator), all PASS: `npm run e2e`
+(sign-in, deposit + redeem, thesis -> own basket with Rule 10 verbatim, pairing, guardians + recovery + cancel).
+Unit tests: 41 (identity, routes, numbers, amounts, basket input, security, activity, error mapping), mutants killed
+for each core module. Local-stack integration tests: `npm run test:stack`.
+Not covered by automation: a real wallet popup (Wallets Kit) - the wallet signing path itself is covered by
+`test/wallet.stack.test.ts` with a keypair signer; real phones (cross-platform passkeys) - check by hand.
+Deliberately simple design: the owner will lead the UI/UX/animation phase later.
