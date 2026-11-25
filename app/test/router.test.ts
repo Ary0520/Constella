@@ -14,6 +14,8 @@ describe("routes", () => {
     expect(matchRoute("/vault/not-an-address").name).toBe("notfound");
     expect(matchRoute("/vault/GAD5SR3CXQLQUU64C6MN7VKRXRY5WCWYB3HT5JQI6NHV6BYX3MI5QRHF").name).toBe("notfound");
     expect(matchRoute("/admin").name).toBe("notfound");
+    expect(matchRoute("/new/extra").name).toBe("notfound");
+    expect(matchRoute("/account/x/y").name).toBe("notfound");
   });
   it("reads the invitation links (device pairing, guardian, recovery approval)", () => {
     expect(linkIntent("?pair=ABCD2345")).toEqual({ kind: "pair", code: "ABCD2345" });
