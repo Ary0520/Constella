@@ -431,7 +431,7 @@ async function createOwnVault() {
   const name = String(d.policy.basket_name || "My basket");
   const before: string[] = (await chain.view(cfg.contracts.vault_factory, "vaults_of", [sv.addr(u.address)]).catch(() => [])).map(String);
   await u.call("create_vault_with_policy", createVaultArgs({
-    owner: u.address, numeraire: cfg.assets.USDC, feeBps: Number(settings.default_fee_bps),
+    owner: u.address, numeraire: d.numeraire_contract ?? cfg.assets.USDC, feeBps: Number(settings.default_fee_bps),
     capUnits: 25_000n * 10_000_000n, name, symbol: name.replace(/[^A-Za-z]/g, "").slice(0, 8).toUpperCase() || "BASKET",
     salt, bind: d.bind_policy, policyHashHex: d.policy_hash,
   }));
