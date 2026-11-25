@@ -68,3 +68,22 @@ def test_raising_cash_sells_the_most_overweight_sleeve_first():
     sl = [cash(100, 2000), s("B", 520, 5000), s("A", 480, 3000)]
     p = plan_raise_cash(sl, ONE, 50, ident, 200 * ONE)
     assert [o.asset_in for o in p.operations] == ["CA"]
+
+
+def test_a_sleeve_near_its_band_edge_is_trued_up_in_the_same_rebalance():
+    # A is +150: inside its 200 band but beyond half of it - left alone, slippage
+    # could tip it over and revert the whole rebalance; so it goes to target too.
+    sl = [cash(2500, 2000), s("A", 4150, 4000), s("B", 3350, 4000)]
+    p = plan(sl, ONE, 200, 50, ident)
+    assert sorted(legs(p)) == sorted([("A", "USDC", 150), ("USDC", "B", 650)])
+    assert in_band(p, sl)
+
+
+def test_a_cash_shortfall_sells_the_most_overweight_first_with_no_buys():
+    # Only cash breaches (-250). Overweights A +100, B +100, C +90; D -40.
+    sl = [cash(1750, 2000), s("A", 2100, 2000), s("B", 2100, 2000), s("C", 2090, 2000), s("D", 1960, 2000)]
+    p = plan(sl, ONE, 200, 50, ident)
+    got = legs(p)
+    assert all(b == "USDC" for _, b, _ in got), "a withdrawal never causes a purchase"
+    assert dict((a, n) for a, _, n in got) == {"A": 100, "B": 100, "C": 50}
+    assert in_band(p, sl)
