@@ -25,7 +25,11 @@ from typing import Callable, Optional
 
 from stellar_sdk import Address, scval, xdr
 
-from .gateway import Rejected
+from .gateway import Rejected, address_credentials
+
+# ADDRESS and CAP-71 ADDRESS_V2 (what testnet simulation returns); delegated
+# credentials are not used by Constella accounts.
+_KINDS = (xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS, xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS_V2)
 
 TTL = 7 * 86_400
 ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
@@ -36,21 +40,21 @@ def _entry(b64: str) -> xdr.SorobanAuthorizationEntry:
         e = xdr.SorobanAuthorizationEntry.from_xdr(b64)
     except Exception as ex:  # malformed of any kind
         raise Rejected("INVALID_XDR", f"entry: {ex}") from None
-    if e.credentials.type != xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS:
-        raise Rejected("UNSUPPORTED_CREDENTIALS", "address credentials only")
+    if e.credentials.type not in _KINDS:
+        raise Rejected("UNSUPPORTED_CREDENTIALS", "address credentials (ADDRESS / ADDRESS_V2) only")
     return e
 
 
 def _shape(e: xdr.SorobanAuthorizationEntry) -> bytes:
     """Everything a guardian signs over except the signature itself."""
-    a = e.credentials.address
-    return (a.address.to_xdr_bytes() + a.nonce.to_xdr_bytes() + a.signature_expiration_ledger.to_xdr_bytes()
+    a = address_credentials(e.credentials)
+    return (e.credentials.type.value.to_bytes(4, "big") + a.address.to_xdr_bytes() + a.nonce.to_xdr_bytes() + a.signature_expiration_ledger.to_xdr_bytes()
             + e.root_invocation.to_xdr_bytes())
 
 
 def _payload(e: xdr.SorobanAuthorizationEntry) -> tuple[bytes, list]:
     """(rule ids XDR, [(signer key ScVal, sig ScVal)]) of a signed entry."""
-    sig = e.credentials.address.signature
+    sig = address_credentials(e.credentials).signature
     if sig.type != xdr.SCValType.SCV_MAP or sig.map is None:
         raise Rejected("UNSIGNED", "the guardian entry carries no signature")
     top = {scval.to_native(m.key): m.val for m in sig.map.sc_map}
@@ -91,7 +95,7 @@ def merge_signed(base_b64: str, signed_b64: list[str]) -> str:
         xdr.SCMapEntry(scval.to_symbol("signers"), xdr.SCVal(xdr.SCValType.SCV_MAP, map=xdr.SCMap(
             [xdr.SCMapEntry(k, v) for k, v in ordered]))),
     ]))
-    base.credentials.address.signature = payload
+    address_credentials(base.credentials).signature = payload
     return base.to_xdr()
 
 
@@ -106,7 +110,7 @@ def _is_proposal(account: str, func_b64: str, entry_b64: str) -> None:
     if Address.from_xdr_sc_address(c.contract_address).address != account or c.function_name.sc_symbol != b"propose_recovery":
         raise Rejected("NOT_A_PROPOSAL", "only account.propose_recovery on the named account")
     e = _entry(entry_b64)
-    if Address.from_xdr_sc_address(e.credentials.address.address).address != account:
+    if Address.from_xdr_sc_address(address_credentials(e.credentials).address).address != account:
         raise Rejected("NOT_A_PROPOSAL", "the entry must be the account's")
     fn = e.root_invocation.function
     if fn.contract_fn is None or fn.contract_fn.to_xdr_bytes() != c.to_xdr_bytes():
