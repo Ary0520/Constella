@@ -653,3 +653,68 @@ mod trusted_factory {
         assert!(s.sponsor.is_whitelisted(&target) && s.sponsor.is_whitelisted(&s.vault));
     }
 }
+
+// -------------------------------------------------------------------------
+// Step 8 (account recovery): guardians approve a recovery on the user's OWN
+// smart account (a new address per user), so the sponsor must also trust
+// accounts proven by a registered Constella ACCOUNT factory (`is_account`).
+// Real account factory and a real created account below, no doubles.
+// -------------------------------------------------------------------------
+mod trusted_account_factory {
+    use super::*;
+    use constella_account_factory::{AccountFactory, AccountFactoryClient};
+    use soroban_sdk::{testutils::{MockAuth, MockAuthInvoke}, Bytes, IntoVal};
+
+    const ACCOUNT_WASM: &[u8] = include_bytes!("../../target/wasm32v1-none/release/constella_smart_account.wasm");
+    const VERIFIER_WASM: &[u8] = include_bytes!("../../target/wasm32v1-none/release/constella_webauthn_verifier.wasm");
+    /// P-256 generator G, uncompressed: a valid public key.
+    const KEY: &str = "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5";
+
+    struct S { env: Env, sponsor: FeeSponsorContractClient<'static>, factory: AccountFactoryClient<'static>, account: Address }
+
+    fn setup() -> S {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.cost_estimate().budget().reset_unlimited();
+        let admin = Address::generate(&env);
+        let verifier = env.register(VERIFIER_WASM, ());
+        let hash = env.deployer().upload_contract_wasm(ACCOUNT_WASM);
+        let factory = AccountFactoryClient::new(&env, &env.register(AccountFactory, (admin.clone(), verifier, hash)));
+        let raw: std::vec::Vec<u8> = (0..KEY.len()).step_by(2).map(|i| u8::from_str_radix(&KEY[i..i + 2], 16).unwrap()).collect();
+        let account = factory.create_account(&Bytes::from_slice(&env, &raw));
+        let sponsor_id = env.register(FeeSponsorContract, (admin, 10u32, 50u32, 1_000_000u64));
+        S { env: env.clone(), sponsor: FeeSponsorContractClient::new(&env, &sponsor_id), factory, account }
+    }
+
+    #[test]
+    fn an_account_proven_by_a_trusted_account_factory_is_sponsorable() {
+        let s = setup();
+        let user = Address::generate(&s.env);
+        assert!(!s.sponsor.is_whitelisted(&s.account));
+        s.sponsor.trust_account_factory(&s.factory.address);
+        assert_eq!(s.sponsor.get_trusted_account_factories(), soroban_sdk::vec![&s.env, s.factory.address.clone()]);
+        assert!(s.sponsor.is_whitelisted(&s.account));
+        assert_eq!(s.sponsor.try_validate_sponsorship(&user, &s.account, &5000), Ok(Ok(())));
+        let stranger = Address::generate(&s.env);
+        assert!(!s.sponsor.is_whitelisted(&stranger));
+        s.sponsor.untrust_account_factory(&s.factory.address);
+        assert!(!s.sponsor.is_whitelisted(&s.account));
+    }
+
+    #[test]
+    fn only_the_admin_manages_trusted_account_factories_and_the_list_is_bounded() {
+        let s = setup();
+        let mallory = Address::generate(&s.env);
+        s.env.mock_auths(&[MockAuth { address: &mallory, invoke: &MockAuthInvoke { contract: &s.sponsor.address,
+            fn_name: "trust_account_factory", args: (s.factory.address.clone(),).into_val(&s.env), sub_invokes: &[] } }]);
+        assert!(s.sponsor.try_trust_account_factory(&s.factory.address).is_err());
+        s.env.mock_all_auths();
+        s.sponsor.trust_account_factory(&s.factory.address);
+        assert_eq!(s.sponsor.try_trust_account_factory(&s.factory.address), Err(Ok(SponsorError::FactoryAlreadyTrusted)));
+        for _ in 1..MAX_TRUSTED_FACTORIES {
+            s.sponsor.trust_account_factory(&Address::generate(&s.env));
+        }
+        assert_eq!(s.sponsor.try_trust_account_factory(&Address::generate(&s.env)), Err(Ok(SponsorError::TooManyFactories)));
+        assert_eq!(s.sponsor.try_untrust_account_factory(&Address::generate(&s.env)), Err(Ok(SponsorError::FactoryNotTrusted)));
+    }
+}
