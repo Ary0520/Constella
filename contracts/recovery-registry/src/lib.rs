@@ -52,6 +52,16 @@ pub enum RecoveryError {
     NotOwnerKey = 7,
     /// This guardian key already guards MAX_GUARDED_PER_KEY accounts.
     GuardianOfTooMany = 8,
+    /// The account has no pending recovery.
+    NoPendingRecovery = 9,
+}
+
+/// Mirror of `constella_smart_account::PendingRecovery` (decoded by field name).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingRecoveryRef {
+    pub new_owner: Signer,
+    pub executable_at: u64,
 }
 
 #[contracttype]
@@ -108,6 +118,8 @@ pub trait SmartAccountRef {
                         signers: Vec<Signer>, policies: Map<Address, Val>) -> ContextRule;
     fn get_owner_rule(env: Env) -> u32;
     fn get_context_rule(env: Env, context_rule_id: u32) -> ContextRule;
+    fn get_pending_recovery(env: Env) -> Option<PendingRecoveryRef>;
+    fn execute_recovery(env: Env);
 }
 
 fn settings(env: &Env) -> Settings {
@@ -214,6 +226,24 @@ impl RecoveryRegistry {
         env.storage().persistent().set(&k, &account);
         renew(&env, &k);
         OwnerRecorded { account, key }.publish(&env);
+    }
+
+    /// Finish a due recovery in one permissionless call: execute it on the
+    /// account (which enforces the 48 h delay) and record the new owner key.
+    /// Returns that key. The relayer builds this call itself (no signature).
+    pub fn finish(env: Env, account: Address) -> Bytes {
+        let acc = SmartAccountClient::new(&env, &account);
+        let pending = match acc.get_pending_recovery() {
+            Some(p) => p,
+            None => panic_with_error!(&env, RecoveryError::NoPendingRecovery),
+        };
+        let key = match pending.new_owner {
+            Signer::External(_, key) => key,
+            _ => panic_with_error!(&env, RecoveryError::NotOwnerKey),
+        };
+        acc.execute_recovery();
+        Self::record_owner(env, account, key.clone());
+        key
     }
 
     /// The account a recovered owner key controls, if recorded.
