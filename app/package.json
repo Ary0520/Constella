@@ -11,7 +11,8 @@
     "preview": "vite preview --port 4173 --strictPort",
     "test": "vitest run",
     "e2e:signin": "node e2e/signin.cjs",
-    "e2e:vault": "node e2e/vault.cjs"
+    "e2e:vault": "node e2e/vault.cjs",
+    "e2e:basket": "node e2e/basket.cjs"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "2.8.0",
