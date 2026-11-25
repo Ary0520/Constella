@@ -134,6 +134,8 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 | **Issuer outage** | Largest-weight issuer frozen for 30 days; show basket impact |
 | **Worst-case exit time** | Slowest plausible full exit scenario |
 
+**Implemented (step 7, 25 Nov 2026):** depeg = 5 % of the largest stable constituent and every position denominated in it (a Blend USDC supply moves with USDC); issuer outage = the largest issuer frozen 30 days, with `redeemable_during_freeze`; `normal_exit_hours` beside `worst_case_exit_hours` (the freeze) and `worst_case_scenario`; historical replay only from real history (`history_available`, `history_note`) - no synthetic line; `DISCLAIMER` constant. The console shows all of it, worst case first, before the create button.
+
 **UI requirements (non-negotiable):**
 > Every simulation screen MUST display the canonical disclaimer from `AGENT-RULES.md` Rule 10: *"This simulation uses historical data. Past performance does not predict future returns. This is not financial advice."*
 
@@ -151,6 +153,7 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 - **Diff against thesis:** Where the proposed basket matches and where it doesn't
   - e.g., *"You asked for 1/3 euro. We proposed 20% euro because the euro T-bill sleeve is permissioned and requires professional investor status. If you have that status, we can increase it."*
 - **Ambiguity flags:** Any parsed fields with low confidence are flagged for user confirmation
+- **Implemented (step 7):** each currency divergence names what binds (per-asset cap, issuer cap with the vault currency exempt, no eligible asset, or the 5-point band); parser defaults are shown as defaults to confirm, unregistered assets as excluded.
 - **Issuer concentration warning:** If any issuer exceeds 25% (even if below the user's configured cap), display a warning
 - **Missing thesis elements:** If the thesis mentioned something not achievable, explain clearly why it's not in the proposal
 
