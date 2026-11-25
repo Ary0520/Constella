@@ -148,6 +148,14 @@ class SimulationReport(BaseModel):
     worst_case_exit_hours: int
     historical_nav_series: List[float] = Field(default_factory=list)
     disclaimer: str
+    # Step 7 (spec: Simulate): the normal full-exit time beside the worst case,
+    # what the worst case is, what stays redeemable during the issuer freeze,
+    # and whether the replay is real history (never a made-up line).
+    normal_exit_hours: int = 0
+    worst_case_scenario: str = ""
+    redeemable_during_freeze: Optional[RedemptionLadder] = None
+    history_available: bool = False
+    history_note: str = ""
 
 
 # ==============================================================================
