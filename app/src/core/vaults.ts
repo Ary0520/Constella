@@ -82,13 +82,15 @@ export interface VaultData {
   address: string; name: string; symbol: string; paused: boolean;
   navConservative: bigint | null; navDeposit: bigint | null; totalAssets: bigint; totalSupply: bigint; highWaterMark: bigint;
   sleeves: SleeveView[]; apr: number | null; cash: string;
+  feeBps: number; admin: string; policy: string; policyHash: string | null;
 }
 
 export async function readVault(chain: Chain, address: string): Promise<VaultData> {
   const v = (fn: string) => chain.view(address, fn);
-  const [name, symbol, paused, cons, dep, total, supply, hwm, sleeves, history, config] = await Promise.all([
+  const [name, symbol, paused, cons, dep, total, supply, hwm, sleeves, history, config, hash] = await Promise.all([
     v("name"), v("symbol"), v("is_paused"), v("get_nav_conservative"), v("get_nav_deposit"), v("total_assets"),
     v("total_supply"), v("get_high_water_mark"), v("get_sleeves"), v("get_nav_history").catch(() => []), v("get_config"),
+    v("get_policy_hash").catch(() => null),
   ]);
   const cash = String(config.numeraire);
   const oracle = String(config.oracle_contract);
@@ -108,6 +110,8 @@ export async function readVault(chain: Chain, address: string): Promise<VaultDat
     navConservative: cons ? BigInt(cons.price) : null, navDeposit: dep ? BigInt(dep.price) : null,
     totalAssets: BigInt(total), totalSupply: BigInt(supply), highWaterMark: BigInt(hwm),
     sleeves: sleeveView(rows, prices, cash), apr: realisedApr(history as NavPoint[]), cash,
+    feeBps: Number(config.performance_fee_bps), admin: String(config.admin), policy: String(config.policy_contract),
+    policyHash: hash ? Array.from(hash as Uint8Array, (b: number) => b.toString(16).padStart(2, "0")).join("") : null,
   };
 }
 
@@ -117,4 +121,16 @@ export async function readPosition(chain: Chain, vault: string, user: string): P
   const shares = BigInt(await chain.view(vault, "balance", [sv.addr(user)]).catch(() => 0));
   const value = shares > 0n ? BigInt(await chain.view(vault, "convert_to_assets", [sv.i128(shares)])) : 0n;
   return { shares, value };
+}
+
+/** What a person typed -> exact units. Positive, at most 7 decimals, commas allowed. */
+export function parseUnits(text: string): bigint {
+  const s = text.trim().replace(/,/g, "");
+  const m = /^(\d*)(?:\.(\d*))?$/.exec(s);
+  if (!s || !m || (m[1] === "" && !m[2])) throw new Error("Enter an amount, like 100 or 12.5.");
+  const frac = m[2] ?? "";
+  if (frac.length > DECIMALS) throw new Error(`At most ${DECIMALS} decimal places.`);
+  const units = BigInt(m[1] || "0") * ONE + BigInt((frac + "0".repeat(DECIMALS)).slice(0, DECIMALS));
+  if (units <= 0n) throw new Error("Enter an amount above zero.");
+  return units;
 }

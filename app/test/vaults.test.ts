@@ -25,9 +25,9 @@ describe("sleeves", () => {
   it("values cash at face and the rest at the oracle price, weights sum to 10000", () => {
     const v = sleeveView(sleeves, { CEURC: 10_951_674n, CBLEND: ONE }, "CUSDC");
     expect(v.map((s) => s.value)).toEqual([5_374_822n, 3_257_822n * 10_951_674n / ONE, 1_500_000n]);
-    expect(v.reduce((n, s) => n + s.weight_bps, 0)).toBe(10000);
+    expect(v.reduce((n, s) => n + (s.weight_bps ?? 0), 0)).toBe(10000);
     expect(v[1].priced).toBe(true);
-    expect(v.every((s) => Math.abs(s.weight_bps - s.target_weight_bps) <= s.band_bps)).toBe(true);
+    expect(v.every((s) => Math.abs((s.weight_bps ?? -1e9) - s.target_weight_bps) <= s.band_bps)).toBe(true);
   });
   it("an unpriced non-cash holding is flagged, not valued at zero silently", () => {
     const v = sleeveView(sleeves, { CBLEND: ONE }, "CUSDC");

@@ -3,6 +3,8 @@ import { SessionProvider, useSession } from "./session";
 import { Page, Shell } from "./ui/Shell";
 import { Welcome } from "./screens/Welcome";
 import { Logo } from "./ui/kit";
+import { Portfolio } from "./screens/Portfolio";
+import { Vault } from "./screens/Vault";
 
 function Screens() {
   const route = useRoute();
@@ -10,9 +12,9 @@ function Screens() {
   if (!identity) return <Welcome />;
   const body = (() => {
     switch (route.name) {
-      case "home": return <Page title="Portfolio" sub="Your baskets, what they hold, and what each share is worth." />;
+      case "home": return <Portfolio />;
       case "new": return <Page title="New basket" sub="Write your thesis. The engine drafts a basket and the rules that bind it." />;
-      case "vault": return <Page title="Basket" sub={route.params.id} />;
+      case "vault": return <Vault id={route.params.id} />;
       case "assets": return <Page title="Assets" sub="The closed universe every basket is built from." />;
       case "passport": return <Page title="Collateral Passport" sub="Borrow against your basket without selling it." />;
       case "account": return <Page title="Account" sub="Devices, guardians and recovery." />;

@@ -131,3 +131,37 @@ p { color: var(--ink-2) }
 }
 @media (min-width: 901px) { .c-topbar { display: none } }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important } }
+
+/* ---------- composition, lists, tables, forms */
+.small { font-size: 13px }
+.c-comp { display: flex; flex-direction: column; gap: 12px }
+.c-bar { display: flex; height: 10px; border-radius: 999px; overflow: hidden; background: rgba(20, 18, 28, .06); gap: 2px }
+.c-bar span { display: block; height: 100% }
+.c-legend { list-style: none; display: flex; flex-direction: column; gap: 8px }
+.c-legend li { display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--ink-2) }
+.c-legend i { width: 10px; height: 10px; border-radius: 3px; flex: none }
+.c-legend b { margin-left: auto; font-weight: 500; color: var(--ink) }
+.c-basket { display: flex; flex-direction: column; gap: 16px; cursor: pointer; transition: transform .25s cubic-bezier(.2, .8, .2, 1) }
+.c-basket:hover { transform: translateY(-2px) }
+.c-basket .row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px }
+.c-kv { display: flex; flex-direction: column; gap: 2px }
+.c-kv span { font-size: 12.5px; color: var(--muted) }
+.c-kv b { font-weight: 500; font-size: 18px; letter-spacing: -.02em }
+.c-table { width: 100%; border-collapse: collapse; font-size: 14px }
+.c-table th { text-align: left; font-weight: 500; color: var(--muted); font-size: 12.5px; padding: 0 8px 10px }
+.c-table td { padding: 12px 8px; border-top: 1px solid var(--line) }
+.c-table td.r, .c-table th.r { text-align: right }
+.c-field { display: flex; flex-direction: column; gap: 6px }
+.c-field label { font-size: 13px; color: var(--muted) }
+.c-input { width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line-2); background: var(--card); font: inherit; color: var(--ink) }
+.c-input:focus { outline: 2px solid var(--iris); outline-offset: 0; border-color: transparent }
+textarea.c-input { min-height: 120px; resize: vertical; line-height: 1.5 }
+.c-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap }
+.c-row > .c-field { flex: 1; min-width: 160px }
+.c-skel { height: 140px; border-radius: var(--r-md); background: linear-gradient(90deg, rgba(20,18,28,.04), rgba(20,18,28,.07), rgba(20,18,28,.04)); background-size: 200% 100%; animation: sk 1.4s infinite }
+@keyframes sk { to { background-position: -200% 0 } }
+.c-section-title { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px }
+@media (max-width: 900px) { .c-table .hide-sm { display: none } }
+.c-build { display: grid; place-items: center; min-height: 200px; text-align: center }
+.c-build p { margin-top: 6px }
+.c-kvs { display: flex; gap: 32px; flex-wrap: wrap; margin-bottom: 18px }
