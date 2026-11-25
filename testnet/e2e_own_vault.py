@@ -11,7 +11,7 @@ The account here is a plain G account paying its own fee (the wallet path);
 the passkey + relayer path is exercised from the console. Prints the
 transaction fee of the setup call (sizes RELAYER_FN_MAX_FEE).
 
-    python testnet/e2e_own_vault.py [--wait SECONDS]
+    python testnet/e2e_own_vault.py [--wait SECONDS] [--thesis "..."]
 """
 from __future__ import annotations
 
@@ -42,6 +42,8 @@ def post(url: str, body: dict) -> dict:
 
 def main() -> None:
     wait = int(sys.argv[sys.argv.index("--wait") + 1]) if "--wait" in sys.argv else 0
+    thesis = (sys.argv[sys.argv.index("--thesis") + 1] if "--thesis" in sys.argv
+              else "Keep a safe runway in dollars with at least 10% instant cash; lend a little.")
     cfg = json.loads((ROOT / "sandbox/config.testnet.json").read_text())
     st = json.loads((ROOT / "testnet/state/config.json").read_text())
     ct = st["contracts"]
@@ -56,7 +58,7 @@ def main() -> None:
     say("account", user.public_key, "faucet:", post(cfg["services"]["relayer"] + "/faucet", {"address": user.public_key}).get("status", "ok"))
 
     out = post(cfg["services"]["thesis_api"] + "/thesis", {
-        "text": "Keep a safe runway in dollars with at least 10% instant cash; lend a little.",
+        "text": thesis,
         "jurisdiction": "DE", "investor_class": "retail", "owner": user.public_key, "use_llm": True})
     assert out["signable"] and out["policy"]["admin"]["admin_address"] == user.public_key, out
     b = out["bind_policy"]
@@ -64,7 +66,7 @@ def main() -> None:
         [(s["asset_id"], s["target_weight_bps"]) for s in b["sleeves"]])
 
     S = ld.struct
-    params = S({"admin": ld.A(user.public_key), "pause_authority": ld.A(user.public_key), "numeraire": ld.A(usdc),
+    params = S({"admin": ld.A(user.public_key), "pause_authority": ld.A(user.public_key), "numeraire": ld.A(out["numeraire_contract"]),
                 "performance_fee_bps": ld.U32(int(net.view(factory, "get_settings", [], user.public_key)["default_fee_bps"])),
                 "tvl_cap": ld.I128(25_000 * ONE), "per_user_cap": ld.I128(25_000 * ONE),
                 "name": ld.STR(out["policy"]["basket_name"]), "symbol": ld.STR("CRUN"), "salt": scval.to_bytes(os.urandom(32))})
