@@ -18,6 +18,9 @@ Configuration (environment only - the secret is never logged):
   any vault the fee-sponsor proves via a trusted factory; empty = off),
   RELAYER_MAX_FEE_STROOPS (default 1_000_000), RELAYER_HOST, RELAYER_PORT,
   ACCOUNT_FACTORY_ID (enables /accounts, audit A2), ACCOUNTS_PER_IP_PER_DAY (3),
+  SPONSOR_ACCOUNT_FUNCTIONS ("propose_recovery,cancel_recovery": on accounts the
+  fee-sponsor proves via a trusted account factory; empty = off), RECOVERY_REGISTRY_ID
+  (enables /recovery/finish), RECOVERY_STATE_FILE (guardian approvals; /data/recovery.json),
   RELAYER_FN_MAX_FEE ("add_device:30000000": per-function caps for calls that
   create storage), ACCOUNTS_PER_DAY (200), ACCOUNT_MAX_FEE_STROOPS (30_000_000: an account
   deployment pays its storage rent), RELAYER_TRUST_PROXY=1 (use X-Forwarded-For's first
@@ -40,6 +43,7 @@ from stellar_sdk import Keypair, SorobanServer
 from .accounts import RateLimiter, parse_owner_key
 from .faucet import Faucet, parse_address
 from .pairing import Pairing
+from .recovery import RecoveryMailbox
 from .gateway import Rejected
 from .relayer import Relayer
 
@@ -71,6 +75,19 @@ def parse_vault_functions(spec: str) -> frozenset[str]:
     return names
 
 
+# Step 8: the only account functions that may be sponsored on users' own smart
+# accounts (proven on chain by a trusted account factory). Finishing a recovery
+# goes through the recovery registry (relayer-built, /recovery/finish).
+ACCOUNT_RECOVERY_FUNCTIONS = frozenset({"propose_recovery", "cancel_recovery"})
+
+
+def parse_account_functions(spec: str) -> frozenset[str]:
+    names = frozenset(f.strip() for f in spec.split(",") if f.strip())
+    if names - ACCOUNT_RECOVERY_FUNCTIONS:
+        raise ValueError(f"SPONSOR_ACCOUNT_FUNCTIONS may only contain {sorted(ACCOUNT_RECOVERY_FUNCTIONS)}")
+    return names
+
+
 def parse_fee_caps(spec: str) -> dict[str, int]:
     """'fn:stroops,fn:stroops' -> {fn: stroops} (per-function fee caps)."""
     out: dict[str, int] = {}
@@ -89,7 +106,8 @@ def make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimi
 
 def _make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLimiter | None = None,
                  trust_proxy: bool = False, cors_origin: str | None = None, faucet: "Faucet | None" = None,
-                 pairing: Pairing | None = None):
+                 pairing: Pairing | None = None, recovery: "RecoveryMailbox | None" = None,
+                 recovery_registry: str | None = None):
     pairing = pairing or Pairing()
     class Handler(BaseHTTPRequestHandler):
         server_version = "constella-relayer"
@@ -141,6 +159,21 @@ def _make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLim
                     return self._reply(200, pairing.join(body.get("code"), body.get("device_key"), body.get("name")))
                 if self.path == "/pair/status":
                     return self._reply(200, pairing.status(body.get("code")))
+                if self.path.startswith("/recovery/") and recovery is not None:
+                    if self.path == "/recovery/request":
+                        return self._reply(200, recovery.open(body.get("account"), body.get("new_key"), body.get("threshold"),
+                                                              body.get("func"), body.get("entry")))
+                    if self.path == "/recovery/get":
+                        return self._reply(200, recovery.get(body.get("id")))
+                    if self.path == "/recovery/approve":
+                        out = recovery.approve(body.get("id"), body.get("entry"))
+                        if out["ready"] and not recovery.get(out["id"])["submitted"]:
+                            done = dict(vars(relayer.submit(out["func"], [out["entry"]])))
+                            recovery.mark_submitted(out["id"], done["hash"])
+                            out["submitted"] = done
+                        return self._reply(200, out)
+                    if self.path == "/recovery/finish" and recovery_registry:
+                        return self._reply(200, relayer.finish_recovery(recovery_registry, body.get("account")))
                 if self.path == "/faucet" and faucet:
                     client = self.client_address[0]
                     if trust_proxy and self.headers.get("X-Forwarded-For"):
@@ -177,7 +210,8 @@ def cli() -> None:
         max_fee_stroops=int(env.get("RELAYER_MAX_FEE_STROOPS", "1000000")),
         account_max_fee_stroops=int(env.get("ACCOUNT_MAX_FEE_STROOPS", "30000000")),
         function_max_fee=parse_fee_caps(env.get("RELAYER_FN_MAX_FEE", "add_device:30000000")),
-        vault_functions=parse_vault_functions(env.get("SPONSOR_VAULT_FUNCTIONS", "")),
+        vault_functions=parse_vault_functions(env.get("SPONSOR_VAULT_FUNCTIONS", ""))
+        | parse_account_functions(env.get("SPONSOR_ACCOUNT_FUNCTIONS", "")),
     )
     host, port = env.get("RELAYER_HOST", "127.0.0.1"), int(env.get("RELAYER_PORT", "8787"))
     sys.stderr.write(f"constella-relayer pool of {len(relayer.keypairs)} on {host}:{port}\n")
@@ -189,7 +223,11 @@ def cli() -> None:
                         int(env.get("FAUCET_AMOUNT", "1000000000")),
                         RateLimiter(int(env.get("FAUCET_PER_ADDRESS_PER_DAY", "1")), int(env.get("FAUCET_PER_DAY", "200"))),
                         RateLimiter(int(env.get("FAUCET_PER_IP_PER_DAY", "3")), int(env.get("FAUCET_PER_DAY", "200"))))
-    handler = make_handler(relayer, factory, limiter, env.get("RELAYER_TRUST_PROXY") == "1", env.get("RELAYER_CORS_ORIGIN") or None, faucet)
+    # Step 8: account recovery - guardian approvals persist across restarts.
+    recovery_registry = env.get("RECOVERY_REGISTRY_ID") or None
+    recovery = RecoveryMailbox(env.get("RECOVERY_STATE_FILE") or ("/data/recovery.json" if os.path.isdir("/data") else "recovery.json"))
+    handler = make_handler(relayer, factory, limiter, env.get("RELAYER_TRUST_PROXY") == "1", env.get("RELAYER_CORS_ORIGIN") or None, faucet,
+                           recovery=recovery, recovery_registry=recovery_registry)
     ThreadingHTTPServer((host, port), handler).serve_forever()
 
 

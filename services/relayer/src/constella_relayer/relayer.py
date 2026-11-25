@@ -181,6 +181,20 @@ class Relayer:
         done = self._sponsor(hf, [], user, factory, "create_account", self.account_max_fee)
         return {"account": user, "existing": False, **{k: v for k, v in done.__dict__.items() if k != "user"}}
 
+    def finish_recovery(self, registry: str, account: str) -> dict:
+        """Step 8: complete a due recovery through the recovery registry
+        (`finish(account)`: the account enforces the 48 h delay, the registry
+        records the new owner key). Built HERE, never client-supplied; needs
+        no signature (like account creation)."""
+        if not (isinstance(account, str) and account.startswith("C") and len(account) == 56):
+            raise Rejected("INVALID_ADDRESS", "account must be a C... address")
+        hf = xdr.HostFunction(
+            type=xdr.HostFunctionType.HOST_FUNCTION_TYPE_INVOKE_CONTRACT,
+            invoke_contract=xdr.InvokeContractArgs(contract_address=Address(registry).to_xdr_sc_address(),
+                                                   function_name=xdr.SCSymbol(b"finish"), args=[scval.to_address(account)]))
+        done = self._sponsor(hf, [], account, registry, "finish", self.function_max_fee.get("finish"))
+        return {"account": account, **{k: v for k, v in done.__dict__.items() if k != "user"}}
+
     def _sponsor(self, host_function, auth, user: str, contract: str, function: str,
                  max_fee: int | None = None) -> Submitted:
         cap = self.max_fee if max_fee is None else max_fee
