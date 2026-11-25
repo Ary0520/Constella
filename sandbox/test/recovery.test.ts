@@ -37,7 +37,7 @@ describe("recovery requests", () => {
     expect(ids.every((i: any) => i.u32 === 7)).toBe(true);
     const signers = top.find((m: any) => new TextDecoder().decode(m.key.sym.bytes) === "signers").val.map;
     expect(signers).toHaveLength(1);
-    expect(Buffer.from(signers[0].key.vec[2].bytes).toString("hex")).toBe(Buffer.from(g.publicKey).toString("hex"));
+    expect(Buffer.from(signers[0].key.vec[2].bytes.value).toString("hex")).toBe(Buffer.from(g.publicKey).toString("hex"));
   });
 
   it("the proposal names the account's new owner passkey", () => {
@@ -46,6 +46,6 @@ describe("recovery requests", () => {
     const s = X(signer);
     expect(new TextDecoder().decode(s.vec[0].sym.bytes)).toBe("External");
     expect(Address.fromScVal(s.vec[1]).toString()).toBe(VERIFIER);
-    expect(Buffer.from(s.vec[2].bytes)).toEqual(Buffer.from(key));
+    expect(Buffer.from(s.vec[2].bytes.value)).toEqual(Buffer.from(key));
   });
 });
