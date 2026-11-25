@@ -160,3 +160,10 @@ def test_the_currency_split_lands_near_what_was_asked_not_at_the_edge():
     # the cap by the diversification objective.
     _, _, r = run("Keep 18 months of runway safe, hold a third in euro. Up to 40% per issuer and 40% per asset.")
     assert abs(r.weights_bps["EURC"] - 3333) <= 100
+
+
+
+def test_the_final_check_refuses_a_split_far_above_what_was_asked():
+    d, cands, r = run("Keep 18 months of runway safe, hold a third in euro. Up to 40% per issuer and 40% per asset.")
+    over = {**r.weights_bps, "EURC": 4000, "USDC": r.weights_bps["USDC"] - (4000 - r.weights_bps["EURC"])}
+    assert "EUR above your requested split" in check_allocation(over, d, cands, "USDC")
