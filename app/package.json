@@ -12,7 +12,10 @@
     "test": "vitest run",
     "e2e:signin": "node e2e/signin.cjs",
     "e2e:vault": "node e2e/vault.cjs",
-    "e2e:basket": "node e2e/basket.cjs"
+    "e2e:basket": "node e2e/basket.cjs",
+    "e2e:recovery": "node e2e/recovery.cjs",
+    "e2e:pairing": "node e2e/pairing.cjs",
+    "e2e": "node e2e/signin.cjs && node e2e/vault.cjs && node e2e/basket.cjs && node e2e/pairing.cjs && node e2e/recovery.cjs"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "2.8.0",
