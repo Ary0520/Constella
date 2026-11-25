@@ -55,3 +55,19 @@ describe("realised return", () => {
     expect(realisedApr([{ nav: ONE, timestamp: 0n }, { nav: 2n * ONE, timestamp: 3600n }])).toBeNull();
   });
 });
+
+describe("typed amounts", () => {
+  it("parses what people type into exact 7-decimal units", async () => {
+    const { parseUnits } = await import("../src/core/vaults");
+    expect(parseUnits("100")).toBe(1_000_000_000n);
+    expect(parseUnits(" 1,250.5 ")).toBe(12_505_000_000n);
+    expect(parseUnits("0.0000001")).toBe(1n);
+    expect(parseUnits(".5")).toBe(5_000_000n);
+  });
+  it("refuses anything that is not a positive amount with at most 7 decimals", async () => {
+    const { parseUnits } = await import("../src/core/vaults");
+    for (const bad of ["", "0", "-1", "1e3", "abc", "1.00000001", "1.2.3", "NaN", "Infinity"]) {
+      expect(() => parseUnits(bad), bad).toThrow();
+    }
+  });
+});
