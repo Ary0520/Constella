@@ -1,4 +1,6 @@
-import { useRoute } from "./router";
+import { linkIntent, useRoute } from "./router";
+import { Invitation } from "./screens/Invitation";
+import { Account } from "./screens/Account";
 import { SessionProvider, useSession } from "./session";
 import { Page, Shell } from "./ui/Shell";
 import { Welcome } from "./screens/Welcome";
@@ -10,6 +12,8 @@ import { NewBasket } from "./screens/NewBasket";
 function Screens() {
   const route = useRoute();
   const { identity } = useSession();
+  const intent = linkIntent(location.search);
+  if (intent) return <Invitation intent={intent} />;
   if (!identity) return <Welcome />;
   const body = (() => {
     switch (route.name) {
@@ -18,7 +22,7 @@ function Screens() {
       case "vault": return <Vault id={route.params.id} />;
       case "assets": return <Page title="Assets" sub="The closed universe every basket is built from." />;
       case "passport": return <Page title="Collateral Passport" sub="Borrow against your basket without selling it." />;
-      case "account": return <Page title="Account" sub="Devices, guardians and recovery." />;
+      case "account": return <Account />;
       default: return <Page title="Not found" sub="This page does not exist." />;
     }
   })();
