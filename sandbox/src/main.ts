@@ -3,11 +3,12 @@
  * Plain DOM, raw numbers: a place to click through every implemented flow,
  * not a design. Delete sandbox/ to remove it.
  */
-import { xdr } from "@stellar/stellar-sdk";
-import { Chain, Config, Passkey, sv, thesis } from "./chain";
+import { Address, xdr } from "@stellar/stellar-sdk";
+import { Chain, Config, funcB64, Passkey, sv, thesis } from "./chain";
 import { createPasskey, createTestPasskey, discoverPasskey, getAssertion, recoverPublicKeys } from "./passkey";
 import { addUsdcTrustline, connectWallet, friendbotFund, WalletSigner, walletInvoke, walletStatus } from "./wallet";
 import { createVaultArgs } from "./ownvault";
+import { fixExpiry, GuardianKey, guardianSign, proposalArgs } from "./recovery";
 
 const ONE = 10_000_000n;
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
@@ -177,6 +178,22 @@ function layout() {
     <p>Borrowing against shares on a live Blend pool is proven in the contract tests
     (<code>collateral_passport::*</code>); a local Blend pool for this console is a later step.</p></section>
 
+  <section><h2>8. Account recovery (guardians, D-F)</h2>
+    <p>If every passkey of an account is lost, its guardians (your other devices or trusted people) can approve a NEW
+    passkey. It takes effect after 48 hours; the owner can cancel meanwhile. Guardians can never move funds.</p>
+    <h3>Your guardians (owner)</h3>
+    <div id="guardians"></div>
+    <button id="addGuardian">Add a guardian (another device or a trusted person)</button>
+    approvals needed <input id="threshold" value="1" size="2"/> <button id="saveGuardians">Save guardians</button>
+    <button id="cancelRecovery">Cancel a pending recovery</button>
+    <div id="guardBox"></div><div id="guardJoin"></div>
+    <h3>Lost every passkey? Recover your account (on the new device)</h3>
+    account <input id="recAccount" size="58" placeholder="C... (ask a guardian if you do not know it)"/>
+    <button id="recover">Recover - new passkey on THIS device</button>
+    <button id="recoverTest">Recover - test passkey (local testing only)</button>
+    <button id="finishRecovery">Finish recovery (after 48 hours)</button>
+    <div id="recBox"></div><div id="approveBox"></div></section>
+
   <section><h2>7. Admin (local throwaway admin key)</h2>
     <button id="pause">Pause vault</button> <button id="unpause">Unpause vault</button>
     <button id="vaults">List factory vaults</button> <div id="vaultList"></div></section>`;
@@ -189,6 +206,16 @@ function layout() {
   $("addDevice").onclick = () => act("add another device", addDevice);
   const pairCode = new URLSearchParams(location.search).get("pair");
   if (pairCode) showJoin(pairCode);
+  const guardCode = new URLSearchParams(location.search).get("guard");
+  if (guardCode) showGuardJoin(guardCode);
+  const recId = new URLSearchParams(location.search).get("recover");
+  if (recId) showApprove(recId);
+  $("addGuardian").onclick = () => act("add a guardian", addGuardian);
+  $("saveGuardians").onclick = () => act("save guardians", saveGuardians);
+  $("cancelRecovery").onclick = () => act("cancel recovery", async () => { const a = need(); return chain.sponsored(a, a.address, "cancel_recovery", []); });
+  $("recover").onclick = () => act("start recovery", () => startRecovery("platform"));
+  $("recoverTest").onclick = () => act("start recovery", () => startRecovery("test"));
+  $("finishRecovery").onclick = () => act("finish recovery", finishRecovery);
   $("createTest").onclick = () => act("create test passkey account", async () => {
     if (loadAccount()) throw new Error("this browser already has an account - use 'Start over with a new passkey' first");
     const t = await createTestPasskey();
@@ -282,6 +309,12 @@ async function signIn() {
     if (dev) {
       saveAccount({ credentialId: found.id, publicKey: pk, address: String(dev.account), ruleId: Number(dev.rule_id), attachment: "existing" });
       return { signed_in: String(dev.account), as_device: dev.name };
+    }
+    // Step 8: a key that became the owner through a recovery.
+    const recovered = cfg.contracts.recovery_registry ? await chain.view(cfg.contracts.recovery_registry, "owner_account", [sv.bytes(pk)]) : null;
+    if (recovered) {
+      saveAccount({ credentialId: found.id, publicKey: pk, address: String(recovered), attachment: "existing" });
+      return { signed_in: String(recovered), recovered: true };
     }
     const acct = await chain.view(cfg.contracts.account_factory, "account_of", [sv.bytes(pk)]);
     if (acct) {
@@ -466,6 +499,139 @@ async function createOwnVault() {
   return { vault: created, policy_hash: d.policy_hash };
 }
 
+// ------------------------------------------------------------ step 8: recovery
+const GUARDIAN_KEYS = "constella-sandbox-guardian-keys";
+const RECOVERY_KEY = "constella-sandbox-recovery";
+const fromHexStr = (h: string) => Uint8Array.from(h.match(/../g)!.map((x) => parseInt(x, 16)));
+const readJson = (k: string, d: any) => { try { return JSON.parse(localStorage.getItem(k) || "") ?? d; } catch { return d; } };
+const writeJson = (k: string, v: any) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* private mode */ } };
+/** Same 6-character check code as the pairing mailbox (SHA-256 of the key). */
+async function checkCode(key: Uint8Array): Promise<string> {
+  const d = new Uint8Array(await crypto.subtle.digest("SHA-256", key as BufferSource));
+  return hex(d).slice(0, 6).toUpperCase();
+}
+let pendingGuardians: { key: string; check: string }[] = [];
+
+/** Owner: invite a guardian through the pairing mailbox (public key + check code). */
+async function addGuardian() {
+  const a = need();
+  if (a.ruleId !== undefined) throw new Error("only the account's first device (its owner passkey) can set guardians");
+  if (!cfg.contracts.recovery_registry) throw new Error("this deployment has no recovery registry");
+  const { code } = await chain.relayer("/pair/start", { account: a.address });
+  const link = `${location.origin}${location.pathname}?guard=${code}`;
+  $("guardBox").innerHTML = `<p><b>Send this link to your guardian</b> (your other device or a trusted person):<br>
+    <span class="mono">${link}</span><br>Waiting for them to create their guardian passkey (10 minutes)...</p>`;
+  for (let i = 0; i < 300; i++) {
+    await new Promise((r) => setTimeout(r, 2000));
+    const st = await chain.relayer("/pair/status", { code });
+    if (st.device_key) {
+      pendingGuardians.push({ key: st.device_key, check: st.check });
+      $("guardBox").innerHTML = `<p>Guardian joined - check code <b class="mono">${st.check}</b> must match their screen.
+        Pending: ${pendingGuardians.length}. Add more, then "Save guardians".</p>`;
+      return { guardian_check: st.check, pending: pendingGuardians.length };
+    }
+  }
+  throw new Error("the guardian did not join in time - start again");
+}
+
+/** Owner: install the guardians as one M-of-N rule (one passkey signature). */
+async function saveGuardians() {
+  const a = need();
+  if (!pendingGuardians.length) throw new Error("add at least one guardian first");
+  const t = Number($<HTMLInputElement>("threshold").value);
+  if (!(t >= 1 && t <= pendingGuardians.length)) throw new Error(`approvals needed must be 1..${pendingGuardians.length}`);
+  const keys = xdr.ScVal.scvVec(pendingGuardians.map((g) => sv.bytes(fromHexStr(g.key))));
+  const out = await chain.sponsored(a, cfg.contracts.recovery_registry, "set_guardians", [sv.addr(a.address), keys, sv.u32(t)]);
+  pendingGuardians = [];
+  return out;
+}
+
+/** Guardian device (opened with ?guard=CODE): create a guardian passkey here. */
+function showGuardJoin(code: string) {
+  $("guardJoin").innerHTML = `<h3>Become a guardian</h3>
+    <p>Someone asked you to help recover their Constella account if they ever lose their passkeys. Create a guardian
+    passkey on this device. It can only ever approve a new passkey for them - never move money.</p>
+    <button id="guardHere">Create my guardian passkey (this device)</button>
+    <button id="guardTest">Create a test guardian passkey (local testing only)</button>`;
+  const go = (test: boolean) => act("become a guardian", async () => {
+    const g = test ? await createTestPasskey().then((t) => ({ id: t.id, publicKey: t.publicKey, jwk: t.jwk, transports: [] as string[] }))
+                   : await createPasskey(`constella-guardian-${Date.now()}`, "platform").then((p) => ({ ...p, jwk: undefined }));
+    const keys = readJson(GUARDIAN_KEYS, []);
+    keys.push({ credentialId: g.id, publicKey: hex(g.publicKey), testKey: g.jwk, transports: g.transports });
+    writeJson(GUARDIAN_KEYS, keys);
+    const st = await chain.relayer("/pair/join", { code, device_key: hex(g.publicKey), name: "guardian" });
+    $("guardJoin").innerHTML = `<p><b>You are a guardian.</b> Check code <b class="mono">${st.check ?? await checkCode(g.publicKey)}</b> - tell the
+      account owner; it must match their screen.</p>`;
+    return { guardian: true };
+  });
+  $("guardHere").onclick = () => go(false);
+  $("guardTest").onclick = () => go(true);
+}
+
+/** New device: a new passkey and a recovery request for the guardians. */
+async function startRecovery(kind: "platform" | "test") {
+  const account = $<HTMLInputElement>("recAccount").value.trim();
+  if (!/^C[A-Z2-7]{55}$/.test(account)) throw new Error("enter the account's C... address");
+  const gs = await chain.view(cfg.contracts.recovery_registry, "guardians_of", [sv.addr(account)]);
+  if (!gs) throw new Error("this account has no guardians - it cannot be recovered");
+  const pk = kind === "test" ? await createTestPasskey().then((t) => ({ id: t.id, publicKey: t.publicKey, jwk: t.jwk as JsonWebKey | undefined, transports: [] as string[], attachment: "test" }))
+                             : await createPasskey(`constella-${Date.now()}`, "platform").then((p) => ({ ...p, jwk: undefined }));
+  const func = funcB64(account, "propose_recovery", proposalArgs(cfg.contracts.verifier, pk.publicKey));
+  const { auth, latest_ledger } = await chain.relayer("/prepare", { func });
+  // The account's own entry (the guardians sign as the account, under its recovery rule).
+  const mine = (auth as string[]).find((e) => {
+    const c: any = (xdr.SorobanAuthorizationEntry.fromXDR(e, "base64") as any).credentials;
+    const creds = c.address ?? c.addressV2;
+    return creds && Address.fromScAddress(creds.address).toString() === account;
+  });
+  if (!mine) throw new Error("no authorization to sign");
+  const entry = fixExpiry(mine, latest_ledger + 120_960); // guardians have about 7 days
+  const req = await chain.relayer("/recovery/request", { account, new_key: hex(pk.publicKey), threshold: Number(gs.threshold), func, entry });
+  writeJson(RECOVERY_KEY, { account, id: req.id, credentialId: pk.id, publicKey: hex(pk.publicKey), testKey: pk.jwk,
+                            transports: pk.transports, attachment: pk.attachment });
+  const link = `${location.origin}${location.pathname}?recover=${req.id}`;
+  $("recBox").innerHTML = `<p><b>Send this link to your guardians</b> (${gs.threshold} of ${gs.guardians.length} must approve):<br>
+    <span class="mono">${link}</span><br>Tell them this check code: <b class="mono">${await checkCode(pk.publicKey)}</b>.
+    After approval, the new passkey takes effect in 48 hours - then click "Finish recovery" here.</p>`;
+  return { request: req.id };
+}
+
+/** Guardian device (opened with ?recover=ID): approve with a guardian passkey. */
+async function showApprove(id: string) {
+  try {
+    const r = await chain.relayer("/recovery/get", { id });
+    const gs = await chain.view(cfg.contracts.recovery_registry, "guardians_of", [sv.addr(r.account)]);
+    const mine: GuardianKey[] = readJson(GUARDIAN_KEYS, []).map((k: any) => ({ ...k, publicKey: fromHexStr(k.publicKey) }));
+    const usable = mine.filter((k) => gs?.guardians.some((g: any) => hex(new Uint8Array(g)) === hex(k.publicKey)));
+    $("approveBox").innerHTML = `<h3>Approve a recovery</h3>
+      <p>Account <span class="mono">${r.account}</span> asks to make a NEW passkey its owner. Check code of the new passkey:
+      <b class="mono">${await checkCode(fromHexStr(r.new_key))}</b> - confirm it with the owner (call them) before approving.
+      Approvals: ${r.approvals.length} of ${r.threshold}.</p>
+      ${usable.length ? `<button id="approveRec">Approve with my guardian passkey</button>` : "<p><i>No guardian passkey for this account on this device.</i></p>"}`;
+    if (usable.length) {
+      $("approveRec").onclick = () => act("approve recovery", async () => {
+        const signed = await guardianSign(r.entry, cfg.network.passphrase, Number(gs.rule_id), cfg.contracts.verifier, usable[0]);
+        const out = await chain.relayer("/recovery/approve", { id, entry: signed });
+        $("approveBox").innerHTML = `<p>Approved (${out.approvals} of ${out.threshold}).${out.submitted ? " The proposal is on chain: it takes effect in 48 hours unless the owner cancels." : ""}</p>`;
+        return out;
+      });
+    }
+  } catch (e: any) {
+    $("approveBox").textContent = `recovery request: ${e?.message ?? e}`;
+  }
+}
+
+/** New device, after 48 hours: make the new passkey the owner and sign in. */
+async function finishRecovery() {
+  const rec = readJson(RECOVERY_KEY, null);
+  if (!rec) throw new Error("no recovery started on this device");
+  const out = await chain.relayer("/recovery/finish", { account: rec.account });
+  saveAccount({ credentialId: rec.credentialId, publicKey: fromHexStr(rec.publicKey), address: rec.account,
+                attachment: rec.attachment, transports: rec.transports, testKey: rec.testKey });
+  try { localStorage.removeItem(RECOVERY_KEY); } catch { /* */ }
+  return out;
+}
+
 async function refresh() {
   const c = cfg.contracts;
   try {
@@ -511,6 +677,12 @@ async function refresh() {
           + (devs.length ? `<br>added devices: ${devs.map((d: any) => `${d.name} (rule ${d.rule_id})`).join(", ")}` : "<br>no other devices yet");
       }
       $("claims").innerHTML = `open EURC claim for this account: <b>${fmt(claim)}</b> units ${BigInt(claim) > 0n ? "(the keeper settles it once EURC is priced again)" : ""}`;
+      if (cfg.contracts.recovery_registry) {
+        const gs = await chain.view(cfg.contracts.recovery_registry, "guardians_of", [sv.addr(a.address)]).catch(() => null);
+        const pend = await chain.view(a.address, "get_pending_recovery").catch(() => null);
+        $("guardians").innerHTML = (gs ? `guardians: <b>${gs.guardians.length}</b>, approvals needed <b>${gs.threshold}</b>` : "no guardians yet - add some so a lost passkey is not a lost account")
+          + (pend ? `<br><b style="color:#b00">A recovery is pending</b>: a new owner key takes effect at ${new Date(Number(pend.executable_at) * 1000).toLocaleString()} unless you cancel.` : "");
+      }
     } else {
       $("acct").textContent = "no account in this browser yet";
       $("claims").textContent = "";
