@@ -1,3 +1,9 @@
+> **25 Nov 2026:** these manual checks were written for the throwaway console (retired; the product app replaced it).
+> The same flows live in the app: sign-in and account creation (Welcome), deposit / redeem / frozen redemption
+> (a basket's page), thesis -> own basket (New basket), devices and guardians (Account), recovery (Welcome ->
+> "Lost every passkey?", and the ?guard / ?recover / ?pair links). Automated: `npm run e2e` (hosted app, real
+> passkeys via Chromium's virtual authenticator) and `npm run test:stack` (local network).
+
 # Constella sandbox - manual user-flow test suite
 
 Run these in a real browser on the local stack before the real product frontend is built. Each test
