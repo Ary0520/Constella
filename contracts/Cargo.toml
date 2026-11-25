@@ -16,6 +16,7 @@ members = [
     "account-factory",
     "collateral-oracle",
     "device-registry",
+    "recovery-registry",
 ]
 
 [workspace.package]

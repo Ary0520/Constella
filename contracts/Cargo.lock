@@ -353,6 +353,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "constella-recovery-registry"
+version = "0.1.0"
+dependencies = [
+ "constella-account-factory",
+ "soroban-sdk",
+ "stellar-accounts",
+]
+
+[[package]]
 name = "constella-registry"
 version = "0.1.0"
 dependencies = [
