@@ -10,6 +10,7 @@
     "build:testnet": "tsc --noEmit && vite build && cp config.testnet.json dist/config.json",
     "test": "vitest run",
     "test:stack": "SANDBOX_E2E=1 vitest run --no-file-parallelism test/stack.e2e.test.ts test/wallet.e2e.test.ts test/devices.e2e.test.ts",
+    "test:recovery": "node e2e/recovery.cjs",
     "test:browser": "node e2e/browser.cjs && node e2e/test-passkey.cjs && node e2e/signin.cjs && node e2e/pairing.cjs && node e2e/own-vault.cjs"
   },
   "dependencies": {
