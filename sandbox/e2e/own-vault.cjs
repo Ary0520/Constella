@@ -15,7 +15,12 @@ const ok = async (p, label) => { const s = await t(p, "#status"); console.log(la
   await p.click("#createTest"); await doneWith(p, "create test passkey account"); await ok(p, "CREATE ACCOUNT");
   await p.click("#faucet"); await doneWith(p, "faucet"); await ok(p, "FAUCET");
   await p.click("#run"); await p.waitForSelector("#mkVault", { timeout: 120000 });
-  console.log("DRAFT:", (await t(p, "#thesisOut")).slice(0, 160));
+  const draft = await t(p, "#thesisOut"); console.log("DRAFT:", draft.slice(0, 160));
+  // Step 7: the simulation (worst case first) and the Rule 10 disclaimer come BEFORE the create button.
+  for (const must of ["Simulation (before any money moves)", "Worst case", "Issuer freeze", "Depeg",
+                      "Past performance does not predict future returns", "Your thesis vs this basket"]) {
+    if (!draft.includes(must)) throw new Error(`draft is missing: ${must}`);
+  }
   await p.click("#mkVault"); await doneWith(p, "create my vault"); await ok(p, "CREATE MY VAULT");
   const sel = await p.$eval("#target", (s) => ({ value: s.value, label: s.options[s.selectedIndex].text }));
   console.log("SELECTED:", sel.label);
