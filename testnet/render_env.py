@@ -33,7 +33,7 @@ env = {
     "ACCOUNTS_PER_IP_PER_DAY": "3", "ACCOUNTS_PER_DAY": "200",
     "FAUCET_SECRET": k["lp"], "FAUCET_ASSET": c["assets"]["USDC"], "FAUCET_AMOUNT": "1000000000",
     # keeper
-    "KEEPER_SECRET": k["keeper"], "KEEPER_VAULTS": ",".join(vaults), "KEEPER_FACTORIES": ct["vault_factory"],
+    "KEEPER_SECRET": k["keeper"], "KEEPER_VAULTS": ",".join(vaults), "KEEPER_FACTORIES": ",".join([ct["vault_factory"]] + [v for k, v in sorted(ct.items()) if k.startswith("vault_factory_v")]),
     "KEEPER_INTERVAL_SECONDS": "120",
     "KEEPER_STATE_FILE": "/data/keeper_state.json",
     # ECB feeder (2nd independent EURC source)
