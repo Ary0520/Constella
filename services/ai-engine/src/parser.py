@@ -155,6 +155,10 @@ def parse_thesis(
             currency_exposure["USD"] = rest
         elif "EUR" not in currency_exposure and any(t in text_lower for t in ["euro", "eur", "€"]):
             currency_exposure["EUR"] = rest
+    # A share named for ONE currency only ("20% in dollar T-bills") is about the
+    # asset, not a currency mix: the whole basket is in that currency.
+    if len(currency_exposure) == 1:
+        currency_exposure[next(iter(currency_exposure))] = 1.0
     # Fallback for currency exposure if not parsed
     if currency_exposure:
         confidence["currency_exposure"] = 0.95
