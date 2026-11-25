@@ -132,6 +132,29 @@ pub trait VaultFactoryInterface {
     fn is_vault(env: Env, vault: Address) -> bool;
 }
 
+/// Step 8: the one function of `constella-account-factory` the sponsor reads:
+/// true only for smart accounts that factory deployed.
+#[contractclient(name = "AccountFactoryClient")]
+pub trait AccountFactoryInterface {
+    fn is_account(env: Env, account: Address) -> bool;
+}
+
+/// Topics: [ACCOUNT_FACTORY_TRUSTED, admin]. Data: factory.
+#[contractevent(topics = ["ACCOUNT_FACTORY_TRUSTED"], data_format = "single-value")]
+pub struct AccountFactoryTrusted {
+    #[topic]
+    pub admin: Address,
+    pub factory: Address,
+}
+
+/// Topics: [ACCOUNT_FACTORY_UNTRUSTED, admin]. Data: factory.
+#[contractevent(topics = ["ACCOUNT_FACTORY_UNTRUSTED"], data_format = "single-value")]
+pub struct AccountFactoryUntrusted {
+    #[topic]
+    pub admin: Address,
+    pub factory: Address,
+}
+
 /// Topics: [FACTORY_TRUSTED, admin]. Data: factory.
 #[contractevent(topics = ["FACTORY_TRUSTED"], data_format = "single-value")]
 pub struct FactoryTrusted {
@@ -187,6 +210,8 @@ pub enum DataKey {
     Relayers,
     /// Step 3: vault factories whose `is_vault` contracts are sponsorable.
     TrustedFactories,
+    /// Step 8: account factories whose `is_account` accounts are sponsorable.
+    TrustedAccountFactories,
 }
 
 /// Audit F1a: TTLs (in ledgers, ~5 s each). Per-user stats live in their own
@@ -323,7 +348,48 @@ impl FeeSponsorContract {
         }
         // Step 3: a vault proven by a trusted Constella factory.
         let factories: Vec<Address> = env.storage().instance().get(&DataKey::TrustedFactories).unwrap_or_else(|| Vec::new(&env));
-        factories.iter().any(|f| VaultFactoryClient::new(&env, &f).is_vault(&target))
+        if factories.iter().any(|f| VaultFactoryClient::new(&env, &f).is_vault(&target)) {
+            return true;
+        }
+        // Step 8: a smart account proven by a trusted Constella account factory.
+        let accounts: Vec<Address> = env.storage().instance().get(&DataKey::TrustedAccountFactories).unwrap_or_else(|| Vec::new(&env));
+        accounts.iter().any(|f| AccountFactoryClient::new(&env, &f).is_account(&target))
+    }
+
+    /// Step 8: trust a Constella account factory - every smart account it
+    /// proves (`is_account`) becomes sponsorable (recovery calls). Admin; bounded.
+    pub fn trust_account_factory(env: Env, factory: Address) -> Result<(), SponsorError> {
+        let config = Self::require_admin(&env)?;
+        let mut list: Vec<Address> = env.storage().instance().get(&DataKey::TrustedAccountFactories).unwrap_or_else(|| Vec::new(&env));
+        if list.contains(&factory) {
+            return Err(SponsorError::FactoryAlreadyTrusted);
+        }
+        if list.len() >= MAX_TRUSTED_FACTORIES {
+            return Err(SponsorError::TooManyFactories);
+        }
+        list.push_back(factory.clone());
+        env.storage().instance().set(&DataKey::TrustedAccountFactories, &list);
+        extend_instance(&env);
+        AccountFactoryTrusted { admin: config.admin, factory }.publish(&env);
+        Ok(())
+    }
+
+    /// Step 8: stop trusting an account factory.
+    pub fn untrust_account_factory(env: Env, factory: Address) -> Result<(), SponsorError> {
+        let config = Self::require_admin(&env)?;
+        let list: Vec<Address> = env.storage().instance().get(&DataKey::TrustedAccountFactories).unwrap_or_else(|| Vec::new(&env));
+        let Some(i) = list.first_index_of(&factory) else { return Err(SponsorError::FactoryNotTrusted) };
+        let mut list = list;
+        list.remove(i);
+        env.storage().instance().set(&DataKey::TrustedAccountFactories, &list);
+        extend_instance(&env);
+        AccountFactoryUntrusted { admin: config.admin, factory }.publish(&env);
+        Ok(())
+    }
+
+    /// Step 8: the trusted account factories.
+    pub fn get_trusted_account_factories(env: Env) -> Vec<Address> {
+        env.storage().instance().get(&DataKey::TrustedAccountFactories).unwrap_or_else(|| Vec::new(&env))
     }
 
     /// Step 3: trust a Constella vault factory - every contract it proves

@@ -324,6 +324,7 @@ dependencies = [
 name = "constella-fee-sponsor"
 version = "0.1.0"
 dependencies = [
+ "constella-account-factory",
  "constella-nav-oracle",
  "constella-policy",
  "constella-registry",
