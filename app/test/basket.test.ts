@@ -16,7 +16,6 @@ describe("draft -> own basket", () => {
   it("carries the exact signed terms, hash, owner and Constella's default fee", () => {
     const i = draftToVaultInput(draft(), OWNER, 1000, salt);
     expect(i).toMatchObject({ owner: OWNER, numeraire: "CUSDC", feeBps: 1000, policyHashHex: "ab".repeat(32), name: "18-month runway" });
-    expect(i.bind).toBe(draft().bind_policy === i.bind ? i.bind : i.bind);
     expect(i.bind.min_liquidity_sleeve_bps).toBe(1000);
     expect(i.capUnits).toBe(25_000n * 10_000_000n);
     expect(i.salt).toBe(salt);
