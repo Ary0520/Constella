@@ -128,6 +128,7 @@ def _soft_rows(policy: PolicyDraft, cands: List[AssetCandidate]) -> Tuple[List[R
             impossible.append(f"no eligible asset in {cur} for the requested {target:.0%}")
             continue
         rows.append((a, -lb, f"{cur} >= {lb:.0%} (your currency split, 5% tolerance)"))
+        rows.append((-a, min(1.0, target + CURRENCY_TOLERANCE), f"{cur} <= {min(1.0, target + CURRENCY_TOLERANCE):.0%} (your currency split, 5% tolerance)"))
     return rows, impossible
 
 
@@ -262,6 +263,8 @@ def check_allocation(bps: Dict[str, int], policy: PolicyDraft, cands: List[Asset
                 got = sum(x for a, x in bps.items() if by[a].currency.upper() == cur.upper())
                 if got < cap(max(0.0, target - CURRENCY_TOLERANCE)) - len(cands):
                     v.append(f"{cur} below your requested split")
+                if got > cap(min(1.0, target + CURRENCY_TOLERANCE)) + len(cands):
+                    v.append(f"{cur} above your requested split")
     return v
 
 
@@ -327,7 +330,12 @@ def optimize_portfolio(
                     pass
         if algorithm == "LP":
             lam = {"maximize": 0.05, "none": 0.0}.get(policy.target_yield_orientation, 0.01)
-            w2 = _refine(w, rows, bounds, lambda x: float(np.sum(x ** 2) - lam * np.sum(x * yields)))
+            # Step 4: pull each requested currency's share to what was asked
+            # (the band above only bounds it; diversification alone drifts to the edge).
+            split = [(np.array([1.0 if c.currency.upper() == cur.upper() else 0.0 for c in candidates]), t)
+                     for cur, t in policy.currency_exposure.items() if t > 0]
+            w2 = _refine(w, rows, bounds, lambda x: float(np.sum(x ** 2) - lam * np.sum(x * yields)
+                                                         + 10.0 * sum((float(m @ x) - t) ** 2 for m, t in split)))
             if w2 is not w:
                 w, algorithm = w2, "CONSTRAINED_HEURISTIC"
         return _to_bps(w, n_idx, rows, bounds), algorithm
