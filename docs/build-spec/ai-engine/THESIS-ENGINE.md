@@ -107,6 +107,14 @@ def retrieve_candidates(policy: PolicyDraft, registry: AssetRegistry) -> List[As
 
 **Fail closed (audit A1 / decision D-A, implemented `fce2fed`):** there is **no** fallback that relaxes a rule. Hard rules — the profile (Cash Reserve, the default and only Phase-1 profile: vault currency ≥ 85 %, lending ≤ 15 %), the liquidity floor, and the user's issuer / single-asset caps on every asset **except the vault currency** — are never relaxed. The user's currency split is a soft target: if it conflicts, `InfeasibleAllocation` lists the reasons and offers the nearest valid allocation without it, which the user must accept. An exact LP proves feasibility, SLSQP / HRP refinements are kept only if still valid, bps rounding is cap-safe largest-remainder, and an integer-exact final check raises rather than returning an invalid allocation. The explainer discloses the vault-currency issuer exposure (e.g. "92 % depends on CIRCLE through USDC") plainly.
 
+**Thesis-driven rules (step 4, decision D-P, 25 Nov 2026)** - these replace the single Cash Reserve profile for every thesis; the fail-closed machinery above is unchanged:
+- vault currency = the cash asset of the thesis's main currency, restricted by the API to what the chain can price (the NAV oracle base, USDC; the factory refuses others);
+- cash >= the thesis's liquidity floor (default 10 %); a currency the thesis did not ask for gets 0 %;
+- each lending pool <= 15 % (one audited pool, D-A); excluded sleeves get 0 %;
+- no tier-3 (illiquid) asset unless the horizon allows a month; assets slower than the horizon <= 25 % in total;
+- the currency split is a two-sided ±5 % band and the refinement pulls each currency to its requested share;
+- the parser reads fraction words ("a third", "half") and completes partial splits with the vault currency.
+
 **Covariance inputs:**
 - Historical NAV returns (where available; short histories for newer tokenized funds)
 - Duration/liquidity tier proxies where history is insufficient
