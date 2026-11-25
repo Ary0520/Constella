@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { sv } from "../core/chain";
 import { assetName } from "../core/labels";
-import { formatUnits, parseUnits, readPosition, readVault } from "../core/vaults";
+import { formatUnits, parseUnits, readActivity, readPosition, readVault } from "../core/vaults";
 import { addUsdcTrustline, friendbotFund, walletStatus } from "../core/wallet";
 import { navigate } from "../router";
 import { useSession } from "../session";
@@ -16,12 +16,20 @@ import { userAddress } from "./Portfolio";
 const usd = (u: bigint) => "$" + formatUnits(u);
 const pct = (bps: number) => (bps / 100).toFixed(1) + "%";
 
+/** Vault contract errors (VaultError codes) and service errors, in plain words. */
+const VAULT_ERRORS: Record<string, string> = {
+  "4": "This basket is paused by its admin, so it cannot take this action right now.",
+  "8": "The basket does not have enough cash to pay this out right now. Redeem less, or wait for the keeper to raise cash.",
+  "10": "A price is unavailable right now, so a normal redemption cannot value your shares. Use \"Redeem while a price is unavailable\" below.",
+  "18": "This basket is full (its total limit).",
+  "19": "That is above this basket's per-person limit.",
+};
 export function friendlyChainError(m: string): string {
+  const code = /Error\(Contract, #(\d+)\)/.exec(m)?.[1];
+  if (code && VAULT_ERRORS[code]) return VAULT_ERRORS[code];
   if (/RATE_LIMITED|once a day/i.test(m)) return "The test-USDC faucet gives each account one top-up a day. Try again tomorrow.";
-  if (/faucet_refused|trustline/i.test(m)) return "This wallet needs a USDC trustline first (button above).";
+  if (/faucet_refused|trustline/i.test(m)) return "This wallet needs to accept USDC first (button above).";
   if (/NotAllowedError|timed out/i.test(m)) return "The signature prompt was closed. Nothing was sent.";
-  if (/ExceedsUserCap|PerUserCap/i.test(m)) return "That deposit is above this basket's per-person limit.";
-  if (/Paused/i.test(m)) return "This basket is paused by its admin. Deposits wait; redemptions follow the vault's rules.";
   return m;
 }
 
@@ -38,6 +46,8 @@ export function Vault({ id }: { id: string }) {
     return { vault, pos, usdc: BigInt(usdc), claim: BigInt(claim), wallet };
   }, [id, me]);
   const act = useAction();
+  const activity = useAsync(() => readActivity(chain, id), [id]);
+  const [frozenPreview, setFrozenPreview] = useState<{ cash: bigint; claims: [string, bigint][] } | null>(null);
   const [dep, setDep] = useState("");
   const [red, setRed] = useState("");
 
@@ -113,6 +123,25 @@ export function Vault({ id }: { id: string }) {
               </div>
               {act.error && <div className="c-note c-note-bad" role="alert" style={{ marginTop: 12 }}>{act.error}</div>}
               {act.done && <div className="c-note c-note-ok" role="status" style={{ marginTop: 12 }}>{act.done}</div>}
+              {v.sleeves.some((s) => !s.priced) && d.pos.shares > 0n && (
+                <div className="c-note" style={{ marginTop: 12, flexDirection: "column" }} data-frozen>
+                  <span>A holding has no valid price right now. You can still redeem: you get its cash part now and a claim for the rest, which the keeper pays in USDC once the price is back.</span>
+                  {frozenPreview && <span className="small">For {red || "these"} shares: {usd(frozenPreview.cash)} now
+                    {frozenPreview.claims.map(([a, n]) => ` + a claim of ${formatUnits(n)} units of ${a === cfg.assets.EURC ? "EURC" : a.slice(0, 6)}`).join("")}.</span>}
+                  <div className="c-row">
+                    <button className="c-btn c-btn-line c-btn-sm" disabled={!!act.busy} onClick={() => act.run("preview", async () => {
+                      const p = await chain.view(id, "preview_redeem_frozen", [sv.i128(parseUnits(red))]);
+                      setFrozenPreview({ cash: BigInt(p.cash), claims: (p.claims as any[]).map(([a, n]: any) => [String(a), BigInt(n)]) });
+                    })}>Preview</button>
+                    <button className="c-btn c-btn-dark c-btn-sm" disabled={!!act.busy} data-act="redeem-frozen" onClick={() => run("frozen", async () => {
+                      const n = parseUnits(red);
+                      if (n > d.pos.shares) throw new Error(`You hold ${formatUnits(d.pos.shares, 4)} shares.`);
+                      await actor().call(id, "redeem_frozen", user(n)); setRed(""); setFrozenPreview(null);
+                      return "Redeemed: cash is in your account; the rest is a claim the keeper pays once the price is back.";
+                    })}>Redeem while a price is unavailable</button>
+                  </div>
+                </div>
+              )}
               {d.claim > 0n && (
                 <div className="c-note" style={{ marginTop: 12 }}>You have an open EURC claim of {formatUnits(d.claim)} units. It was set aside
                   while the euro price was unavailable; the keeper pays it in USDC once EURC is priced again.</div>
@@ -148,6 +177,18 @@ export function Vault({ id }: { id: string }) {
               Fee: {v.feeBps / 100}% of profit above the high-water mark, never more than 0.20% a year; nothing when there is no profit.
             </p>
             {v.policyHash && <p className="addr" style={{ marginTop: 8 }}>Policy hash {v.policyHash}</p>}
+          </section>
+          <section className="c-card">
+            <div className="c-section-title"><h3>Recent activity</h3><span className="muted small">last week, from the network</span></div>
+            {activity.error && <p className="small muted">Activity is unavailable right now.</p>}
+            {!activity.data && !activity.error && <p className="small muted">Loading…</p>}
+            {activity.data?.length === 0 && <p className="small muted">Nothing in the last week.</p>}
+            {activity.data && activity.data.length > 0 && (
+              <table className="c-table" data-activity><tbody>{activity.data.map((a) => (
+                <tr key={a.tx + a.label}><td>{a.label}</td><td className="r muted small">{new Date(a.at).toLocaleString()}</td>
+                  <td className="r hide-sm"><a className="addr" href={`https://stellar.expert/explorer/testnet/tx/${a.tx}`} target="_blank" rel="noreferrer">{a.tx.slice(0, 10)}…</a></td></tr>
+              ))}</tbody></table>
+            )}
           </section>
         </>
       )}
