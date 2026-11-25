@@ -208,3 +208,13 @@ def test_every_other_rule_still_applies_to_own_vault_calls():
     with pytest.raises(Rejected) as e:
         validate(func(c), [entry(c, source_account=True)], ALLOWED, RELAYERS, vault_functions=VAULT_FNS)
     assert e.value.code == "SOURCE_ACCOUNT_AUTH_FORBIDDEN"
+
+
+def test_recovery_calls_on_an_unlisted_account_need_the_on_chain_proof():
+    acct_fns = frozenset({"propose_recovery", "cancel_recovery"})
+    c = call(contract=OWN_VAULT, fn="propose_recovery", args=[scval.to_bytes(b"\x04" * 65)])
+    v = validate(func(c), [entry(c)], ALLOWED, RELAYERS, vault_functions=VAULT_FNS | acct_fns)
+    assert v.needs_chain_proof is True and v.function == "propose_recovery"
+    other = call(contract=OWN_VAULT, fn="add_signer", args=[scval.to_bytes(b"\x04" * 65)])
+    with pytest.raises(Rejected):
+        validate(func(other), [entry(other)], ALLOWED, RELAYERS, vault_functions=VAULT_FNS | acct_fns)
