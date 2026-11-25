@@ -14,7 +14,7 @@ real frontend). stdlib only.
 
 Config (env): CONSTELLA_RPC_URL, CONSTELLA_NETWORK_PASSPHRASE, REGISTRY_ID,
 ORACLE_ID, READ_SOURCE (any existing account, for simulations), API_HOST
-(127.0.0.1), API_PORT (8790), API_CORS_ORIGIN (http://localhost:5173),
+(127.0.0.1), API_PORT (8790), API_CORS_ORIGIN (comma-separated browser origins; http://localhost:5173),
 LLM_ENABLED=1 to allow "use_llm" (then OPENROUTER_API_KEY and
 LLM_RUN_BUDGET_USD, default 0.05 for the whole process).
 """
@@ -122,6 +122,9 @@ class Engine:
 
 
 def make_handler(engine: Engine, cors_origin: str):
+    # Comma-separated allow-list of browser origins (the console, the app).
+    allowed = frozenset(o.strip().rstrip("/") for o in (cors_origin or "").split(",") if o.strip())
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "constella-thesis-api"
 
@@ -132,8 +135,11 @@ def make_handler(engine: Engine, cors_origin: str):
             data = json.dumps(body, default=str).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            self.send_header("Access-Control-Allow-Origin", cors_origin)
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Vary", "Origin")
+            origin = (self.headers.get("Origin") or "").rstrip("/")
+            if origin in allowed:  # answer only a listed caller origin
+                self.send_header("Access-Control-Allow-Origin", origin)
+                self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
