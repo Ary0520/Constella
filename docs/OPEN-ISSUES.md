@@ -12,7 +12,7 @@ WASM (no upgrade path by design) - on mainnet every account will be created with
 
 | # | Severity | Issue | Where | Done when |
 |---|---|---|---|---|
-| 2 | **High (users can lose funds)** | No recovery path if every passkey is lost. Guardian recovery exists in the contract (48 h, owner-cancellable) but nothing in the relayer or frontend sets up guardians or calls it, and the relayer does not sponsor those calls. | `contracts/smart-account`, `services/relayer`, frontend | Guardian setup + recovery flow works end to end on testnet; sponsored; documented in ACCOUNTS.md. |
+| 2 | **High (users can lose funds)** | No recovery path if every passkey is lost. **25 Nov 2026: built and live on testnet** (recovery registry, guardian mailbox, sponsored propose/cancel, relayer-built finish, console screens; ACCOUNTS.md). Proven live: guardian setup, M-of-N approval, proposal on chain, owner cancel. **Still open until** the 48-hour finish is proven: `python testnet/e2e_recovery.py --finish` after 2026-11-27 13:00 UTC. | `contracts/smart-account`, `services/relayer`, frontend | Guardian setup + recovery flow works end to end on testnet; sponsored; documented in ACCOUNTS.md. |
 | 4 | Low (UI) | Landing page on phones: the hero coin overlaps the copy and the nav buttons wrap. | `prototypes/landing/index.html` (media query at max-width 900px) | Hero readable at 390 px wide, verified by screenshot. |
 
 Also noted (not bugs, product gaps):

@@ -65,6 +65,10 @@ version). Then select **Constella local** as the active network. xBull also supp
 | V5 | Wait ~2-4 min, refresh | BLEND_USDC_SUPPLY "held" becomes positive (Constella's keeper rebalanced YOUR vault to the signed targets) |
 | V6 | Same with **Sign in with: Stellar wallet** (section 2b ready) | Wallet popup for the create call; you pay the XLM fee; same result |
 | V7 | Draft a policy without any account, or connect another account and click create | Preview only (no button) / "this draft was made for another account" |
+| R1 | Owner (first device): section 8 -> "Add a guardian" -> open the link on another device/browser -> "Create my guardian passkey" | Both screens show the same check code; "Save guardians" -> "guardians: 1, approvals needed 1" |
+| R2 | New device: enter the account address -> "Recover - new passkey on THIS device" -> send the link to the guardian | Guardian sees the same check code as the new device; "Approve" -> "The proposal is on chain" |
+| R3 | Owner: refresh | Red "A recovery is pending ... unless you cancel"; "Cancel a pending recovery" removes it |
+| R4 | (48 h after R2, without cancelling) New device: "Finish recovery" | This device is now the owner; "Sign in with an existing passkey" on it finds the account |
 
 Automated: `npm run test:browser` (own-vault.cjs) and `python testnet/e2e_own_vault.py --wait 300`.
 

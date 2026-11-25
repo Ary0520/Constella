@@ -25,7 +25,7 @@ every thesis becomes the same basket, and a drafted policy cannot become the use
 | 5 | Multi-asset sleeves on testnet: EURC sleeve live (needs Soroswap EURC depth), Blend EURC reserve, any real permissionless testnet RWA we can find (research: Etherfuse, Spiko, Franklin testnet tokens) | Baskets need more than USDC to be baskets | >= 3 priced sleeves rebalanced by the keeper |
 | 6 | Flow netting: deposits buy underweight sleeves, withdrawals come from overweight ones | Founding doc 4.5; cheaper, fewer trades | Keeper trades only residuals |
 | 7 | ✅ DONE 25 Nov (live on the hosted console): Simulation to spec: redemption ladder, depeg, issuer outage, history replay, worst exit time; explain = diff vs thesis | Founding doc 2.2 / 4.7 | Shown before every signature |
-| 8 | Account recovery (OPEN-ISSUES #2): guardians setup + recovery, sponsored | Users must not lose funds | Recover an account with a new device on testnet |
+| 8 | 🟡 LIVE 25 Nov on testnet + hosted console (guardians, M-of-N approval, propose, cancel); finish proof due 27 Nov 13:00 UTC (`testnet/e2e_recovery.py --finish`). Account recovery (OPEN-ISSUES #2): guardians setup + recovery, sponsored | Users must not lose funds | Recover an account with a new device on testnet |
 | 9 | Collateral Passport live: vault share listed in our Blend pool (needs BLND backstop: ask Blend team) | The headline metric | Borrow USDC against a vault share on testnet |
 | 10 | Real product app (design from the landing direction; reuse sandbox passkey/chain/wallet code) | Replace the throwaway console | Every live flow above in the real UI |
 

@@ -68,6 +68,35 @@ The relayer exposes `POST /accounts {"owner_key": hex}`: it builds the call itse
 
 Sign-in on any device: "Sign in with an existing passkey" asks the device for any passkey it holds for the site, recovers the P-256 public key from the signature, and finds the account via `account_factory.account_of` or `device_registry.device_of`.
 
+### Account recovery: guardians (step 8, OPEN-ISSUES #2; implemented 25 Nov 2026)
+
+`contracts/recovery-registry` (one fixed address the relayer can sponsor, like the device registry):
+- **Set up (owner):** `set_guardians(account, guardian_keys, threshold)` is authorized by the account's owner passkey
+  and installs ONE rule scoped `CallContract(account)` named "recovery": signers = the guardians' passkeys
+  (`External(webauthn_verifier, key)`), policy = the shared `threshold-policy` with M = `threshold`. Limits: 1 <= M <= N
+  <= 5 guardians, distinct valid P-256 keys, never the owner's own key, once per account. `guardians_of(account)`,
+  `accounts_guarded_by(key)`.
+- **Recover (new device):** a new passkey is created; the console prepares `account.propose_recovery(External(verifier,
+  new_key))` and fixes the authorization entry's expiry (~7 days) so every guardian signs the SAME entry. The relayer's
+  guardian mailbox (`/recovery/request | get | approve`, persisted in `/data/recovery.json`, 7-day expiry) accepts only
+  signatures over exactly that entry and rule, merges them (signer map in Soroban key order) and, at M approvals, submits
+  through the normal sponsored path. The account checks every guardian signature, the threshold, and that only the
+  recovery rule may propose (S4).
+- **48 hours later:** `/recovery/finish` - the relayer builds `recovery_registry.finish(account)` itself (no signature):
+  it executes the recovery on the account (which enforces the delay) and records `new key -> account`
+  (`owner_account`), so "Sign in with an existing passkey" on the new device finds the account.
+- **Cancel (owner):** `account.cancel_recovery`, sponsored on accounts the fee-sponsor proves via the account factory
+  (`SPONSOR_ACCOUNT_FUNCTIONS` = `propose_recovery,cancel_recovery` only).
+- **Check codes:** the guardian invitation reuses device pairing (same 6-character code on both screens); a recovery
+  request shows the new passkey's code on the new device and on the guardian's approval screen - the guardian should
+  confirm it with the owner (e.g. by phone) before approving.
+- Credentials: testnet simulation returns CAP-71 `ADDRESS_V2` entries; the mailbox accepts `ADDRESS` and `ADDRESS_V2`.
+
+Proven on Stellar testnet, 25 Nov 2026: `testnet/e2e_recovery.py` (2-of-2 through the hosted relayer: one approval
+submits nothing, the second submits; pending on chain for 48.0 h; finishing early refused; owner cancel on a second
+account) and `sandbox/e2e/recovery.cjs` (owner, guardian and new device as three browser profiles on the hosted console).
+`--finish` completes the first account after 2026-11-27 13:00 UTC.
+
 ## Fee Sponsorship Architecture
 
 ```
@@ -193,5 +222,5 @@ Using **Stellar Wallets Kit** for wallet connection:
 - [ ] Partner SDK with account creation
 - [ ] Bell readiness: W-address (CAP-84) design documented, implementation deferred
 - [ ] Bell readiness: ML-DSA (CAP-87) design documented, implementation deferred
-- [ ] Emergency: account recovery flow for passkey accounts
+- [x] Emergency: account recovery flow for passkey accounts (guardians; testnet 25 Nov 2026 - finish proof due 27 Nov)
 - [ ] Security: sponsor account monitoring and alerting
