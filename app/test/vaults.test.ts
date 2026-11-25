@@ -71,3 +71,17 @@ describe("typed amounts", () => {
     }
   });
 });
+
+describe("activity", () => {
+  it("names the events people care about and hides internal steps", async () => {
+    const { eventLabel } = await import("../src/core/vaults");
+    expect(eventLabel("REBALANCE_COMPLETE")).toBe("Keeper rebalanced");
+    expect(eventLabel("deposit")).toBe("Deposit");
+    expect(eventLabel("withdraw")).toBe("Withdrawal");
+    expect(eventLabel("FROZEN_REDEMPTION")).toBe("Redeemed while a price was unavailable");
+    expect(eventLabel("CLAIM_SETTLED")).toBe("Claim paid");
+    expect(eventLabel("VAULT_PAUSED")).toBe("Paused by its admin");
+    expect(eventLabel("REBALANCE_STEP")).toBeNull();
+    expect(eventLabel("transfer")).toBeNull();
+  });
+});
