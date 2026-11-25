@@ -144,6 +144,39 @@ def plan(sleeves: List[Sleeve], scale: int, default_band_bps: int, max_slippage_
                                 "not trading against an off-oracle pool")
         return Trade(s_in.address, s_out.address, amount_in, min_out, ROUTE_BLEND if blend else ROUTE_SOROSWAP)
 
+    # Flow netting (step 6; EXECUTION.md Steps 1-2, RISKS R04): trade only the
+    # residual. Deposits/withdrawals land in cash; sleeves more than HALF their
+    # band from target go back to target (cash absorbs it); leftover excess cash
+    # buys the most underweight sleeves, a leftover shortfall sells the most
+    # overweight ones. Sleeves within half their band are left alone: slippage
+    # (<= max_slippage_bps of the traded value) cannot push them out of band.
+    band_of = lambda s: s.band_bps if s.band_bps > 0 else default_band_bps
+    goal = {s.asset_id: total * s.target_bps // 10000 for s in sleeves}
+    want = {s.asset_id: value(s, scale) for s in sleeves}
+    beyond_half = lambda s, v: abs(v * 10000 - total * s.target_bps) * 2 > band_of(s) * total
+    others = [s for s in sleeves if not s.is_cash]
+    for s in others:
+        if beyond_half(s, want[s.asset_id]):
+            want[s.asset_id] = goal[s.asset_id]
+    cash_after = total - sum(want[s.asset_id] for s in others)
+    if beyond_half(hub, cash_after):
+        gap = cash_after - goal[hub.asset_id]
+        if gap > 0:   # deposits: fill the most underweight first
+            order = sorted((s for s in others if want[s.asset_id] < goal[s.asset_id]),
+                           key=lambda s: want[s.asset_id] - goal[s.asset_id])
+            for s in order:
+                step = min(gap, goal[s.asset_id] - want[s.asset_id])
+                want[s.asset_id] += step
+                gap -= step
+        else:         # withdrawals: drain the most overweight first
+            short = -gap
+            order = sorted((s for s in others if want[s.asset_id] > goal[s.asset_id]),
+                           key=lambda s: goal[s.asset_id] - want[s.asset_id])
+            for s in order:
+                step = min(short, want[s.asset_id] - goal[s.asset_id])
+                want[s.asset_id] -= step
+                short -= step
+
     sells: List[Trade] = []
     buys: List[Tuple[Sleeve, int]] = []
     after = {s.asset_id: value(s, scale) for s in sleeves}
@@ -151,7 +184,7 @@ def plan(sleeves: List[Sleeve], scale: int, default_band_bps: int, max_slippage_
     for s in sleeves:
         if s.is_cash:
             continue
-        delta = total * s.target_bps // 10000 - value(s, scale)
+        delta = want[s.asset_id] - value(s, scale)
         if abs(delta) < min_trade_value:
             continue
         if delta < 0:
@@ -200,8 +233,12 @@ def plan_raise_cash(sleeves: List[Sleeve], scale: int, max_slippage_bps: int, qu
     hub = cash[0]
     if need <= 0:
         raise PlanError("nothing to raise")
+    # Withdrawals come from the most overweight sleeves (flow netting, step 6):
+    # the claim's own asset first, then by excess over target, then size.
+    # (An unpriced holding fails closed here, as before: value() raises.)
+    total = sum(value(s, scale) for s in sleeves)
     order = sorted((s for s in sleeves if not s.is_cash and s.held > 0),
-                   key=lambda s: (s.address != prefer, -value(s, scale)))
+                   key=lambda s: (s.address != prefer, -(value(s, scale) * 10000 - total * s.target_bps), -value(s, scale)))
     ops: List[Trade] = []
     after = {s.asset_id: value(s, scale) for s in sleeves}
     raised = 0
