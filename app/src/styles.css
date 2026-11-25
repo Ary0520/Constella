@@ -165,3 +165,12 @@ textarea.c-input { min-height: 120px; resize: vertical; line-height: 1.5 }
 .c-build { display: grid; place-items: center; min-height: 200px; text-align: center }
 .c-build p { margin-top: 6px }
 .c-kvs { display: flex; gap: 32px; flex-wrap: wrap; margin-bottom: 18px }
+.c-list { padding-left: 18px; display: flex; flex-direction: column; gap: 6px; color: var(--ink-2); font-size: 14px }
+.c-stages { list-style: none; display: flex; flex-wrap: wrap; gap: 8px }
+.c-stages li { font-size: 13px; padding: 6px 12px; border-radius: 999px; background: var(--iris-soft); color: var(--iris); animation: pulse 1.6s infinite }
+.c-stages li:nth-child(2) { animation-delay: .3s } .c-stages li:nth-child(3) { animation-delay: .6s }
+.c-stages li:nth-child(4) { animation-delay: .9s } .c-stages li:nth-child(5) { animation-delay: 1.2s }
+@keyframes pulse { 50% { opacity: .45 } }
+.c-check { display: flex; gap: 10px; align-items: flex-start; font-size: 14px; color: var(--ink) }
+.c-check input { margin-top: 3px; width: 16px; height: 16px; accent-color: var(--ink) }
+details summary { cursor: pointer }

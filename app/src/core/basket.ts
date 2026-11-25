@@ -20,7 +20,9 @@ export async function draftThesis(cfg: Config, text: string, owner: string | nul
   const out = await r.json();
   if (!r.ok) {
     const reasons = Array.isArray(out.reasons) ? out.reasons.join(" ") : out.detail ?? "";
-    throw new Error(`${out.error ?? "The engine refused this thesis"}${reasons ? `: ${reasons}` : ""}`);
+    const err: Error & { body?: any } = new Error(`${out.error ?? "The engine refused this thesis"}${reasons ? `: ${reasons}` : ""}`);
+    err.body = out; // an infeasible thesis carries reasons + the nearest basket
+    throw err;
   }
   return out;
 }
