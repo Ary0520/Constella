@@ -40,7 +40,7 @@ def func(c) -> str:
     return b64(xdr.HostFunction(type=xdr.HostFunctionType.HOST_FUNCTION_TYPE_INVOKE_CONTRACT, invoke_contract=c))
 
 
-def entry(c, nonce=7, signers=None, rule=3) -> str:
+def entry(c, nonce=7, signers=None, rule=3, v2=False) -> str:
     smap = lambda entries: xdr.SCVal(xdr.SCValType.SCV_MAP, map=xdr.SCMap([xdr.SCMapEntry(k, v) for k, v in entries]))
     sig = scval.to_void() if signers is None else smap([
         (scval.to_symbol("context_rule_ids"), scval.to_vec([scval.to_uint32(rule)])),
@@ -49,7 +49,8 @@ def entry(c, nonce=7, signers=None, rule=3) -> str:
     creds = xdr.SorobanAddressCredentials(address=Address(ACCOUNT).to_xdr_sc_address(), nonce=xdr.Int64(nonce),
                                           signature_expiration_ledger=xdr.Uint32(5_000), signature=sig)
     return b64(xdr.SorobanAuthorizationEntry(
-        credentials=xdr.SorobanCredentials(type=xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS, address=creds),
+        credentials=(xdr.SorobanCredentials(type=xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS_V2, address_v2=creds) if v2 else
+                     xdr.SorobanCredentials(type=xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS, address=creds)),
         root_invocation=xdr.SorobanAuthorizedInvocation(
             function=xdr.SorobanAuthorizedFunction(
                 type=xdr.SorobanAuthorizedFunctionType.SOROBAN_AUTHORIZED_FUNCTION_TYPE_CONTRACT_FN, contract_fn=c),
@@ -61,7 +62,8 @@ G1, G2, G3 = "04" + "aa" * 64, "04" + "22" * 64, "04" + "cc" * 64
 
 def signer_keys(entry_b64: str) -> list[str]:
     e = xdr.SorobanAuthorizationEntry.from_xdr(entry_b64)
-    top = {scval.to_native(m.key): m.val for m in e.credentials.address.signature.map.sc_map}
+    creds = e.credentials.address or e.credentials.address_v2
+    top = {scval.to_native(m.key): m.val for m in creds.signature.map.sc_map}
     return [bytes(scval.to_native(m.key)[2]).hex() for m in top["signers"].map.sc_map]
 
 
@@ -116,3 +118,17 @@ def test_only_a_propose_recovery_on_the_named_account_can_be_opened(tmp_path):
         box.open(ACCOUNT, NEW_KEY, 1, func(call(account=OTHER)), entry(call(account=OTHER)))
     with pytest.raises(Rejected):
         box.open(ACCOUNT, NEW_KEY, 0, func(call()), entry(call()))
+
+
+def test_cap71_address_v2_entries_work_too(tmp_path):
+    """Testnet (CAP-71) returns ADDRESS_V2 credentials from simulation: the
+    mailbox must accept and merge them exactly like ADDRESS ones."""
+    c = call()
+    box = RecoveryMailbox(str(tmp_path / "rec.json"))
+    rid = box.open(ACCOUNT, NEW_KEY, 2, func(c), entry(c, v2=True))["id"]
+    box.approve(rid, entry(c, signers={G1: b"s1"}, v2=True))
+    out = box.approve(rid, entry(c, signers={G2: b"s2"}, v2=True))
+    assert out["ready"] and sorted(signer_keys(out["entry"])) == sorted([G1, G2])
+    assert xdr.SorobanAuthorizationEntry.from_xdr(out["entry"]).credentials.type == xdr.SorobanCredentialsType.SOROBAN_CREDENTIALS_ADDRESS_V2
+    with pytest.raises(Rejected):  # a V1 copy is a different signed payload: not this request
+        box.approve(rid, entry(c, signers={G3: b"s3"}))
