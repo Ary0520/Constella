@@ -45,7 +45,7 @@ def main() -> None:
     deposit = float(sys.argv[sys.argv.index("--deposit") + 1]) if "--deposit" in sys.argv else 100.0
     thesis = (sys.argv[sys.argv.index("--thesis") + 1] if "--thesis" in sys.argv
               else "Keep a safe runway in dollars with at least 10% instant cash; lend a little.")
-    cfg = json.loads((ROOT / "sandbox/config.testnet.json").read_text())
+    cfg = json.loads((ROOT / "app/config.testnet.json").read_text())
     st = json.loads((ROOT / "testnet/state/config.json").read_text())
     ct = st["contracts"]
     factory, usdc = ct["vault_factory"], cfg["assets"]["USDC"]

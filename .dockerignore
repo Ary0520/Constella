@@ -2,7 +2,7 @@ contracts/target
 **/node_modules
 **/__pycache__
 **/*.egg-info
-sandbox/dist
+app/dist
 localnet/state
 testnet/state
 videos

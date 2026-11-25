@@ -15,7 +15,9 @@
     "e2e:basket": "node e2e/basket.cjs",
     "e2e:recovery": "node e2e/recovery.cjs",
     "e2e:pairing": "node e2e/pairing.cjs",
-    "e2e": "node e2e/signin.cjs && node e2e/vault.cjs && node e2e/basket.cjs && node e2e/pairing.cjs && node e2e/recovery.cjs"
+    "e2e": "node e2e/signin.cjs && node e2e/vault.cjs && node e2e/basket.cjs && node e2e/pairing.cjs && node e2e/recovery.cjs",
+    "dev:local": "cp config.local.json public/config.json && vite",
+    "test:stack": "STACK_E2E=1 vitest run --no-file-parallelism test/stack.stack.test.ts test/wallet.stack.test.ts test/devices.stack.test.ts"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "2.8.0",

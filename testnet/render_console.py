@@ -1,4 +1,4 @@
-"""Write sandbox/config.testnet.json for the hosted console: testnet
+"""Write app/config.testnet.json for the hosted app: testnet
 addresses and public service URLs ONLY - no secrets (this file is public)."""
 import json
 import sys
@@ -16,5 +16,5 @@ cfg = {
     "services": {"relayer": f"{base}/relayer", "thesis_api": f"{base}/api"},
 }
 assert "LOCAL_ONLY_secrets" not in cfg and not any(str(v).startswith("S") and len(str(v)) == 56 for v in cfg["accounts"].values())
-(ROOT / "sandbox/config.testnet.json").write_text(json.dumps(cfg, indent=2))
-print("wrote sandbox/config.testnet.json (no secrets)")
+(ROOT / "app/config.testnet.json").write_text(json.dumps(cfg, indent=2))
+print("wrote app/config.testnet.json (no secrets)")

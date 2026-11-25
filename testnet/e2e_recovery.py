@@ -69,7 +69,7 @@ def external(verifier: str, key: bytes) -> xdr.SCVal:
 
 class Ctx:
     def __init__(self):
-        self.cfg = json.loads((ROOT / "sandbox/config.testnet.json").read_text())
+        self.cfg = json.loads((ROOT / "app/config.testnet.json").read_text())
         self.ct = json.loads((ROOT / "testnet/state/config.json").read_text())["contracts"]
         self.rel = self.cfg["services"]["relayer"]
         self.verifier = self.ct["verifier"]

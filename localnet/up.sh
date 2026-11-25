@@ -18,4 +18,4 @@ docker run --rm --network constella-local_default -v "$(cd .. && pwd):/repo" -w 
   sh -c "pip install -q --no-cache-dir --root-user-action=ignore stellar-sdk==17.0.1 >/dev/null 2>&1 && python localnet/deploy.py && python localnet/render.py"
 docker compose up -d relayer keeper watchdog thesis-api mailsink
 echo "stack up: RPC :8000  relayer :8787  thesis API :8790   (logs: docker compose -f localnet/docker-compose.yml logs -f)"
-echo "console:  cd sandbox && npm install && npm run dev  ->  http://localhost:5173"
+echo "app:      cd app && npm install && npm run dev:local  ->  http://localhost:5180"

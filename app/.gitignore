@@ -3,3 +3,4 @@ dist/
 public/config.json
 .vercel/
 .env*
+config.local.json

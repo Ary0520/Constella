@@ -42,7 +42,7 @@ def post(url: str, body: dict) -> dict:
 def main() -> None:
     vault, amount = sys.argv[1], float(sys.argv[2])
     wait = int(sys.argv[sys.argv.index("--wait") + 1]) if "--wait" in sys.argv else 900
-    cfg = json.loads((ROOT / "sandbox/config.testnet.json").read_text())
+    cfg = json.loads((ROOT / "app/config.testnet.json").read_text())
     usdc = cfg["assets"]["USDC"]
     net = ld.Net(cfg["network"]["rpc_url"], cfg["network"]["friendbot"], TESTNET, allowed=(TESTNET,))
     keeper_secret = json.loads((Path.home() / ".config/constella/testnet/keys.json").read_text())["keeper"]
