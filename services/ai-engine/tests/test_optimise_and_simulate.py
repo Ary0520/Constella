@@ -288,5 +288,7 @@ def test_t13_exit_hours_derivation():
     candidates = retrieve_candidates(policy, registry)
     opt_result = optimize_portfolio(policy, candidates)
     sim_report = simulate_portfolio(opt_result.weights, candidates, policy)
-    assert sim_report.worst_case_exit_hours == 24
+    assert sim_report.normal_exit_hours == 24
+    # Step 7 (spec): the worst plausible full exit is the 30-day freeze of the largest issuer.
+    assert sim_report.worst_case_exit_hours == 720 and "30-day freeze" in sim_report.worst_case_scenario
 
