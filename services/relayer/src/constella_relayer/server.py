@@ -25,7 +25,7 @@ Configuration (environment only - the secret is never logged):
   create storage), ACCOUNTS_PER_DAY (200), ACCOUNT_MAX_FEE_STROOPS (30_000_000: an account
   deployment pays its storage rent), RELAYER_TRUST_PROXY=1 (use X-Forwarded-For's first
   address as the client; only behind your own proxy), RELAYER_CORS_ORIGIN
-  (unset = no CORS headers; set to one browser origin, e.g. the sandbox),
+  (unset = no CORS headers; a comma-separated list of browser origins, e.g. the console and the app),
   FAUCET_SECRET + FAUCET_ASSET (enables POST /faucet {"address"} on TEST
   networks only; FAUCET_AMOUNT 1_000_000_000 = 100 units, per address 1/day,
   per IP 3/day, 200/day total).
@@ -109,6 +109,9 @@ def _make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLim
                  pairing: Pairing | None = None, recovery: "RecoveryMailbox | None" = None,
                  recovery_registry: str | None = None):
     pairing = pairing or Pairing()
+    # Comma-separated allow-list of browser origins (the console, the app).
+    cors_allowed = frozenset(o.strip().rstrip("/") for o in (cors_origin or "").split(",") if o.strip())
+
     class Handler(BaseHTTPRequestHandler):
         server_version = "constella-relayer"
 
@@ -119,9 +122,12 @@ def _make_handler(relayer: Relayer, factory: str | None = None, limiter: RateLim
             data = json.dumps(body).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
-            if cors_origin:  # opt-in, one origin (e.g. the local sandbox console)
-                self.send_header("Access-Control-Allow-Origin", cors_origin)
-                self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            if cors_allowed:  # opt-in: answer only a listed caller origin
+                self.send_header("Vary", "Origin")
+                origin = (self.headers.get("Origin") or "").rstrip("/")
+                if origin in cors_allowed:
+                    self.send_header("Access-Control-Allow-Origin", origin)
+                    self.send_header("Access-Control-Allow-Headers", "Content-Type")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
