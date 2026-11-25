@@ -18,7 +18,7 @@ WASM (no upgrade path by design) - on mainnet every account will be created with
 Also noted (not bugs, product gaps):
 - Euro-currency vaults need a EUR-based price feed on chain (the NAV oracle is USDC-based; the factory refuses
   other vault currencies). Until then a mostly-euro thesis stays in a USDC vault with the reason shown.
-- Testnet Soroswap USDC/EURC depth is demo-scale (~177 EURC after repricing on 25 Nov 2026): the keeper refuses
+- Testnet Soroswap USDC/EURC depth is demo-scale (~240 EURC after the owner's faucet EURC was added on 25 Nov 2026): the keeper refuses
   larger EURC legs (correctly). More testnet EURC is needed for bigger baskets.
 - (Resolved 23 Nov 2026) The AI model is now **on** for the hosted testnet services: `LLM_ENABLED=1`,
   `LLM_RUN_BUDGET_USD=1.00` per process run (falls back to the rules parser when spent). Verified live:

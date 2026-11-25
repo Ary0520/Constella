@@ -66,6 +66,14 @@ If ANY check fails: **rebalance rejected in its entirety**.
 - **Post-trade check (W1b):** the proposal's `weights_after` is only a claim. After the swaps, the vault values every sleeve as **actually held** (measured balance, capped by the booked balance, at its own asset's median price; cash at face value) and the policy's `validate_holdings` must accept the result: every signed band, single-asset cap, issuer caps and the cash liquidity floor, compared exactly. Otherwise the whole rebalance reverts with `AllocationOutOfPolicy`, swaps included. A sleeve without a valid price stops it with `OracleUnavailable`.
 - **Targets (W1b):** once a policy is bound, `set_sleeves` accepts only sleeves declared in it with exactly the signed target weight (`SleeveTargetMismatch`). Targets are read **live** from the policy (`get_sleeves`, empty-vault risk sheet), so an activated amendment applies without re-running `set_sleeves`. If an amendment drops a sleeve the vault still holds, the next rebalance must sell it to zero (the post-trade check rejects undeclared holdings).
 - **Blend adapter (decision D-H, `000f40a`):** route `Blend`. A `Lending` sleeve whose address the oracle knows as a Blend position (official-factory pools only) is held as **plain-supply bTokens** (never collateral: the vault never borrows, so it cannot be liquidated). Supply authorizes exactly one `transfer(vault → pool, amount_in)`; withdraw converts bTokens to underlying at the live `b_rate`, rounded down so Blend burns ≤ `amount_in`. Spent and received are measured on the vault's token balance and its bToken position; the other leg must be the position's own underlying; Soroswap never routes a Blend position. Liquidity risk is real: Blend refuses a withdraw that would take utilization to 100 % (`InvalidUtilRate` 1207) and the whole rebalance reverts — cash for redemptions must come from the cash sleeve, as the liquidity floor requires.
+- **Flow netting (step 6, 25 Nov 2026, keeper `planner.py`):** with one vault currency, deposits and withdrawals
+  land in cash and net out there first - no trade while every sleeve is in band. When a rebalance is triggered it
+  trades only the residual: sleeves more than half their band from target go back to target (cash absorbs it); excess
+  cash (deposits) buys the most underweight sleeves and never sells; a cash shortfall (withdrawals) sells the most
+  overweight and never buys; sleeves within half their band are not traded (the margin keeps them inside their signed
+  band after slippage, so the vault's post-trade check holds). Redemption claims are paid from the claim's asset, then
+  the most overweight sleeves. Proven live: `testnet/e2e_netting.py` (deposit -> the keeper bought only the breached
+  sleeve; the in-band Blend sleeve was untouched).
 - **Not yet:** Aquarius, SDEX and issuer routes (refused with `RouteUnavailable`); DeFindex.
 
 ## Execution Order Within a Rebalance
