@@ -114,3 +114,21 @@ fn after_recovery_the_new_key_finds_the_account() {
     // The old key no longer owns it: it cannot be recorded.
     assert_eq!(f.reg.try_record_owner(&f.account, &key(&f.env, OWNER)), Err(Ok(RecoveryError::NotOwnerKey.into())));
 }
+
+#[test]
+fn finish_executes_a_due_recovery_and_records_the_new_key_in_one_call() {
+    let f = setup();
+    f.env.mock_all_auths();
+    f.reg.set_guardians(&f.account, &guardians(&f), &1);
+    let new_owner = Signer::External(f.verifier.clone(), key(&f.env, NEW));
+    let _: Val = f.env.invoke_contract(&f.account, &Symbol::new(&f.env, "propose_recovery"), vec![&f.env, new_owner.into_val(&f.env)]);
+    // Not before the 48-hour delay (the account refuses), and nothing is recorded.
+    assert!(f.reg.try_finish(&f.account).is_err());
+    assert_eq!(f.reg.owner_account(&key(&f.env, NEW)), None);
+    f.env.ledger().set_timestamp(T0 + DELAY);
+    f.env.set_auths(&[]); // permissionless: no signature at all
+    assert_eq!(f.reg.finish(&f.account), key(&f.env, NEW));
+    assert_eq!(f.reg.owner_account(&key(&f.env, NEW)), Some(f.account.clone()));
+    // Nothing pending any more.
+    assert_eq!(f.reg.try_finish(&f.account), Err(Ok(RecoveryError::NoPendingRecovery.into())));
+}
