@@ -21,6 +21,10 @@ describe("stored passkey account", () => {
   it("a corrupt entry reads as signed out, never throws", () => {
     const m = memoryStore(); m.setItem("constella-app-account", "{oops");
     expect(new PasskeyStore(m).load()).toBeNull();
+    for (const bad of ["null", "{}", '{"credentialId":"x"}', '{"credentialId":1,"publicKey":[1]}']) {
+      m.setItem("constella-app-account", bad);
+      expect(new PasskeyStore(m).load(), bad).toBeNull();
+    }
   });
 });
 
@@ -31,7 +35,7 @@ describe("who acts", () => {
     expect(pass.address).toBe(A);
     await pass.call("CVAULT", "deposit", []);
     expect(chain.sponsored).toHaveBeenCalledWith(expect.objectContaining({ address: A }), "CVAULT", "deposit", []);
-    const invoke = vi.fn(async () => "w");
+    const invoke = vi.fn(async () => ({ hash: "w", max_fee_xlm: 0 }));
     const w = actorFor({ kind: "wallet", signer: { address: "GABC", label: "x", sign: async (t: string) => t } }, chain, invoke);
     await w.call("CVAULT", "redeem", []);
     expect(invoke).toHaveBeenCalledWith(chain, expect.objectContaining({ address: "GABC" }), "CVAULT", "redeem", []);
