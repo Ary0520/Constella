@@ -22,7 +22,7 @@ def base():
 
 def call(base, path, body=None):
     req = urllib.request.Request(base + path, data=json.dumps(body).encode() if body is not None else None,
-                                 headers={"Content-Type": "application/json"}, method="POST" if body is not None else "GET")
+                                 headers={"Content-Type": "application/json", "Origin": "http://localhost:5173"}, method="POST" if body is not None else "GET")
     try:
         with urllib.request.urlopen(req) as r:
             return r.status, json.loads(r.read()), dict(r.headers)
@@ -105,3 +105,20 @@ def test_a_mostly_euro_thesis_stays_in_a_usdc_vault_and_says_why(base):
     assert status == 422 and out["error"] == "INFEASIBLE"
     assert any("euro" in r.lower() and "price feed" in r.lower() for r in out["reasons"])
     assert out["nearest"]["numeraire"] == "USDC"
+
+
+def test_cors_answers_only_a_listed_origin():
+    """API_CORS_ORIGIN is a comma-separated allow-list (console + product app);
+    the caller's origin is echoed only when listed (Vary: Origin)."""
+    app, console = "https://constella-app.vercel.app", "https://constella-sandbox.vercel.app"
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(Engine(fixture_registry), f"{console}, {app}"))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_address[1]}/health"
+    try:
+        for origin, expected in [(app, app), (console, console), ("https://evil.example", None), (None, None)]:
+            req = urllib.request.Request(url, headers={"Origin": origin} if origin else {})
+            with urllib.request.urlopen(req) as r:
+                assert r.headers.get("Access-Control-Allow-Origin") == expected, origin
+                assert "Origin" in (r.headers.get("Vary") or "")
+    finally:
+        srv.shutdown()
