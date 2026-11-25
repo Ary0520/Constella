@@ -9,7 +9,8 @@
     "dev": "npm run -s config && vite",
     "build": "npm run -s config && tsc --noEmit && vite build",
     "preview": "vite preview --port 4173 --strictPort",
-    "test": "vitest run"
+    "test": "vitest run",
+    "e2e:signin": "node e2e/signin.cjs"
   },
   "dependencies": {
     "@creit.tech/stellar-wallets-kit": "2.8.0",
