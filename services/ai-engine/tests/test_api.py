@@ -71,3 +71,37 @@ def test_registry_and_health(base):
     assert s == 200 and {a["asset_id"] for a in out["assets"]} >= {"USDC", "EURC"}
     assert "ONDO_USDY" in out["ineligible"]
     assert call(base, "/health")[1] == {"ok": True, "llm": False}
+
+
+# --- Step 4: thesis-driven baskets through the API -------------------------------------
+OWNER = "GCFIRY65OQE7DFP5KLNS2PF2LVZMUZYJX4OZIEQ36N2IQANUB5XVYOJR"
+
+
+def test_the_response_names_the_vault_currency_contract(base):
+    status, out, _ = call(base, "/thesis", {"text": "Keep a safe runway in dollars with at least 10% instant cash.",
+                                            "jurisdiction": "DE", "owner": OWNER})
+    assert status == 200
+    from tests.fixtures import USDC_MAINNET
+    assert out["allocation"]["numeraire"] == "USDC" and out["numeraire_contract"] == USDC_MAINNET
+
+
+def test_different_theses_give_different_signed_terms(base):
+    terms = []
+    for text in ["Keep a safe runway in dollars with at least 10% instant cash.",
+                 "Keep a safe runway in dollars, no lending.",
+                 "Keep 18 months of runway safe, hold a third in euro. Up to 40% per issuer and 40% per asset."]:
+        status, out, _ = call(base, "/thesis", {"text": text, "jurisdiction": "DE", "owner": OWNER})
+        assert status == 200, out
+        terms.append(tuple(sorted((s["asset_id"], s["target_weight_bps"]) for s in out["bind_policy"]["sleeves"])))
+    assert len(set(terms)) == 3
+    eur = dict(terms[2])
+    assert 2833 <= eur["EURC"] <= 3833
+
+
+def test_a_mostly_euro_thesis_stays_in_a_usdc_vault_and_says_why(base):
+    # The chain's price feed is USDC-based (vault-factory NumeraireNotOracleBase),
+    # so the API never offers a euro vault yet: it explains and offers the nearest mix.
+    status, out, _ = call(base, "/thesis", {"text": "Keep 70% in euros and the rest in dollars.", "jurisdiction": "DE", "owner": OWNER})
+    assert status == 422 and out["error"] == "INFEASIBLE"
+    assert any("euro" in r.lower() and "price feed" in r.lower() for r in out["reasons"])
+    assert out["nearest"]["numeraire"] == "USDC"
