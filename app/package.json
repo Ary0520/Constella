@@ -1,0 +1,30 @@
+{
+  "name": "constella-app",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Constella product app (step 10, decision D-R): static client-only React app on Stellar testnet.",
+  "type": "module",
+  "scripts": {
+    "config": "cp config.testnet.json public/config.json",
+    "dev": "npm run -s config && vite",
+    "build": "npm run -s config && tsc --noEmit && vite build",
+    "preview": "vite preview --port 4173 --strictPort",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@creit.tech/stellar-wallets-kit": "2.8.0",
+    "@stellar/stellar-sdk": "17.4.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "@types/react": "19.3.0",
+    "@types/react-dom": "19.3.0",
+    "@vitejs/plugin-react": "5.2.0",
+    "playwright": "1.55.0",
+    "typescript": "5.8.3",
+    "vite": "6.4.1",
+    "vitest": "3.2.7"
+  }
+}
