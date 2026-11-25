@@ -48,7 +48,8 @@ def main() -> None:
     W = lambda n: ROOT / f"contracts/target/wasm32v1-none/release/constella_{n}.wasm"
     h = state.setdefault("wasm_hashes", {})
     for n in ["registry", "nav_oracle", "policy", "vault_strategy", "webauthn_verifier", "smart_account", "fee_sponsor",
-              "account_factory", "vault_factory", "collateral_oracle", "device_registry"]:
+              "account_factory", "vault_factory", "collateral_oracle", "device_registry", "threshold_policy",
+              "recovery_registry"]:
         if n not in h:
             h[n] = net.upload(admin, W(n)).hex(); save(); log("uploaded", n)
     H = lambda n: bytes.fromhex(h[n])
@@ -126,9 +127,23 @@ def main() -> None:
                                                                          U32(1000), A(keys["keeper"].public_key), A(SOROSWAP_ROUTER)]))
     # Step 3: the sponsor pays for the one-signature vault setup on the factory,
     # and trusts every vault the factory proves (users' own vaults).
+    # Step 8: account recovery - the shared threshold policy (guardian M-of-N) and
+    # the recovery registry (one fixed address the relayer can sponsor).
+    threshold = once("threshold_policy", lambda: net.deploy(admin, H("threshold_policy")))
+    recovery = once("recovery_registry", lambda: net.deploy(admin, H("recovery_registry"), [A(account_factory), A(verifier), A(threshold)]))
+    # Sponsor trust (idempotent): every vault-factory version proves its vaults,
+    # the account factory proves accounts; the fixed-address targets are whitelisted.
     if not state.get("sponsor_trusts_factory"):
-        net.invoke(admin, sponsor, "whitelist_contract", [A(c["vault_factory"])])
-        net.invoke(admin, sponsor, "trust_factory", [A(c["vault_factory"])])
+        is_wl = lambda t: net.view(sponsor, "is_whitelisted", [A(t)], admin.public_key) is True
+        for t in (c["vault_factory"], recovery, registry_dev):
+            if not is_wl(t):
+                net.invoke(admin, sponsor, "whitelist_contract", [A(t)])
+        trusted = [getattr(x, "address", str(x)) for x in net.view(sponsor, "get_trusted_factories", [], admin.public_key)]
+        for f in [v for k, v in sorted(c.items()) if k == "vault_factory" or k.startswith("vault_factory_v")]:
+            if f not in trusted:
+                net.invoke(admin, sponsor, "trust_factory", [A(f)])
+        if account_factory not in [getattr(x, "address", str(x)) for x in net.view(sponsor, "get_trusted_account_factories", [], admin.public_key)]:
+            net.invoke(admin, sponsor, "trust_account_factory", [A(account_factory)])
         state["sponsor_trusts_factory"] = True; save()
     collateral = once("collateral_oracle", lambda: net.deploy(admin, H("collateral_oracle"), [A(admin.public_key), A(oracle)]))
     if not state.get("collateral_listed"):

@@ -22,12 +22,15 @@ env = {
     # relayer (+ testnet faucet)
     "RELAYER_SECRETS": f'{k["relayer1"]},{k["relayer2"]}', "SPONSOR_CONTRACT_ID": ct["fee_sponsor"],
     "SPONSOR_ALLOWED": ";".join(f"{v}:deposit,redeem,withdraw,redeem_frozen" for v in vaults) + f';{ct["device_registry"]}:add_device'
-                       + f';{ct["vault_factory"]}:create_vault_with_policy',
+                       + f';{ct["vault_factory"]}:create_vault_with_policy' + f';{ct["recovery_registry"]}:set_guardians',
     # Step 3: users' own vaults (proven on chain by the trusted factory).
     "SPONSOR_VAULT_FUNCTIONS": "deposit,redeem,withdraw,redeem_frozen",
+    # Step 8: recovery calls on users' own accounts (proven by the account factory).
+    "SPONSOR_ACCOUNT_FUNCTIONS": "propose_recovery,cancel_recovery",
+    "RECOVERY_REGISTRY_ID": ct["recovery_registry"], "RECOVERY_STATE_FILE": "/data/recovery.json",
     # add_device pays its storage (~2.37 XLM); the vault setup deploys a contract
     # (measured 0.11-5.96 XLM on testnet 24 Nov 2026, the higher with restores).
-    "RELAYER_FN_MAX_FEE": "add_device:30000000,create_vault_with_policy:70000000",
+    "RELAYER_FN_MAX_FEE": "add_device:30000000,create_vault_with_policy:70000000,set_guardians:30000000,finish:10000000",
     "ACCOUNT_FACTORY_ID": ct["account_factory"],
     "RELAYER_HOST": "127.0.0.1", "RELAYER_PORT": "8787", "RELAYER_TRUST_PROXY": "1", "RELAYER_CORS_ORIGIN": origin,
     "ACCOUNTS_PER_IP_PER_DAY": "3", "ACCOUNTS_PER_DAY": "200",
