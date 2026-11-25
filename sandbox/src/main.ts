@@ -367,6 +367,25 @@ async function finishSetup(a: Passkey) {
   return out;
 }
 
+/** Step 7 (spec THESIS-ENGINE Step 4): the simulation, shown before any money
+ * moves - labelled "Simulation", worst case first, Rule 10 disclaimer. */
+function simulationHtml(sim: any): string {
+  if (!sim) return "";
+  const pct = (x: number) => `${(x * 100).toFixed(1)} %`;
+  const hours = (h: number) => (h >= 48 ? `${Math.round(h / 24)} days` : h >= 24 ? "1 day" : "under 1 hour");
+  const l = sim.redemption_ladder, m = sim.redeemable_during_freeze;
+  return `<h4>Simulation (before any money moves)</h4>
+    <p><b>Worst case: a full exit could take ${hours(sim.worst_case_exit_hours)}</b> - ${sim.worst_case_scenario}.
+      Normal full exit: ${hours(sim.normal_exit_hours)}.</p>
+    <p><b>Issuer freeze:</b> ${sim.issuer_freeze_stress.description}</p>
+    <p><b>Depeg:</b> ${sim.depeg_stress.description}</p>
+    <p><b>Redeemable:</b> instant ${pct(l.instant_pct)} · within 24 h ${pct(l.within_24h_pct)} · within 1 week ${pct(l.within_1w_pct)}
+      · longer ${pct(l.illiquid_pct)}${m ? ` (during the freeze: instant ${pct(m.instant_pct)}, 24 h ${pct(m.within_24h_pct)})` : ""}</p>
+    <p><b>Estimated yield:</b> ${sim.weighted_yield_pct.toFixed(2)} %/yr (an unknown rate counts as 0)</p>
+    <p>${sim.history_note}</p>
+    <p><i>${sim.disclaimer}</i></p>`;
+}
+
 async function runThesis() {
   // OPEN-ISSUES #3: the policy hash commits to the account that will sign it
   // (passkey smart account, else the connected wallet); without one the API
@@ -387,6 +406,10 @@ async function runThesis() {
       ${out.ai_note ? `<br><i>${out.ai_note}</i>` : ""}</p>
     <table><tr><th>asset</th><th>weight</th><th>why</th></tr>${rows}</table>
     ${out.ai_summary ? `<p><b>AI summary:</b> ${out.ai_summary.summary}</p>` : ""}
+    ${simulationHtml(out.simulation)}
+    <h4>Your thesis vs this basket</h4>
+    <table><tr><th>you asked</th><th>proposed</th><th>why</th></tr>${(out.explanation.thesis_diff as any[])
+      .map((d) => `<tr><td>${d.requested}</td><td>${d.proposed}</td><td>${d.explanation}</td></tr>`).join("")}</table>
     <p><b>Warnings:</b> ${(out.explanation.issuer_concentration_warnings as string[]).join("<br>") || "none"}</p>
     <p><b>Needs your confirmation:</b> ${(out.explanation.ambiguity_clarifications as string[]).join("<br>") || "nothing"}</p>
     <p>${out.signable ? `policy hash for <span class="mono">${out.policy.admin.admin_address}</span>: <span class="mono">${out.policy_hash}</span>`
