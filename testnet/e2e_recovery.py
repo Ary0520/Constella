@@ -190,4 +190,13 @@ def finish() -> None:
 
 
 if __name__ == "__main__":
-    finish() if "--finish" in sys.argv else run()
+    if "--create-account" in sys.argv:  # helper for the browser e2e: prints the new account
+        key = bytes.fromhex(sys.argv[sys.argv.index("--create-account") + 1])
+        c = Ctx()
+        admin = ld.Keypair.from_secret(json.loads((Path.home() / ".config/constella/testnet/keys.json").read_text())["admin"])
+        a = c.net.invoke(admin, c.ct["account_factory"], "create_account", [scval.to_bytes(key)])
+        print(getattr(a, "address", str(a)))
+    elif "--finish" in sys.argv:
+        finish()
+    else:
+        run()
