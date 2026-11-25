@@ -29,7 +29,7 @@ from typing import Callable, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 from src.explainer import generate_explanation
-from src.optimizer import InfeasibleAllocation, optimize_portfolio
+from src.optimizer import InfeasibleAllocation, choose_numeraire, optimize_portfolio
 from src.parser import parse_thesis
 from src.retriever import AssetRegistry, retrieve_candidates
 from src.signer import assemble_canonical_policy, compute_policy_hash, onchain_terms, validate_owner
@@ -44,8 +44,12 @@ _PREVIEW_OWNER = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4"
 
 class Engine:
     def __init__(self, load_registry: Callable[[], AssetRegistry], llm_factory: Optional[Callable] = None,
-                 live_yields: Optional[Callable] = None, cache_seconds: float = 60.0):
+                 live_yields: Optional[Callable] = None, cache_seconds: float = 60.0,
+                 vault_numeraires: tuple = ("USDC",)):
         self.load_registry, self.llm_factory, self.live_yields = load_registry, llm_factory, live_yields
+        # Step 4: vault currencies the chain can price today - the NAV oracle's
+        # base (vault-factory refuses any other, NumeraireNotOracleBase).
+        self.vault_numeraires = tuple(vault_numeraires)
         self.cache_seconds = cache_seconds
         self._reg, self._at = None, 0.0
 
@@ -84,10 +88,15 @@ class Engine:
                 ai_note = "AI reading is disabled on this server; used the rule-based parser."
         reg = self.registry()
         cands = retrieve_candidates(draft, reg)
+        ids = [c.asset_id for c in cands]
+        wanted = choose_numeraire(draft, cands)
+        numeraire = wanted if wanted in self.vault_numeraires else next((n for n in self.vault_numeraires if n in ids), None)
+        note = ([f"a {wanted} vault needs a price feed based on {wanted} on chain (coming); your vault currency is "
+                 f"{numeraire} - euro holdings are kept within your caps"] if wanted and wanted != numeraire else [])
         try:
-            opt = optimize_portfolio(draft, cands)
+            opt = optimize_portfolio(draft, cands, numeraire=numeraire)
         except InfeasibleAllocation as e:
-            return 422, {"error": "INFEASIBLE", "reasons": e.reasons, "relaxed": e.relaxed,
+            return 422, {"error": "INFEASIBLE", "reasons": note + e.reasons, "relaxed": e.relaxed,
                          "nearest": e.nearest.model_dump() if e.nearest else None, "draft": draft.model_dump()}
         except ValueError as e:
             return 422, {"error": "INFEASIBLE", "reasons": [str(e)], "draft": draft.model_dump()}
@@ -107,6 +116,7 @@ class Engine:
             "simulation": sim.model_dump(), "explanation": exp.model_dump(), "ai_summary": summary,
             "policy": json.loads(canonical.model_dump_json()) if owner else None, "policy_hash": hex_hash,
             "signable": bool(owner), "bind_policy": onchain_terms(canonical),
+            "numeraire_contract": next(c.contract_address for c in cands if c.asset_id == opt.numeraire),
             "ineligible": reg.eligibility(jur, cls),
         }
 
