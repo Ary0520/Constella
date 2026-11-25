@@ -11,7 +11,7 @@ The account here is a plain G account paying its own fee (the wallet path);
 the passkey + relayer path is exercised from the console. Prints the
 transaction fee of the setup call (sizes RELAYER_FN_MAX_FEE).
 
-    python testnet/e2e_own_vault.py [--wait SECONDS] [--thesis "..."]
+    python testnet/e2e_own_vault.py [--wait SECONDS] [--thesis "..."] [--deposit USDC]
 """
 from __future__ import annotations
 
@@ -42,6 +42,7 @@ def post(url: str, body: dict) -> dict:
 
 def main() -> None:
     wait = int(sys.argv[sys.argv.index("--wait") + 1]) if "--wait" in sys.argv else 0
+    deposit = float(sys.argv[sys.argv.index("--deposit") + 1]) if "--deposit" in sys.argv else 100.0
     thesis = (sys.argv[sys.argv.index("--thesis") + 1] if "--thesis" in sys.argv
               else "Keep a safe runway in dollars with at least 10% instant cash; lend a little.")
     cfg = json.loads((ROOT / "sandbox/config.testnet.json").read_text())
@@ -92,8 +93,8 @@ def main() -> None:
     keeper = addr(net.view(vault, "get_keeper", [], user.public_key))
     say("on chain: owner + hash match; sleeves = signed targets; keeper", keeper)
 
-    net.invoke(user, vault, "deposit", [ld.I128(100 * ONE), ld.A(user.public_key), ld.A(user.public_key), ld.A(user.public_key)])
-    say("deposited 100 USDC; shares", net.view(vault, "balance", [ld.A(user.public_key)], user.public_key))
+    net.invoke(user, vault, "deposit", [ld.I128(int(deposit * ONE)), ld.A(user.public_key), ld.A(user.public_key), ld.A(user.public_key)])
+    say(f"deposited {deposit} USDC; shares", net.view(vault, "balance", [ld.A(user.public_key)], user.public_key))
     t0 = time.time()
     while wait and time.time() - t0 < wait:
         sl = net.view(vault, "get_sleeves", [], user.public_key)
