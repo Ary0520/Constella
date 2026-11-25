@@ -41,10 +41,11 @@ def func(c) -> str:
 
 
 def entry(c, nonce=7, signers=None, rule=3) -> str:
-    sig = scval.to_void() if signers is None else scval.to_map({
-        scval.to_symbol("context_rule_ids"): scval.to_vec([scval.to_uint32(rule)]),
-        scval.to_symbol("signers"): scval.to_map({signer(k): scval.to_bytes(v) for k, v in signers.items()}),
-    })
+    smap = lambda entries: xdr.SCVal(xdr.SCValType.SCV_MAP, map=xdr.SCMap([xdr.SCMapEntry(k, v) for k, v in entries]))
+    sig = scval.to_void() if signers is None else smap([
+        (scval.to_symbol("context_rule_ids"), scval.to_vec([scval.to_uint32(rule)])),
+        (scval.to_symbol("signers"), smap([(signer(k), scval.to_bytes(v)) for k, v in signers.items()])),
+    ])
     creds = xdr.SorobanAddressCredentials(address=Address(ACCOUNT).to_xdr_sc_address(), nonce=xdr.Int64(nonce),
                                           signature_expiration_ledger=xdr.Uint32(5_000), signature=sig)
     return b64(xdr.SorobanAuthorizationEntry(
