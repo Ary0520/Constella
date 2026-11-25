@@ -1,6 +1,7 @@
 import { linkIntent, useRoute } from "./router";
 import { Invitation } from "./screens/Invitation";
 import { Account } from "./screens/Account";
+import { Assets, Passport } from "./screens/Vision";
 import { SessionProvider, useSession } from "./session";
 import { Page, Shell } from "./ui/Shell";
 import { Welcome } from "./screens/Welcome";
@@ -20,8 +21,8 @@ function Screens() {
       case "home": return <Portfolio />;
       case "new": return <NewBasket />;
       case "vault": return <Vault id={route.params.id} />;
-      case "assets": return <Page title="Assets" sub="The closed universe every basket is built from." />;
-      case "passport": return <Page title="Collateral Passport" sub="Borrow against your basket without selling it." />;
+      case "assets": return <Assets />;
+      case "passport": return <Passport />;
       case "account": return <Account />;
       default: return <Page title="Not found" sub="This page does not exist." />;
     }

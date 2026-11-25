@@ -176,3 +176,5 @@ textarea.c-input { min-height: 120px; resize: vertical; line-height: 1.5 }
 details summary { cursor: pointer }
 .c-invite { max-width: 560px; margin: 120px auto 0; display: flex; flex-direction: column; gap: 14px }
 @media (max-width: 900px) { .c-invite { margin-top: 72px } }
+.c-gated { opacity: .8 }
+.c-gated .c-btn:disabled { opacity: .35 }
