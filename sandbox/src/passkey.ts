@@ -63,6 +63,13 @@ function withCreds(entry: any, old: any, validUntil: number, signature: xdr.ScVa
   return new X.SorobanAuthorizationEntry({ credentials: wrapped, rootInvocation: entry.rootInvocation });
 }
 
+/** Step 8: the same entry with its expiry fixed and no signature yet - what
+ * several guardians each sign (they must all sign exactly this entry). */
+export function fixExpiry(entryXdr: string, validUntil: number): string {
+  const entry: any = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
+  return withCreds(entry, addressCreds(entry), validUntil, xdr.ScVal.scvVoid()).toXDR("base64");
+}
+
 /** (payload, challenge, ruleIds) for an entry - what the passkey must sign. */
 export function signingInput(entryXdr: string, validUntil: number, passphrase: string, ruleId: number) {
   const entry: any = xdr.SorobanAuthorizationEntry.fromXDR(entryXdr, "base64");
