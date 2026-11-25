@@ -98,7 +98,7 @@ export function Vault({ id }: { id: string }) {
               <div className="c-row" style={{ marginTop: 12 }}>
                 <div className="c-field"><label htmlFor="red">Redeem shares</label>
                   <input id="red" className="c-input num" inputMode="decimal" placeholder="10" value={red} onChange={(e) => setRed(e.target.value)} /></div>
-                <button className="c-btn c-btn-line c-btn-sm" disabled={d.pos.shares === 0n} onClick={() => setRed(formatUnits(d.pos.shares, 7).replace(/,/g, ""))}>All</button>
+                <button className="c-btn c-btn-line c-btn-sm" data-act="redeem-all" disabled={d.pos.shares === 0n} onClick={() => setRed(formatUnits(d.pos.shares, 7).replace(/,/g, ""))}>All</button>
                 <button className="c-btn c-btn-line" disabled={!!act.busy} data-act="redeem"
                   onClick={() => run("redeem", async () => {
                     const n = parseUnits(red);
