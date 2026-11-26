@@ -83,7 +83,7 @@ export interface VaultData {
   address: string; name: string; symbol: string; paused: boolean;
   navConservative: bigint | null; navDeposit: bigint | null; totalAssets: bigint; totalSupply: bigint; highWaterMark: bigint;
   sleeves: SleeveView[]; apr: number | null; cash: string;
-  feeBps: number; admin: string; policy: string; policyHash: string | null;
+  feeBps: number; admin: string; policy: string; policyHash: string | null; maxSlippageBps: number | null;
 }
 
 export async function readVault(chain: Chain, address: string): Promise<VaultData> {
@@ -94,6 +94,7 @@ export async function readVault(chain: Chain, address: string): Promise<VaultDat
     v("get_policy_hash").catch(() => null),
   ]);
   const cash = String(config.numeraire);
+  const pcfg = await chain.view(String(config.policy_contract), "get_policy_config", [sv.addr(address)]).catch(() => null);
   const oracle = String(config.oracle_contract);
   const prices: Record<string, bigint> = {};
   await Promise.all((sleeves as any[]).map(async (s) => {
@@ -112,6 +113,7 @@ export async function readVault(chain: Chain, address: string): Promise<VaultDat
     totalAssets: BigInt(total), totalSupply: BigInt(supply), highWaterMark: BigInt(hwm),
     sleeves: sleeveView(rows, prices, cash), apr: realisedApr(history as NavPoint[]), cash,
     feeBps: Number(config.performance_fee_bps), admin: String(config.admin), policy: String(config.policy_contract),
+    maxSlippageBps: pcfg ? Number(pcfg.max_slippage_bps) : null,
     policyHash: hash ? Array.from(hash as Uint8Array, (b: number) => b.toString(16).padStart(2, "0")).join("") : null,
   };
 }
@@ -170,4 +172,14 @@ export async function readActivity(chain: Chain, vault: string, limit = 12, wind
     }
   }
   return out;
+}
+
+/** What a basket shows about rebalancing. The keeper checks every 5 minutes;
+ * a holding still outside its band 10+ minutes after the last activity means
+ * the keeper is refusing to trade (on testnet: a market too thin to trade
+ * within the signed slippage limit), not that something is broken. */
+export function rebalanceStatus(outOfBand: boolean, lastActivityAt: string | null, now = Date.now()): "ok" | "soon" | "waiting" {
+  if (!outOfBand) return "ok";
+  if (lastActivityAt && now - Date.parse(lastActivityAt) < 10 * 60_000) return "soon";
+  return "waiting";
 }

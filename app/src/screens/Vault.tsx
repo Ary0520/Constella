@@ -3,7 +3,7 @@
 import { useState } from "react";
 import { sv } from "../core/chain";
 import { assetName } from "../core/labels";
-import { formatUnits, parseUnits, readActivity, readPosition, readVault } from "../core/vaults";
+import { formatUnits, parseUnits, readActivity, readPosition, readVault, rebalanceStatus } from "../core/vaults";
 import { addUsdcTrustline, friendbotFund, walletStatus } from "../core/wallet";
 import { navigate } from "../router";
 import { useSession } from "../session";
@@ -73,6 +73,16 @@ export function Vault({ id }: { id: string }) {
               <b className="num">{v.apr !== null ? `${v.apr.toFixed(2)}%/yr` : "Not enough history"}</b></div>
           </div>
           {v.paused && <div className="c-note"><Badge kind="warn">Paused</Badge> Its admin paused this basket.</div>}
+          {(() => {
+            const outOfBand = v.totalAssets > 0n && v.sleeves.some((s) => s.weight_bps !== null && Math.abs(s.weight_bps - s.target_weight_bps) > s.band_bps);
+            const st = rebalanceStatus(outOfBand, activity.data?.[0]?.at ?? null);
+            if (st === "ok" || !activity.data) return null;
+            return st === "soon"
+              ? <div className="c-note" data-rebalance="soon">Some holdings are outside their allowed range. The keeper checks every 5 minutes and should rebalance shortly.</div>
+              : <div className="c-note" data-rebalance="waiting"><span><b>The keeper is waiting, on purpose.</b> Some holdings are outside their allowed range, but the market
+                  for at least one asset is too thin right now to trade within this basket's rule of at most {v.maxSlippageBps !== null ? (v.maxSlippageBps / 100).toFixed(2) + "%" : "its"} slippage per trade.
+                  Rather than trade at a bad price, it keeps that part in cash and tries again every 5 minutes. On testnet the euro (EURC) market is tiny, so this is expected for euro baskets above about $1.</span></div>;
+          })()}
 
           <div className="c-grid c-grid-2">
             <section className="c-card">
