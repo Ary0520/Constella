@@ -1,0 +1,406 @@
+<title>Constella, Explained</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600&family=Geist+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one reading column (~68ch) with a sticky chapter rail on wide screens; worked examples sit in tinted "ledger" boxes. */
+:root {
+  --page: #F3F2F7; --paper: #FFFFFF; --ink: #14121C; --ink-2: #3B3848; --muted: #6E6B7E;
+  --line: rgba(20,18,28,.10); --iris: #5B4ED6; --iris-soft: #ECE9FB; --ledger: #F7F5FD;
+  --ok: #23845A; --ok-soft: #E3F4EC; --warn: #9A6414; --warn-soft: #FBF1DE;
+  --sky: linear-gradient(160deg, #ECE9F6 0%, #DCD6F0 55%, #D1C9ED 100%);
+  --font: "Plus Jakarta Sans", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "Geist Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --page: #131119; --paper: #1C1A25; --ink: #EEECF5; --ink-2: #C9C6D6; --muted: #9692A8;
+  --line: rgba(238,236,245,.12); --iris: #A79CFF; --iris-soft: #2A2547; --ledger: #201D2C;
+  --ok: #6FD3A2; --ok-soft: #173A2A; --warn: #E9B864; --warn-soft: #3A2C14;
+  --sky: linear-gradient(160deg, #221E33 0%, #1B1829 60%, #171522 100%); color-scheme: dark } }
+:root[data-theme="dark"] {
+  --page: #131119; --paper: #1C1A25; --ink: #EEECF5; --ink-2: #C9C6D6; --muted: #9692A8;
+  --line: rgba(238,236,245,.12); --iris: #A79CFF; --iris-soft: #2A2547; --ledger: #201D2C;
+  --ok: #6FD3A2; --ok-soft: #173A2A; --warn: #E9B864; --warn-soft: #3A2C14;
+  --sky: linear-gradient(160deg, #221E33 0%, #1B1829 60%, #171522 100%); color-scheme: dark }
+* { box-sizing: border-box }
+body { background: var(--page); color: var(--ink); font-family: var(--font); font-size: 16.5px; line-height: 1.65; letter-spacing: -.005em;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); padding-block: 16px 80px }
+a { color: var(--iris) }
+.hero { background: var(--sky); border-radius: 28px; padding: clamp(28px, 6vw, 72px); max-width: 1180px; margin: 0 auto }
+.hero h1 { font-weight: 500; font-size: clamp(38px, 6vw, 72px); line-height: 1.02; letter-spacing: -.045em; margin: 0 0 18px; text-wrap: balance }
+.hero p { font-size: clamp(17px, 2vw, 20px); max-width: 640px; color: var(--ink-2); margin: 0 }
+.eyebrow { font-family: var(--mono); font-size: 12px; letter-spacing: .08em; text-transform: uppercase; color: var(--muted) }
+.wrap { max-width: 1180px; margin: 32px auto 0; display: grid; grid-template-columns: 230px minmax(0, 1fr); gap: 48px }
+nav.toc { position: sticky; top: calc(env(safe-area-inset-top, 0px) + 20px); align-self: start; display: flex; flex-direction: column; gap: 2px; font-size: 14px }
+nav.toc a { color: var(--ink-2); text-decoration: none; padding: 6px 10px; border-radius: 10px }
+nav.toc a:hover { background: var(--iris-soft); color: var(--ink) }
+main { min-width: 0; max-width: 720px }
+section { padding-top: 12px; margin-bottom: 56px; scroll-margin-top: 20px }
+h2 { font-weight: 500; font-size: clamp(26px, 3.2vw, 36px); letter-spacing: -.03em; line-height: 1.12; margin: 6px 0 16px; text-wrap: balance }
+h3 { font-size: 18px; font-weight: 600; letter-spacing: -.015em; margin: 28px 0 8px }
+p { margin: 0 0 14px; color: var(--ink-2) }
+strong { color: var(--ink); font-weight: 600 }
+ul, ol { margin: 0 0 14px; padding-left: 22px; color: var(--ink-2) }
+li { margin-bottom: 6px }
+.ledger { background: var(--ledger); border: 1px solid var(--line); border-radius: 18px; padding: 18px 20px; margin: 18px 0 }
+.ledger .eyebrow { display: block; margin-bottom: 8px }
+.ledger table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 15px }
+.ledger td { padding: 7px 0; border-top: 1px solid var(--line); vertical-align: top }
+.ledger tr:first-child td { border-top: 0 }
+.ledger td.r { text-align: right; white-space: nowrap; padding-left: 16px; color: var(--ink) }
+.say { border-left: 3px solid var(--iris); padding: 4px 0 4px 16px; margin: 16px 0; font-size: 18px; color: var(--ink) }
+.flow { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 18px 0 }
+.step { background: var(--paper); border: 1px solid var(--line); border-radius: 16px; padding: 14px }
+.step b { display: block; font-size: 15px; color: var(--ink) }
+.step span { font-size: 13.5px; color: var(--muted); line-height: 1.45; display: block; margin-top: 4px }
+.step i { font-style: normal; font-family: var(--mono); font-size: 11.5px; color: var(--iris) }
+.tag { display: inline-block; font-size: 12px; font-weight: 500; padding: 2px 9px; border-radius: 999px; margin-left: 6px; vertical-align: 2px }
+.live { background: var(--ok-soft); color: var(--ok) } .soon { background: var(--warn-soft); color: var(--warn) } .later { background: var(--iris-soft); color: var(--iris) }
+.status { width: 100%; border-collapse: collapse; font-size: 15px }
+.status td { padding: 10px 8px 10px 0; border-top: 1px solid var(--line); vertical-align: top; color: var(--ink-2) }
+.status td:first-child { color: var(--ink); width: 42% }
+.tablewrap { overflow-x: auto }
+.gloss-tools { position: relative; margin: 8px 0 16px }
+#q { width: 100%; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--line); background: var(--paper); color: var(--ink); font: inherit }
+#q:focus { outline: 2px solid var(--iris); outline-offset: 0 }
+dl.gloss { margin: 0; display: grid; gap: 2px }
+dl.gloss div { padding: 12px 0; border-top: 1px solid var(--line) }
+dl.gloss dt { font-weight: 600; color: var(--ink) }
+dl.gloss dd { margin: 2px 0 0; color: var(--ink-2) }
+.qa h3 { margin-top: 22px }
+.note { font-size: 14px; color: var(--muted) }
+:focus-visible { outline: 2px solid var(--iris); outline-offset: 2px }
+@media (max-width: 900px) { .wrap { grid-template-columns: 1fr; gap: 8px } nav.toc { position: static; flex-direction: row; flex-wrap: wrap; gap: 6px }
+  nav.toc a { background: var(--paper); border: 1px solid var(--line); font-size: 13px } }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto } }
+html { scroll-behavior: smooth }
+</style>
+
+<header class="hero">
+  <div class="eyebrow">For Aryan · from zero to every term · 26 Nov 2026</div>
+  <h1>Constella, explained</h1>
+  <p>What we built, in plain words: the problem, the product, every piece of jargon, the numbers, what's live on testnet, and how to say it to anyone in ten seconds.</p>
+</header>
+
+<div class="wrap">
+<nav class="toc" aria-label="Chapters">
+  <a href="#oneline">The one line</a>
+  <a href="#problem">The problem</a>
+  <a href="#basics">Finance from zero</a>
+  <a href="#product">The product</a>
+  <a href="#ai">What the AI does</a>
+  <a href="#rules">Rules and safety</a>
+  <a href="#money">How money moves</a>
+  <a href="#passport">Collateral Passport</a>
+  <a href="#accounts">Accounts</a>
+  <a href="#business">How we earn</a>
+  <a href="#status">What's live</a>
+  <a href="#pitch">How to say it</a>
+  <a href="#qa">Hard questions</a>
+  <a href="#glossary">Glossary</a>
+</nav>
+<main>
+
+<section id="oneline">
+  <div class="eyebrow">Start here</div>
+  <h2>The one line</h2>
+  <div class="say">You tell Constella what your money is for, in plain words. It builds a basket of real-world assets on Stellar to match, locks your rules into code, and gives you one token you can hold, cash out any time, or borrow against.</div>
+  <p>The founding document says it more tightly: Constella turns a plain-English thesis into a rule-bound basket of Stellar's tokenized real-world assets, packaged as one non-custodial token that ships collateral-ready.</p>
+  <p>Notice what's missing: "AI portfolio manager." The AI is one part. It drafts. It never holds money, never trades, and never decides anything on its own. The product is the <strong>basket token with your rules locked in</strong>, and the fact that lenders can accept it as collateral.</p>
+</section>
+
+<section id="problem">
+  <div class="eyebrow">Why it exists</div>
+  <h2>The problem: billions of dollars sitting still</h2>
+  <p>Big financial firms have started putting traditional investments on blockchains. Franklin Templeton's government money fund (BENJI) alone holds over $1.1B on chain, and it lives on Stellar. In total Stellar holds <strong>more than $4.1B</strong> of these "tokenized real-world assets."</p>
+  <p>But only about <strong>$198M</strong> of value is actually being <em>used</em> in Stellar's lending and trading apps. Over 95% just sits in wallets. The Stellar Development Foundation's framing for this is <strong>useful → usable → used</strong>: assets exist (useful), but they're hard to combine and put to work (not yet usable), so almost nobody does (not used).</p>
+  <h3>Why they sit still</h3>
+  <ul>
+    <li><strong>Each one is a separate island.</strong> A company that wants "safe dollars, some euros, some yield" has to research, buy and watch five different tokens from five issuers.</li>
+    <li><strong>Rules live in someone's head.</strong> "Never more than 30% with one issuer" is a policy in a spreadsheet, not something the system enforces.</li>
+    <li><strong>Lenders won't accept them.</strong> A lender can't easily price a mixed bag of tokens, doesn't know how fast it could be sold, and may not be allowed to hold some of them. So you can't borrow against your holdings.</li>
+  </ul>
+  <p>Constella fixes all three: one basket, rules enforced by code, and a token designed so lenders can accept it.</p>
+</section>
+
+<section id="basics">
+  <div class="eyebrow">The minimum finance you need</div>
+  <h2>Finance from zero</h2>
+  <h3>Real-world asset (RWA) and tokenization</h3>
+  <p>A "real-world asset" is something that exists off the blockchain: a US government bond, a money market fund, a euro. <strong>Tokenizing</strong> it means an issuer holds the real thing and issues a digital token that represents it, one token per unit. The token can move instantly, 24/7, on a blockchain.</p>
+  <h3>The assets in our world</h3>
+  <ul>
+    <li><strong>Stablecoins (USDC, EURC):</strong> tokens worth exactly 1 dollar or 1 euro, issued by Circle and backed by cash in banks. Think "digital cash." Instant, but earn nothing on their own.</li>
+    <li><strong>T-bills:</strong> short-term loans to the US government (or a European one). The safest common investment there is. They pay a small interest rate.</li>
+    <li><strong>Money market / T-bill funds (BENJI, Spiko, USDY):</strong> funds that hold T-bills and pass the interest to you. On chain, you hold a token; its value slowly grows. Cashing out can take up to a day.</li>
+    <li><strong>Lending (Blend):</strong> you lend your USDC into a pool; borrowers pay interest; you earn part of it. You get "bTokens" that represent your share of the pool.</li>
+    <li><strong>Tokenized equities (later):</strong> stocks or index trackers on chain, like JQQQ (a Nasdaq-100 tracker), for professional investors.</li>
+  </ul>
+  <h3>Permissionless vs gated</h3>
+  <p>USDC, EURC and Blend are <strong>permissionless</strong>: anyone can hold them. BENJI, USDY, Spiko and JQQQ are <strong>gated</strong>: the issuer must approve each holder (identity checks, sometimes only professional investors, sometimes not in certain countries). That's why our testnet baskets use only USDC, EURC and Blend today, and why the gated ones are shown in the app as "coming with issuer partners."</p>
+  <h3>Liquidity: how fast can you get cash</h3>
+  <p>Liquidity means "how quickly can I turn this into cash without losing value." USDC is instant. A T-bill fund might take a day. Some assets take a week. A basket mixes them, so we always keep a slice in instant cash. That slice is called the <strong>liquidity floor</strong>.</p>
+</section>
+
+<section id="product">
+  <div class="eyebrow">The core idea</div>
+  <h2>The product: a basket, its rules, and one token</h2>
+  <h3>Basket and sleeves</h3>
+  <p>A <strong>basket</strong> is a mix of assets held together. Each asset's slot in the basket is a <strong>sleeve</strong> ("the USDC sleeve," "the Blend sleeve"). Each sleeve has a <strong>target weight</strong>, its share of the basket.</p>
+  <div class="ledger"><span class="eyebrow">Real example · testnet basket CDAJDSXB, "18 months of runway, a third in euro"</span>
+    <table>
+      <tr><td>US dollar cash (USDC)</td><td class="r">target 50.8%</td></tr>
+      <tr><td>Euro cash (EURC)</td><td class="r">target 34.2%</td></tr>
+      <tr><td>USDC lending on Blend</td><td class="r">target 15.0%</td></tr>
+    </table>
+  </div>
+  <h3>Bands: how far a sleeve may drift</h3>
+  <p>Prices move, so weights drift. Each sleeve has a <strong>band</strong>, an allowed range around its target. In that basket the band is ±2 percentage points, so euro may sit anywhere from 32.2% to 36.2%. Inside the band, nothing happens. Outside it, the keeper rebalances.</p>
+  <h3>The vault and its token (shares)</h3>
+  <p>The basket lives inside a <strong>vault</strong>: a smart contract on Stellar that holds the assets. When you put money in, the vault gives you <strong>shares</strong>: tokens that represent your slice of everything inside. That share token is "the one token." You can hold it, send it, redeem it for cash, and (soon) borrow against it.</p>
+  <h3>The vault currency</h3>
+  <p>Every vault keeps its books in one currency, its <strong>numéraire</strong> (we say "vault currency"). Ours is USDC: you deposit USDC, values are shown in dollars, redemptions pay USDC. Euro-currency vaults need a euro price feed on chain, which we don't have yet.</p>
+  <h3>Shared basket vs your own basket</h3>
+  <p>There's one <strong>shared</strong> basket anyone can join (the Cash Reserve: 85% USDC, 15% Blend lending). And anyone can create their <strong>own private basket</strong> from their thesis, with one signature. That's the core flow.</p>
+</section>
+
+<section id="ai">
+  <div class="eyebrow">AI proposes, contracts dispose</div>
+  <h2>What the AI actually does</h2>
+  <p>You type a thesis, for example <em>"Keep 18 months of runway safe, hold a third in euro, at least 10% instant cash."</em> Our engine turns it into a basket in six stages:</p>
+  <div class="flow">
+    <div class="step"><i>1</i><b>Parse</b><span>An AI model reads your words and fills a strict form: currencies, cash floor, time horizon, caps. Rules double-check it.</span></div>
+    <div class="step"><i>2</i><b>Retrieve</b><span>Finds only assets in our registry that you are eligible to hold in your country. It can't invent assets.</span></div>
+    <div class="step"><i>3</i><b>Optimise</b><span>Math, not AI, picks weights that meet every constraint. If impossible, it says why and shows the closest basket.</span></div>
+    <div class="step"><i>4</i><b>Simulate</b><span>Stress tests: worst exit time, a stablecoin losing its peg, an issuer freezing. Shown before you sign.</span></div>
+    <div class="step"><i>5</i><b>Explain</b><span>A diff: what you asked for vs what you'd get, with the reason for each difference.</span></div>
+    <div class="step"><i>6</i><b>Sign</b><span>Only you sign. The rules get a fingerprint (policy hash) and are locked on chain.</span></div>
+  </div>
+  <p>The principle from the spec: <strong>the AI proposes; the contracts dispose.</strong> The AI's output is only a draft. Nothing reaches the chain until you review and sign, and the contracts check every trade against your signed rules, not against anything the AI says.</p>
+  <h3>Why "closed universe" matters</h3>
+  <p>AI models sometimes make things up. If ours suggested a token that doesn't exist or that you can't legally hold, that would be dangerous. So the engine can only pick from a curated list (the <strong>registry</strong>), filtered by your country and investor type. Ask for "50% Tesla stock" and it tells you that's outside the universe.</p>
+</section>
+
+<section id="rules">
+  <div class="eyebrow">What "rule-bound" means</div>
+  <h2>Rules and safety</h2>
+  <p>When you sign, these rules are stored in a <strong>policy contract</strong> and enforced on every trade. Here are the real rules from the euro runway basket:</p>
+  <div class="ledger"><span class="eyebrow">Signed policy · CDAJDSXB</span>
+    <table>
+      <tr><td>Instant cash at least (liquidity floor)</td><td class="r">10%</td></tr>
+      <tr><td>Any single asset at most</td><td class="r">40%</td></tr>
+      <tr><td>Any single issuer at most</td><td class="r">40%</td></tr>
+      <tr><td>Rebalance when a sleeve drifts by</td><td class="r">2 points</td></tr>
+      <tr><td>Maximum slippage per trade</td><td class="r">0.5%</td></tr>
+    </table>
+  </div>
+  <ul>
+    <li><strong>Issuer cap:</strong> USDC and EURC are both issued by Circle, so together they count as one issuer. This stops "all eggs with one company."</li>
+    <li><strong>Slippage:</strong> the difference between the fair price and the price you actually get when trading. The rule says: never accept more than 0.5% worse than fair. If a trade would be worse, it is refused.</li>
+    <li><strong>Policy hash:</strong> a fingerprint of the exact rules. Anyone can check that the rules on chain are the ones you signed. Changing them needs your signature again; loosening them waits 48 hours with notice.</li>
+    <li><strong>Post-trade check:</strong> after every rebalance, the vault re-measures what it actually holds. If any rule is broken, the whole trade is undone.</li>
+  </ul>
+  <h3>Non-custodial</h3>
+  <p>"Non-custodial" means Constella never holds your money. The vault contract holds it, and only you can redeem your shares. Our admin can pause a vault or propose a code upgrade, but upgrades wait <strong>48 hours in public</strong> first, and no admin key can move user funds.</p>
+</section>
+
+<section id="money">
+  <div class="eyebrow">The numbers</div>
+  <h2>How money moves</h2>
+  <h3>Deposits and shares</h3>
+  <div class="ledger"><span class="eyebrow">Worked example</span>
+    <table>
+      <tr><td>A basket holds $1,000 and has 1,000 shares</td><td class="r">$1.00 / share</td></tr>
+      <tr><td>You deposit $100</td><td class="r">you get 100 shares</td></tr>
+      <tr><td>The basket earns 2% over time: $1,100 becomes $1,122</td><td class="r">$1.02 / share</td></tr>
+      <tr><td>Your 100 shares are now worth</td><td class="r">$102</td></tr>
+    </table>
+  </div>
+  <p>"Value per share" is the <strong>NAV per share</strong> (net asset value: everything in the vault, divided by the shares). The app shows the <strong>conservative</strong> NAV: when two price sources disagree, we use the lower one, so nobody gets overpaid.</p>
+  <h3>The keeper and rebalancing</h3>
+  <p>The <strong>keeper</strong> is our automated bot. Every 5 minutes it checks every vault. If a sleeve is outside its band, it proposes trades to fix it. The vault only accepts trades that pass your rules. The keeper can't take money out; it can only swap between the basket's own assets inside the vault.</p>
+  <h3>Flow netting: trade as little as possible</h3>
+  <p>Every trade costs a fee and some slippage, so we avoid them. Deposits and withdrawals land in cash first and cancel each other out. When a rebalance is needed, new cash buys the <strong>most underweight</strong> sleeves (never selling anything), and cash needed for withdrawals comes from the <strong>most overweight</strong> sleeves. Sleeves that are close to target are left alone.</p>
+  <h3>Where trades happen: AMMs and pools</h3>
+  <p>To swap USDC for EURC, the keeper uses <strong>Soroswap</strong>, an <strong>AMM</strong> (automated market maker). An AMM is a pool holding two tokens; the price comes from the ratio between them. A big trade in a small pool moves the price a lot. That's why euro baskets are stuck on testnet:</p>
+  <div class="ledger"><span class="eyebrow">Real numbers · testnet USDC/EURC pool, 26 Nov</span>
+    <table>
+      <tr><td>Pool holds</td><td class="r">~263 USDC / ~240 EURC</td></tr>
+      <tr><td>A $100 euro basket needs to buy ~34 USDC of EURC</td><td class="r">moves the price ~13%</td></tr>
+      <tr><td>The basket's rule allows</td><td class="r">0.5% slippage</td></tr>
+      <tr><td>So the keeper refuses and keeps that part in cash</td><td class="r">correct behaviour</td></tr>
+    </table>
+  </div>
+  <p>On mainnet the real euro markets are thousands of times deeper, so this is a testnet limitation, not a product one.</p>
+  <h3>Oracles: where prices come from</h3>
+  <p>A contract can't look up a price on the internet. An <strong>oracle</strong> is a contract that publishes prices on chain. We use two independent sources for EURC (Reflector and our own feed from the European Central Bank rate) and take the safer one. If prices go stale or disagree too much, a <strong>circuit breaker</strong> freezes that price.</p>
+  <h3>Frozen prices and claims</h3>
+  <p>If an asset can't be priced (its oracle froze), a normal redemption can't value your shares. So there's a special exit: you get the cash part now, plus a <strong>claim</strong> for the frozen part. When the price returns, the keeper sells that part and pays your claim in USDC. You're never locked out completely.</p>
+  <h3>Stress tests you see before signing</h3>
+  <ul>
+    <li><strong>Redemption ladder:</strong> how much of the basket you could get out instantly, within 24 hours, within a week.</li>
+    <li><strong>Depeg:</strong> what happens if a stablecoin stops being worth exactly $1.</li>
+    <li><strong>Issuer freeze:</strong> what happens if one issuer halts redemptions.</li>
+    <li><strong>Worst-case exit time:</strong> the longest it could take to get everything out.</li>
+  </ul>
+  <p>Every simulation carries this exact sentence, a legal requirement in our rules: <em>"This simulation uses historical data. Past performance does not predict future returns. This is not financial advice."</em></p>
+</section>
+
+<section id="passport">
+  <div class="eyebrow">The headline feature</div>
+  <h2>The Collateral Passport</h2>
+  <p><strong>Collateral</strong> is something you pledge so you can borrow. A lender lets you borrow USDC against your basket token; if you don't pay back, they can sell the token. This lets a company spend without selling its investments.</p>
+  <p>Lenders normally refuse mixed baskets. The Passport is the set of features that makes our token acceptable:</p>
+  <ol>
+    <li><strong>Conservative price:</strong> one price feed for the token (in the SEP-40 standard every Stellar lender reads), always the lowest valid price. If it can't price the token, lending stops.</li>
+    <li><strong>Exit capacity:</strong> how much could be cashed out right now, in 24 hours, in a week. Lenders cap loans by it.</li>
+    <li><strong>Risk sheet:</strong> a recommended <strong>LTV</strong> (loan-to-value: borrow at most this share of the collateral's value, for example 80%).</li>
+    <li><strong>Compliant liquidation:</strong> if a loan must be closed, only approved parties can buy the gated assets.</li>
+  </ol>
+  <p>The number we'll be judged on: <strong>what share of all money in Constella is posted as collateral.</strong> That's the measure of "used."</p>
+  <p class="note">Testnet today: the price feed for vault shares works and the Cash Reserve is listed. Borrowing is off until our Blend lending pool's backstop is funded, which needs BLND tokens from the Blend team.</p>
+</section>
+
+<section id="accounts">
+  <div class="eyebrow">No seed phrase, no gas</div>
+  <h2>Accounts and getting in</h2>
+  <ul>
+    <li><strong>Passkey account:</strong> sign in with Face ID, Touch ID or Windows Hello. No seed phrase to lose. Under the hood it's a <strong>smart account</strong>, a contract that checks your passkey's signature.</li>
+    <li><strong>Zero gas:</strong> every blockchain action costs a tiny network fee in XLM. Our <strong>relayer</strong> pays it for passkey users, through a <strong>fee sponsor</strong> contract that only pays for allowed actions.</li>
+    <li><strong>Stellar wallet:</strong> people who already use Freighter, xBull, LOBSTR and similar can connect instead. They sign in their wallet and pay their own fees.</li>
+    <li><strong>Devices:</strong> add your phone to the same account. Both screens show the same 6-character check code, and your first device approves.</li>
+    <li><strong>Guardians and recovery:</strong> if you lose every passkey, guardians you chose (your other devices or trusted people) approve a new passkey. It takes over only after <strong>48 hours</strong>, and you can cancel meanwhile. Guardians can never move money.</li>
+  </ul>
+</section>
+
+<section id="business">
+  <div class="eyebrow">Revenue</div>
+  <h2>How Constella earns</h2>
+  <p>Decided model (D-D, enforced in the vault contract): a <strong>performance fee of 10% of the profit</strong>, and only above the <strong>high-water mark</strong> (the best value per share reached so far; you never pay twice for the same gains). There is an all-in ceiling of <strong>0.20% of assets per year</strong>. No profit, no fee. No deposit or redemption fees.</p>
+  <div class="ledger"><span class="eyebrow">Worked example</span>
+    <table>
+      <tr><td>$100,000 basket earns 2.4% in a year</td><td class="r">$2,400 profit</td></tr>
+      <tr><td>10% of profit</td><td class="r">$240</td></tr>
+      <tr><td>Ceiling: 0.20% of $100,000</td><td class="r">$200</td></tr>
+      <tr><td>Fee charged (the lower)</td><td class="r">$200</td></tr>
+      <tr><td>Same basket, 0% return</td><td class="r">$0</td></tr>
+    </table>
+  </div>
+  <p>Later: a <strong>Treasury plan</strong> ($199–499/month for companies: private vaults, multisig, accounting exports), a <strong>Partner plan</strong> (wallets embedding Constella share 30% of the fee), and <strong>curators</strong> publishing theses others can follow.</p>
+  <p class="note">The founding PDF quotes a 0.05–0.25% yearly management fee. That was replaced by D-D on 16 Nov 2026, because a flat fee would eat most of a cash-heavy basket's small yield. When you pitch, use D-D.</p>
+</section>
+
+<section id="status">
+  <div class="eyebrow">Honest status, 26 Nov 2026</div>
+  <h2>What's live and what isn't</h2>
+  <div class="tablewrap"><table class="status">
+    <tr><td>Passkey accounts, zero gas, wallet sign-in <span class="tag live">live</span></td><td>Works on testnet, in the app.</td></tr>
+    <tr><td>Thesis → AI draft → your own basket in one signature <span class="tag live">live</span></td><td>Real AI parsing, real contracts.</td></tr>
+    <tr><td>Deposit, redeem, frozen-price redemption with claims <span class="tag live">live</span></td><td>Test USDC from the app, once a day.</td></tr>
+    <tr><td>Keeper rebalancing with flow netting <span class="tag live">live</span></td><td>USDC ↔ Blend at any size; USDC ↔ EURC only tiny amounts (thin testnet pool).</td></tr>
+    <tr><td>Devices, guardians, recovery <span class="tag live">live</span></td><td>Final 48-hour step proven on 27–28 Nov.</td></tr>
+    <tr><td>Blend lending sleeve <span class="tag soon">0% yield</span></td><td>Works, but nobody borrows on testnet, so it earns nothing.</td></tr>
+    <tr><td>Collateral Passport borrowing <span class="tag soon">coming online</span></td><td>Price feed works; borrowing needs BLND from the Blend team.</td></tr>
+    <tr><td>BENJI, USDY, Spiko, JQQQ <span class="tag later">partners</span></td><td>Gated tokens; need issuer partnerships, not on testnet.</td></tr>
+    <tr><td>Euro-currency vaults <span class="tag later">later</span></td><td>Needs a euro price feed on chain.</td></tr>
+    <tr><td>Mainnet <span class="tag later">after audit</span></td><td>External audit, multisig admin, capped beta first.</td></tr>
+  </table></div>
+</section>
+
+<section id="pitch">
+  <div class="eyebrow">Use these</div>
+  <h2>How to say it</h2>
+  <h3>10 seconds</h3>
+  <div class="say">Tell us what your money is for; we turn it into a basket of real-world assets on Stellar, with your rules locked into code, as one token you can hold, cash out or borrow against.</div>
+  <h3>30 seconds</h3>
+  <div class="say">Stellar has over four billion dollars of tokenized treasuries and stablecoins, and 95% of it sits idle. Constella lets a company write its treasury plan in plain English, say "18 months of runway, a third in euro, 10% always in cash." Our engine builds a matching basket from assets the company can legally hold, shows the stress tests, and when they sign, the rules are enforced on chain. They get one token they can redeem any time or use as collateral to borrow.</div>
+  <h3>2 minutes</h3>
+  <p>Add, in order: who it's for (startups, DAOs and funds holding stablecoins), why lenders accept it (the Collateral Passport: conservative pricing, exit capacity, compliant liquidation), why it's safe (non-custodial, the AI only drafts, contracts check every trade, 48-hour timelocks), and how we earn (10% of profit, never more than 0.20% a year, nothing if there's no profit).</p>
+  <h3>Phrases to avoid</h3>
+  <ul>
+    <li>"AI portfolio manager" or "AI treasury manager": the AI drafts; it doesn't manage.</li>
+    <li>"Guaranteed," "safe," "risk-free," or any yield number: nothing is guaranteed.</li>
+    <li>"Audited": not yet; the audit comes before mainnet.</li>
+    <li>"Your keys never leave your device": passkeys can sync through iCloud or Google.</li>
+  </ul>
+</section>
+
+<section id="qa" class="qa">
+  <div class="eyebrow">Be ready</div>
+  <h2>Hard questions, short answers</h2>
+  <h3>Is this a fund?</h3>
+  <p>No. Each user's basket is their own vault with their own rules; Constella provides software. Gated assets and professional clients come through licensed partners.</p>
+  <h3>Who holds the money?</h3>
+  <p>The vault contract. Only the share owner can redeem. Constella's admin can pause, but can't move user funds.</p>
+  <h3>What if the AI gets it wrong?</h3>
+  <p>The AI only fills a draft. Math builds the basket, you review the diff and the stress tests, and you sign. After that, contracts check every trade against the signed rules, not against the AI.</p>
+  <h3>Why Stellar?</h3>
+  <p>That's where the real-world assets are (BENJI, USDC, EURC, Spiko), fees are tiny, and Stellar's new features (passkeys, fee sponsorship, Bell's W-addresses) make it usable for non-crypto people.</p>
+  <h3>How is this different from Yearn or Morpho vaults?</h3>
+  <p>Those optimise yield on crypto assets with rules set by a curator. Constella starts from your own plain-English goals, uses real-world assets you're eligible for, enforces your rules on chain, and is built to be borrowed against.</p>
+  <h3>What happens in a crisis?</h3>
+  <p>Prices freeze when sources disagree, trades that break the rules are refused, a slice is always instant cash, and if an asset is frozen you still get the cash part out with a claim for the rest.</p>
+</section>
+
+<section id="glossary">
+  <div class="eyebrow">Look anything up</div>
+  <h2>Glossary</h2>
+  <div class="gloss-tools"><label class="eyebrow" for="q">Filter terms</label><input id="q" type="search" placeholder="Type a word, e.g. slippage" autocomplete="off"></div>
+  <dl class="gloss" id="gl">
+    <div><dt>AMM (automated market maker)</dt><dd>A pool of two tokens that anyone can swap against; the price comes from their ratio. Soroswap is ours.</dd></div>
+    <div><dt>Band</dt><dd>The allowed range around a sleeve's target weight (e.g. 32.2–36.2% for a 34.2% target). Outside it, the keeper rebalances.</dd></div>
+    <div><dt>Basket</dt><dd>A mix of assets held together in one vault.</dd></div>
+    <div><dt>Blend</dt><dd>Stellar's main lending protocol. Lenders supply USDC and earn interest from borrowers.</dd></div>
+    <div><dt>bToken</dt><dd>The receipt Blend gives you for supplied USDC; it grows as interest accrues.</dd></div>
+    <div><dt>Circuit breaker</dt><dd>An automatic freeze of a price when sources go stale or disagree too much.</dd></div>
+    <div><dt>Claim</dt><dd>An IOU recorded when you redeem while an asset can't be priced; the keeper pays it in USDC later.</dd></div>
+    <div><dt>Closed universe / registry</dt><dd>The curated list of assets the engine may choose from. Nothing outside it can enter a basket.</dd></div>
+    <div><dt>Collateral</dt><dd>Something you pledge so you can borrow against it.</dd></div>
+    <div><dt>Collateral Passport</dt><dd>Constella's features that let lenders accept the basket token: conservative price, exit capacity, risk sheet, compliant liquidation.</dd></div>
+    <div><dt>Depeg</dt><dd>When a stablecoin stops being worth exactly 1 dollar or euro.</dd></div>
+    <div><dt>Fee sponsor / relayer</dt><dd>Our service and contract that pay network fees for passkey users, only for allowed actions.</dd></div>
+    <div><dt>Flow netting</dt><dd>Letting deposits and withdrawals cancel out in cash, so the keeper trades only the leftover.</dd></div>
+    <div><dt>Gated vs permissionless</dt><dd>Gated assets need the issuer's approval to hold; permissionless ones anyone can hold.</dd></div>
+    <div><dt>Guardian</dt><dd>A device or person who can approve a new passkey if you lose all yours. Can't move money.</dd></div>
+    <div><dt>High-water mark</dt><dd>The highest value per share reached so far. The fee only applies to gains above it.</dd></div>
+    <div><dt>Issuer</dt><dd>The company behind a token (Circle for USDC and EURC, Franklin Templeton for BENJI).</dd></div>
+    <div><dt>Keeper</dt><dd>Our bot that checks vaults every 5 minutes and rebalances within the signed rules.</dd></div>
+    <div><dt>Liquidity / liquidity floor</dt><dd>How fast something becomes cash. The floor is the minimum share kept in instant cash.</dd></div>
+    <div><dt>LTV (loan-to-value)</dt><dd>The most you can borrow as a share of your collateral's value, e.g. 80%.</dd></div>
+    <div><dt>NAV (net asset value)</dt><dd>Everything a vault holds, valued in its currency. NAV per share = NAV ÷ shares.</dd></div>
+    <div><dt>Non-custodial</dt><dd>Constella never holds your money; the contract does, and only you can redeem.</dd></div>
+    <div><dt>Numéraire / vault currency</dt><dd>The currency a vault keeps its books in. Ours is USDC.</dd></div>
+    <div><dt>Oracle</dt><dd>A contract that publishes prices on chain.</dd></div>
+    <div><dt>Passkey</dt><dd>A login using your device's Face ID, fingerprint or PIN instead of a password or seed phrase.</dd></div>
+    <div><dt>Policy / policy hash</dt><dd>The signed rules of a basket, and their fingerprint, so anyone can verify them.</dd></div>
+    <div><dt>Redemption ladder</dt><dd>How much could be cashed out instantly, within 24 hours, within a week.</dd></div>
+    <div><dt>Rebalance</dt><dd>Trading to bring sleeves back inside their bands.</dd></div>
+    <div><dt>RWA (real-world asset)</dt><dd>A traditional asset (bond, fund, currency) represented by a token on a blockchain.</dd></div>
+    <div><dt>SEP-40</dt><dd>Stellar's standard format for price feeds that lenders read.</dd></div>
+    <div><dt>Shares</dt><dd>The tokens a vault gives you for your deposit; your slice of everything inside.</dd></div>
+    <div><dt>Sleeve</dt><dd>One asset's slot in a basket, with a target weight and band.</dd></div>
+    <div><dt>Slippage</dt><dd>How much worse than the fair price a trade executes. Capped by the policy (0.5% in our baskets).</dd></div>
+    <div><dt>Smart account</dt><dd>A contract that acts as your account and checks your passkey's signatures.</dd></div>
+    <div><dt>Stablecoin</dt><dd>A token designed to be worth exactly 1 unit of a currency (USDC, EURC).</dd></div>
+    <div><dt>T-bill</dt><dd>A short-term loan to a government; the safest common investment, paying small interest.</dd></div>
+    <div><dt>Thesis</dt><dd>Your plain-English statement of what the money is for and its limits.</dd></div>
+    <div><dt>Timelock</dt><dd>A forced public waiting period (48 hours) before admin changes take effect.</dd></div>
+    <div><dt>Vault</dt><dd>The smart contract that holds a basket's assets and issues shares.</dd></div>
+  </dl>
+  <p class="note" id="none" hidden>No term matches. Try a shorter word.</p>
+</section>
+
+</main>
+</div>
+
+<script>
+(function () {
+  var q = document.getElementById("q"), items = document.querySelectorAll("#gl > div"), none = document.getElementById("none");
+  q.addEventListener("input", function () {
+    var t = q.value.trim().toLowerCase(), shown = 0;
+    items.forEach(function (d) { var hit = !t || d.textContent.toLowerCase().indexOf(t) !== -1; d.hidden = !hit; if (hit) shown++; });
+    none.hidden = shown !== 0;
+  });
+})();
+</script>
