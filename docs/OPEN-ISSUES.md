@@ -16,6 +16,9 @@ by design) - on mainnet every account will be created with the fixed code.
 | 4 | Low (UI) | Landing page on phones: the hero coin overlaps the copy and the nav buttons wrap. | `prototypes/landing/index.html` (media query at max-width 900px) | Hero readable at 390 px wide, verified by screenshot. |
 
 Also noted (not bugs, product gaps):
+- Keeper plans are all-or-nothing: one leg the market cannot take (e.g. a thin EURC pool) also blocks legs that need no
+  market (Blend supply). Seen 26 Nov on vault CBVTIMFS... (Blend 0 % for that reason). Better: plan the feasible legs,
+  skip only the refused one (the vault's post-trade check still guards every band).
 - Euro-currency vaults need a EUR-based price feed on chain (the NAV oracle is USDC-based; the factory refuses
   other vault currencies). Until then a mostly-euro thesis stays in a USDC vault with the reason shown.
 - Testnet Soroswap USDC/EURC depth is demo-scale (~240 EURC after the owner's faucet EURC was added on 25 Nov 2026): the keeper refuses
