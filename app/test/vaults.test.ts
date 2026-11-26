@@ -85,3 +85,14 @@ describe("activity", () => {
     expect(eventLabel("transfer")).toBeNull();
   });
 });
+
+describe("rebalance status shown on a basket", () => {
+  it("in band: nothing; just drifted: soon; still out of band 10+ min after the last activity: waiting", async () => {
+    const { rebalanceStatus } = await import("../src/core/vaults");
+    const now = Date.parse("2026-11-26T10:00:00Z");
+    expect(rebalanceStatus(false, "2026-11-26T09:00:00Z", now)).toBe("ok");
+    expect(rebalanceStatus(true, "2026-11-26T09:55:00Z", now)).toBe("soon");
+    expect(rebalanceStatus(true, "2026-11-26T09:49:59Z", now)).toBe("waiting");
+    expect(rebalanceStatus(true, null, now)).toBe("waiting");
+  });
+});
