@@ -40,7 +40,8 @@ ld = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ld)
 
 TESTNET = Network.TESTNET_NETWORK_PASSPHRASE
-SAVED = Path.home() / ".config/constella/testnet/recovery_e2e.json"
+SAVED = (Path(sys.argv[sys.argv.index("--state") + 1]) if "--state" in sys.argv
+         else Path.home() / ".config/constella/testnet/recovery_e2e.json")  # --state FILE: keep several pending proofs
 say = lambda *a: print(*a, flush=True)
 
 
